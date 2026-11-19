@@ -121,9 +121,8 @@ refuses PTT while another NAC (RAN) is heard, or any traffic, as the setting say
 
 If the DM-32 hears a hotspot, repeater or radio but they don't hear it, check these first.
 
-**NXDN is NXDN48 only.** That is the 6.25 kHz, 4800 bps mode: **"VN"** on Icom, "Very Narrow / 6.25 kHz" on
-Kenwood. The DM-32 has no NXDN96 ("N", 12.5 kHz) mode, so the codeplug editor shows no bandwidth setting for NXDN.
-Set the other radios and the repeater's channel to VN / NXDN48.
+**Match the NXDN rate.** Choose NXDN48 (6.25 kHz, VN) for an MMDVM NXDN hotspot. NXDN96 (12.5 kHz, N) is
+available for radios and repeaters configured for that rate.
 
 **The TX NAC or RAN must match.** RX can be set to `any` (NAC F7E, RAN 0), so you can hear a system whose NAC
 or RAN is different from yours. The other side only accepts your **TX** NAC/RAN. Pi-Star / MMDVMHost defaults to
@@ -139,8 +138,16 @@ back to 0.
 - `SelfOnly=1` under `[P25]` or `[NXDN]` and your unit ID is not the hotspot's own ID. For NXDN that is your
   NXDN ID (65519 or less), not your DMR ID.
 
-**NXDN ID.** NXDN IDs go up to 65519. A channel without its own Unit ID uses your DMR ID, and a 7-digit DMR ID is
-too large: PTT shows "NXDN ID above 65519". Put your NXDN ID in the channel's Unit ID.
+**Unit IDs.** NXDN IDs go up to 65519. Set the NXDN Unit ID in the CPS Radio tab to use it in the VFO and on
+memories without a channel Unit ID. Conventional P25 takes an explicit channel Unit ID before its radio-wide
+setting. Match the ID the hotspot checks for the protocol you are using.
+
+**YSF callsign.** Set YSF Source in the CPS Radio tab or enter your callsign in the general CPS field.
+Both the VFO and stored channels use YSF Source when it is set. The general field supplies it otherwise.
+YSF sends the callsign in the header for both DN and VW. Set the TX DG-ID expected by the repeater.
+
+YSF, conventional P25 and NXDN send a 200 ms synchronization preamble before the first call frame.
+The transmitter starts microphone capture after the modem changes to transmit mode.
 
 The Pi-Star live log shows where a call stops. If nothing at all appears while you transmit, the hotspot does not
 hear a valid signal. Report it with the radio's version, mode and frequency.
