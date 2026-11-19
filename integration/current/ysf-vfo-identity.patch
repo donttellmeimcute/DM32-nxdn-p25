@@ -1,0 +1,124 @@
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index c9620f0..6326f5c 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -112,16 +112,10 @@ static void params(const channel_t *ch, uint16_t number, ysf_engine_cfg_t *c)
+ 
+ static void callsigns_to_cfg(const radio_ysf_settings_t *s, const ysf_identity_t *id, ysf_engine_cfg_t *c)
+ {
+-	// A stored channel's call signs come from the radio-wide record; the VFO's from the settings
+-	if (id != NULL) {
+-		ysf_callsign_pack(id->src, (uint8_t *)c->src);
+-		ysf_callsign_pack(id->down, (uint8_t *)c->down);
+-		ysf_callsign_pack(id->up, (uint8_t *)c->up);
+-	} else {
+-		ysf_callsign_pack(s->src, (uint8_t *)c->src);
+-		ysf_callsign_pack(s->down, (uint8_t *)c->down);
+-		ysf_callsign_pack(s->up, (uint8_t *)c->up);
+-	}
++	// The radio-wide record supplies the defaults, including on the VFO.
++	ysf_callsign_pack(s && s->src[0] ? s->src : id->src, (uint8_t *)c->src);
++	ysf_callsign_pack(s && s->down[0] ? s->down : id->down, (uint8_t *)c->down);
++	ysf_callsign_pack(s && s->up[0] ? s->up : id->up, (uint8_t *)c->up);
+ 	memset(c->rem1, ' ', YSF_CALLSIGN_LEN);
+ 	memset(c->rem2, ' ', YSF_CALLSIGN_LEN);
+ 	memset(c->rem3, ' ', YSF_CALLSIGN_LEN);
+@@ -150,7 +144,8 @@ static void params_channel(const channel_t *ch, uint16_t number, ysf_engine_cfg_
+ 	c->rx_dgid = set.rx_dgid;
+ 	c->tx_dgid = set.tx_dgid;
+ 	ysf_callsign_pack(set.dest, (uint8_t *)c->dest);
+-	callsigns_to_cfg(&set, NULL, c);
++	ysf_identity_load(&cc.id);
++	callsigns_to_cfg(&set, &cc.id, c);
+ }
+ 
+ // ── Voice: the DMR side's voice path (ambeVoice.h), its sink on receive and its source on transmit. The hooks run in
+diff --git a/core/ysf/ysf_codeplug.c b/core/ysf/ysf_codeplug.c
+index fc5c3eb..47be84d 100644
+--- a/core/ysf/ysf_codeplug.c
++++ b/core/ysf/ysf_codeplug.c
+@@ -94,11 +94,19 @@ void ysf_identity_decode(const uint8_t *b, int len, ysf_identity_t *out)
+ 		ysf_callsign_unpack(&b[2u * YSF_CALLSIGN_LEN], out->up);
+ }
+ 
++void ysf_identity_load(ysf_identity_t *out)
++{
++	uint8_t b[YSF_CP_IDENTITY_LEN];
++	int len = codeplug_mode_settings(CODEPLUG_KIND_YSF, b, sizeof b);
++
++	ysf_identity_decode(b, len, out);
++}
++
+ bool ysf_conv_load(uint16_t number, const channel_t *ch, ysf_conv_cfg_t *out)
+ {
+ 	uint8_t b[YSF_CP_CONV_LEN + YSF_CP_IDENTITY_LEN + CODEPLUG_TAG_HEAD_MAX];
+ 	const int cap = (int)(sizeof b - CODEPLUG_TAG_HEAD_MAX);
+-	int len, idlen;
++	int len;
+ 
+ 	if (ch->kind != CODEPLUG_KIND_YSF)
+ 		return false;
+@@ -106,8 +114,7 @@ bool ysf_conv_load(uint16_t number, const channel_t *ch, ysf_conv_cfg_t *out)
+ 	if (len < 0)
+ 		return false;
+ 	ysf_conv_decode(b, len < cap ? len : cap, &out->conv);
+-	idlen = codeplug_mode_settings(CODEPLUG_KIND_YSF, b, YSF_CP_IDENTITY_LEN);
+-	ysf_identity_decode(b, idlen < 0 ? 0 : idlen, &out->id);
++	ysf_identity_load(&out->id);
+ 	return true;
+ }
+ 
+diff --git a/core/ysf/ysf_codeplug.h b/core/ysf/ysf_codeplug.h
+index 02f5835..66dfdb2 100644
+--- a/core/ysf/ysf_codeplug.h
++++ b/core/ysf/ysf_codeplug.h
+@@ -48,6 +48,8 @@ void ysf_conv_decode(const uint8_t *b, int len, ysf_conv_t *out);
+ void ysf_conv_encode(const ysf_conv_t *c, uint8_t out[YSF_CP_CONV_LEN]);
+ // Decode len bytes of the radio-wide identity record (a short one, or none, leaves the rest empty); never fails
+ void ysf_identity_decode(const uint8_t *b, int len, ysf_identity_t *out);
++// Load the radio-wide identity. An absent record gives empty call signs.
++void ysf_identity_load(ysf_identity_t *out);
+ 
+ // What a conventional call is set up from: the channel's block and the radio-wide call signs
+ typedef struct {
+diff --git a/docs/spec/ysf-codeplug.md b/docs/spec/ysf-codeplug.md
+index 1ee15db..197214f 100644
+--- a/docs/spec/ysf-codeplug.md
++++ b/docs/spec/ysf-codeplug.md
+@@ -27,6 +27,7 @@ space, and trailing spaces are trimmed when read, so a short or absent field rea
+ 
+ The remote call signs (Rem1-4) are not stored: a handheld does not originate them, so they go out as spaces.
+ Nothing else is stored radio-wide: the DG-IDs, the data type and the deviation are the channel's (2).
++The VFO also uses these call signs. A nonempty temporary VFO call sign overrides its corresponding field.
+ 
+ ## 2. Conventional channel (kind 6)
+ 
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 1f2c0bc..b84e3ea 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -10342,10 +10342,16 @@ static void test_t3_stun(void)
+ #if CONFIG_YSF
+ static void test_ysf_pcm_handoff(void)
+ {
++	static const char identity[] = "XE1ABC    DOWN      UP        ";
++	radio_ysf_settings_t effective;
++
+ 	dmr_start(true);
+ 	sm.set.talk_permit = false;
++	kv_t3_set(CODEPLUG_KEY_MODE_SET + CODEPLUG_KIND_YSF, identity, sizeof identity - 1);
+ 	CHECK(debuglink_radio_feature_op(DL_OP_DMR_FIELDS, (const uint8_t[]){ RADIO_MODE_YSF, 0xFF, 0 }, 3) == DL_ST_OK);
+ 	CHECK(radio_ysf_running());
++	CHECK(radio_ysf_in_force(&effective) && !strcmp(effective.src, "XE1ABC") &&
++	      !strcmp(effective.down, "DOWN") && !strcmp(effective.up, "UP"));
+ 	aud.feed = true;
+ 	ambeVoiceResetStats();
+ 	ysf_clock_handoff = true;
+@@ -10368,6 +10374,7 @@ static void test_ysf_pcm_handoff(void)
+ 	ysf_clock_handoff = false;
+ 	run(100);
+ 	aud.feed = false;
++	kv_t3_clear();
+ }
+ #endif
+ 
