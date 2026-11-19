@@ -16385,6 +16385,122 @@ new file mode 100644
 +bool ysf_conv_save(uint16_t number, const channel_t *ch, const ysf_conv_t *conv);
 +
 +#endif
+diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
+--- a/core/ysf/ysf_engine.c
++++ b/core/ysf/ysf_engine.c
+@@ -299,11 +299,11 @@ static void tx_voice_cb(void *ctx, unsigned frame_no, unsigned block, uint8_t *v
+ 	switch (e->cfg.dt) {
+ 	case YSF_DT_VD_MODE1:
+ 		if (vch_len == 9)
+-			memcpy(vch, e->stage[block], 9);
++			memcpy(vch, e->buf.tx.stage[block], 9);
+ 		break;
+ 	case YSF_DT_VD_MODE2:
+ 		if (vch_len == 13)
+-			ysf_voice_dn_from_frame(e->stage[block], vch);
++			ysf_voice_dn_from_frame(e->buf.tx.stage[block], vch);
+ 		break;
+ 	default:
+ 		if (vch_len)
+@@ -332,7 +332,7 @@ static void top_up(ysf_engine_t *e)
+ 	if (!e->hooks.tx_voice)
+ 		return;
+ 	while (e->sq_n < 10) {
+-		uint8_t *dst = e->sq[(e->sq_head + e->sq_n) % 10];
++		uint8_t *dst = e->buf.tx.sq[(e->sq_head + e->sq_n) % 10];
+ 
+ 		if (!e->hooks.tx_voice(dst, e->ctx))
+ 			return;
+@@ -359,13 +359,13 @@ static bool stage_voice(ysf_engine_t *e)
+ 		unsigned b = e->stage_n;
+ 
+ 		if (e->sq_n) {
+-			memcpy(e->stage[b], e->sq[e->sq_head], 9);
++			memcpy(e->buf.tx.stage[b], e->buf.tx.sq[e->sq_head], 9);
+ 			e->sq_head = (uint8_t)((e->sq_head + 1) % 10);
+ 			e->sq_n--;
+ 			continue;
+ 		}
+ 		if (!e->hooks.tx_voice || must) {
+-			memcpy(e->stage[b], e->cfg.silence, 9);
++			memcpy(e->buf.tx.stage[b], e->cfg.silence, 9);
+ 			view_begin(e);
+ 			e->view.tx_filler++;
+ 			view_end(e);
+@@ -404,9 +404,9 @@ static bool build_next(ysf_engine_t *e)
+ 	if (seq >= 1 && seq <= 8 &&
+ 	    (e->cfg.dt == YSF_DT_VD_MODE1 || e->cfg.dt == YSF_DT_VD_MODE2) && !stage_voice(e))
+ 		return false;
+-	if (!ysf_tx_frame_build(&e->txcfg, seq, e->txframe))
++	if (!ysf_tx_frame_build(&e->txcfg, seq, e->buf.tx.txframe))
+ 		return false;	// unknown mode: nothing to send
+-	pack_dibits(e->txframe, e->dibits);
++	pack_dibits(e->buf.tx.txframe, e->buf.tx.dibits);
+ 	e->dib_pos = 0;
+ 	if (seq == 0) {
+ 		e->frame_no = 1;
+@@ -440,7 +440,7 @@ static void tx_fill(void *ctx)
+ 		n = (uint16_t)(YSF_FRAME_DIBITS - e->dib_pos);
+ 		if (n > space)
+ 			n = space;
+-		if (!air_session_tx(&e->session, e->dibits, e->dib_pos, n))
++		if (!air_session_tx(&e->session, e->buf.tx.dibits, e->dib_pos, n))
+ 			return;
+ 		e->dib_pos += n;
+ 	}
+@@ -485,7 +485,7 @@ bool ysf_engine_begin(ysf_engine_t *e, const hal_air_t *air, const ysf_engine_cf
+ 	e->txcfg.cycles = 1;
+ 	refresh_txcfg(e);
+ 	ysf_rx_init(&e->rx, &sink, e);
+-	return air_session_open(&e->session, air, e->mode, &e->rx, e->frame, e->soft, YSF_FRAME_DIBITS,
++	return air_session_open(&e->session, air, e->mode, &e->rx, e->buf.rx.frame, e->buf.rx.soft, YSF_FRAME_DIBITS,
+ 				&ops, e);
+ }
+ 
+diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
+--- a/core/ysf/ysf_engine.h
++++ b/core/ysf/ysf_engine.h
+@@ -103,8 +103,23 @@ typedef struct {
+ 	ysf_engine_hooks_t hooks;
+ 	void *ctx;
+ 	ysf_tx_config txcfg;	// the sequence builder's config (refreshed on prepare)
+-	uint8_t txframe[YSF_FRAME_BYTES];	// one built frame, before dibits
+-	uint8_t dibits[YSF_FRAME_DIBITS / 4];	// one built frame, packed (480 dibits)
++	// The frame buffers, receive and transmit, share storage: the radio is half-duplex, so a transmission
++	// discards any partial received frame (unreceivable while transmitting), and reception never runs while
++	// a frame is being built. A frame assembled from the shared bytes still has to pass sync and FICH
++	// (ysf_rx.c), so a clobbered partial frame is rejected as noise, not played. The two sides apart cost
++	// 975 bytes of RAM; shared they cost 600.
++	union {
++		struct {	// receive: the framer's frame and its soft values
++			uint8_t frame[YSF_FRAME_BYTES];
++			int8_t soft[YSF_FRAME_DIBITS];
++		} rx;
++		struct {	// transmit: the built frame, its dibits, the staged voice blocks
++			uint8_t txframe[YSF_FRAME_BYTES];
++			uint8_t dibits[YSF_FRAME_DIBITS / 4];
++			uint8_t stage[YSF_BLOCKS][9];
++			uint8_t sq[10][9];
++		} tx;
++	} buf;
+ 	uint16_t dib_pos;	// next dibit to queue from dibits[]
+ 	unsigned frame_no;	// next sequence frame to build (0 header, 1..8 CC, 9 terminator)
+ 	bool tx_started;	// the header is queued
+@@ -114,14 +129,10 @@ typedef struct {
+ 	bool played;		// the call in hand passes the squelch
+ 	volatile bool recheck;	// ysf_engine_set changed what passes it
+ 	volatile uint8_t seq;	// odd while the provider's task writes view
+-	uint8_t stage[YSF_BLOCKS][9];	// staged voice blocks for the next frame
+ 	uint8_t stage_n;	// blocks already staged for the frame in hand
+-	uint8_t sq[10][9];	// voice blocks from the encoder, waiting for a frame
+ 	uint8_t sq_head;	// next block to take from sq
+ 	uint8_t sq_n;		// blocks held in sq
+ 	ysf_engine_view_t view;
+-	uint8_t frame[YSF_FRAME_BYTES];	// the framer's frame buffer ...
+-	int8_t soft[YSF_FRAME_DIBITS];	// ... and its soft values
+ } ysf_engine_t;
+ 
+ // The mode for a deviation
 diff --git a/docs/feature-matrix.md b/docs/feature-matrix.md
 --- a/docs/feature-matrix.md
 +++ b/docs/feature-matrix.md
