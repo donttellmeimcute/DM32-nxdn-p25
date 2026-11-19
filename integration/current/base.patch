@@ -18482,3 +18482,67 @@ index 595dcd7..ddd1c4b 100644
  }
  
  static void testPlayback(void)
+diff --git a/tools/bench/nxdn/Makefile b/tools/bench/nxdn/Makefile
+index 67322d2..61b3d74 100644
+--- a/tools/bench/nxdn/Makefile
++++ b/tools/bench/nxdn/Makefile
+@@ -10,10 +10,11 @@ CC      ?= cc
+ CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal '-D__attribute__(x)=' \
+            -DCONFIG_AIR=1 -DCONFIG_NXDN=1
+ SRC     := $(HERE)/nxdntool.c $(CORE)/nxdn/nxdn_frame.c $(CORE)/nxdn/nxdn_rx.c $(CORE)/nxdn/nxdn_call.c \
+-           $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(CORE)/fec/conv.c
+-HDRS    := $(wildcard $(CORE)/nxdn/*.h $(CORE)/air/*.h $(CORE)/fec/*.h) $(ROOT)/hal/hal_air.h $(ROOT)/hal/hal_baseband.h
++           $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(CORE)/fec/conv.c \
++           $(CORE)/nxdn/nxdn_aes.c $(CORE)/crypto/aes256.c $(CORE)/dmr/ambe/ambeFec.c
++HDRS    := $(wildcard $(CORE)/nxdn/*.h $(CORE)/air/*.h $(CORE)/fec/*.h) $(ROOT)/hal/hal_air.h $(ROOT)/hal/hal_baseband.h $(CORE)/crypto/aes256.h $(CORE)/dmr/ambe/ambeFec.h
+ 
+-$(OUT)/nxdntool: $(SRC) $(HDRS)
++$(OUT)/nxdntool: $(SRC) $(HDRS) $(HERE)/Makefile
+ 	@mkdir -p $(OUT)
+ 	$(CC) $(CFLAGS) -o $@ $(SRC) -lm
+ 
+diff --git a/tools/bench/nxdntool.py b/tools/bench/nxdntool.py
+index 052bc90..c34123e 100755
+--- a/tools/bench/nxdntool.py
++++ b/tools/bench/nxdntool.py
+@@ -54,7 +54,7 @@ BIN = os.path.join(ROOT, "build", "bench", "nxdntool")
+ 
+ def build():
+     srcs = [os.path.join(SRC, "nxdntool.c"), os.path.join(SRC, "Makefile")]
+-    for d in ("core/nxdn", "core/air", "core/fec"):
++    for d in ("core/nxdn", "core/air", "core/fec", "core/crypto", "core/dmr/ambe"):
+         p = os.path.join(ROOT, d)
+         srcs += [os.path.join(p, f) for f in os.listdir(p) if f.endswith((".c", ".h"))]
+     if not os.path.exists(BIN) or os.path.getmtime(BIN) < max(os.path.getmtime(s) for s in srcs):
+diff --git a/tools/bench/p25/Makefile b/tools/bench/p25/Makefile
+index 4a03fb1..70c88d9 100644
+--- a/tools/bench/p25/Makefile
++++ b/tools/bench/p25/Makefile
+@@ -10,10 +10,11 @@ CC      ?= cc
+ CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal '-D__attribute__(x)=' \
+            -DCONFIG_AIR=1 -DCONFIG_P25=1 -DCONFIG_P25_TRUNK=1
+ SRC     := $(HERE)/p25tool.c $(CORE)/p25/p25_unit.c $(CORE)/p25/p25_rx.c $(CORE)/p25/p25_call.c $(CORE)/p25/p25_tsbk.c \
+-           $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(wildcard $(CORE)/fec/*.c)
+-HDRS    := $(wildcard $(CORE)/p25/*.h $(CORE)/air/*.h $(CORE)/fec/*.h) $(ROOT)/hal/hal_air.h $(ROOT)/hal/hal_baseband.h
++           $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(wildcard $(CORE)/fec/*.c) \
++           $(CORE)/p25/p25_aes.c $(CORE)/crypto/aes256.c
++HDRS    := $(wildcard $(CORE)/p25/*.h $(CORE)/air/*.h $(CORE)/fec/*.h) $(ROOT)/hal/hal_air.h $(ROOT)/hal/hal_baseband.h $(CORE)/crypto/aes256.h
+ 
+-$(OUT)/p25tool: $(SRC) $(HDRS)
++$(OUT)/p25tool: $(SRC) $(HDRS) $(HERE)/Makefile
+ 	@mkdir -p $(OUT)
+ 	$(CC) $(CFLAGS) -o $@ $(SRC) -lm
+ 
+diff --git a/tools/bench/p25tool.py b/tools/bench/p25tool.py
+index 7e29cfd..a0dfece 100644
+--- a/tools/bench/p25tool.py
++++ b/tools/bench/p25tool.py
+@@ -83,7 +83,7 @@ RV = ("accepted", "failed", "denied", "refused")
+ def build():
+     """The program, built when it is missing or older than any source it is made of."""
+     deps = [os.path.join(SRC, "p25tool.c"), os.path.join(SRC, "Makefile")]
+-    for d in ("core/p25", "core/air", "core/fec"):
++    for d in ("core/p25", "core/air", "core/fec", "core/crypto"):
+         p = os.path.join(ROOT, d)
+         deps += [os.path.join(p, f) for f in os.listdir(p) if f.endswith((".c", ".h"))]
+     if os.path.exists(BIN) and os.path.getmtime(BIN) >= max(os.path.getmtime(f) for f in deps):

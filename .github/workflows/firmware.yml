@@ -72,6 +72,12 @@ jobs:
             (cd "$T" && ./"$t")
           done
 
+      - name: Check the P25 and NXDN bench tools
+        run: |
+          python3 tools/bench/p25tool.py selftest
+          python3 tools/bench/nxdntool.py selftest
+        working-directory: build/current
+
       - name: Package the image
         id: package
         env:
