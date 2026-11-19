@@ -67,8 +67,8 @@ jobs:
         run: |
           set -eu
           T=build/current/tests/host
-          make -C "$T" -j4 voiceCipherTest dmrAesTest dmrCallTestAes p25EngineTest p25EngineTestAes nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest
-          for t in voiceCipherTest dmrAesTest dmrCallTestAes p25EngineTest p25EngineTestAes nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest; do
+          make -C "$T" -j4 voiceCipherTest dmrAesTest dmrCallTestAes p25Test p25EngineTest p25EngineTestAes p25VoiceTest nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest
+          for t in voiceCipherTest dmrAesTest dmrCallTestAes p25Test p25EngineTest p25EngineTestAes p25VoiceTest nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest; do
             (cd "$T" && ./"$t")
           done
 

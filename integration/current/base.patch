@@ -3425,7 +3425,7 @@ index b9e74018..3a746e5d 100644
  bool radio_nxdn_poll(radio_nxdn_view_t *v);
  
 diff --git a/core/radio/radio_p25.c b/core/radio/radio_p25.c
-index 2e5f94ac..1a9322e1 100644
+index 2e5f94a..2e86cb8 100644
 --- a/core/radio/radio_p25.c
 +++ b/core/radio/radio_p25.c
 @@ -1,5 +1,6 @@
@@ -3551,7 +3551,8 @@ index 2e5f94ac..1a9322e1 100644
 +	load_key(mem, &cfg);
 +#endif
  #if CONFIG_IMBE
- 	p25VoiceBegin(&mem->voice);
+-	p25VoiceBegin(&mem->voice);
++	p25VoiceBegin(&mem->voice, P25_VOICE_PRIME);
  	hooks = p25VoiceHooks();
  #endif
 +#if CONFIG_AIR_AES
@@ -6214,10 +6215,10 @@ index 2745e456..ff6e172d 100644
  WEAK bool ui_svc_write_contact(uint16_t index, const contact_t *c) { (void)index; (void)c; return false; }
 diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
 new file mode 100644
-index 0000000..56f1315
+index 0000000..bef63e4
 --- /dev/null
 +++ b/core/ysf/ysf_engine.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,628 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF conventional voice and data on a channel (ysf_engine.h).
@@ -6326,6 +6327,12 @@ index 0000000..56f1315
 +			copy_call(c->rem2, f->dch + 10, 10);
 +		}
 +		break;
++	case YSF_DT_VOICE_FR:
++		if (ysf_vw_subheader(&f->fich)) {
++			copy_call(c->rem1, f->dch, 10);
++			copy_call(c->rem2, f->dch + 10, 10);
++		}
++		break;
 +	default:
 +		break;
 +	}
@@ -6364,10 +6371,12 @@ index 0000000..56f1315
 +{
 +	unsigned played = 0;
 +
-+	if (!e->played || !e->hooks.rx_voice || f->fich.fi != YSF_FI_COMMUNICATION)
++	if (!e->played || f->fich.fi != YSF_FI_COMMUNICATION)
 +		return;
 +	switch (f->fich.dt) {
 +	case YSF_DT_VD_MODE1:
++		if (!e->hooks.rx_voice)
++			break;
 +		for (unsigned b = 0; b < YSF_BLOCKS; b++) {
 +			e->hooks.rx_voice(f->voice[b], e->ctx);
 +			played++;
@@ -6376,6 +6385,8 @@ index 0000000..56f1315
 +	case YSF_DT_VD_MODE2: {
 +		uint8_t frame9[9];
 +
++		if (!e->hooks.rx_voice)
++			break;
 +		for (unsigned b = 0; b < YSF_BLOCKS; b++) {
 +			ysf_voice_dn_to_frame(f->voice[b], frame9, NULL);
 +			e->hooks.rx_voice(frame9, e->ctx);
@@ -6383,8 +6394,21 @@ index 0000000..56f1315
 +		}
 +		break;
 +	}
++	case YSF_DT_VOICE_FR: {
++		uint8_t imbe[FEC_IMBE88_BYTES];
++
++		if (!e->hooks.rx_vw)
++			break;
++		for (unsigned b = f->voice_first; b < YSF_BLOCKS; b++) {
++			uint8_t errs = ysf_voice_vw_decode(f->voice[b], imbe);
++
++			e->hooks.rx_vw(imbe, errs, e->ctx);
++			played++;
++		}
++		break;
++	}
 +	default:
-+		break;	// Data FR: no voice; VW: no voice path yet
++		break;	// Data FR has no voice
 +	}
 +	if (played) {
 +		e->call.voice_frames += played;
@@ -6466,8 +6490,9 @@ index 0000000..56f1315
 +		if (e->view.rx_active && !wanted(e, &e->call.fich))
 +			end_call(e);
 +	}
-+	// A frame with another DG-ID than the call in hand is a new transmission
-+	if (e->view.rx_active && f->fich.sc != e->call.fich.sc)
++	// A different DG-ID or voice format starts a new call.
++	if (e->view.rx_active && (f->fich.sc != e->call.fich.sc ||
++				 f->fich.dt != e->call.fich.dt))
 +		end_call(e);
 +	switch (f->fich.fi) {
 +	case YSF_FI_HEADER:
@@ -6518,7 +6543,7 @@ index 0000000..56f1315
 +// ── Transmit ──
 +// The sequence builder's voice callback: the staged 9-byte AMBE frames
 +// become the frame's voice blocks. V/D-1 takes them as they are, DN converts
-+// them, VW has no voice path yet (its blocks stay zero).
++// them, and VW protects and interleaves full-rate IMBE.
 +static void tx_voice_cb(void *ctx, unsigned frame_no, unsigned block, uint8_t *vch, unsigned vch_len)
 +{
 +	ysf_engine_t *e = ctx;
@@ -6532,6 +6557,9 @@ index 0000000..56f1315
 +	case YSF_DT_VD_MODE2:
 +		if (vch_len == 13)
 +			ysf_voice_dn_from_frame(e->buf.tx.stage[block], vch);
++		break;
++	case YSF_DT_VOICE_FR:
++		ysf_voice_vw_encode(e->buf.tx.stage[e->txcfg.vw_subheader ? block - YSF_VW_SUBHEADER_FIRST_VOICE : block], vch);
 +		break;
 +	default:
 +		if (vch_len)
@@ -6557,12 +6585,15 @@ index 0000000..56f1315
 +// from whatever the encoder happened to have made at that instant.
 +static void top_up(ysf_engine_t *e)
 +{
-+	if (!half_rate(e->cfg.dt) || !e->hooks.tx_voice)
++	bool vw = e->cfg.dt == YSF_DT_VOICE_FR;
++	bool (*next)(uint8_t *, void *) = vw ? e->hooks.tx_vw : half_rate(e->cfg.dt) ? e->hooks.tx_voice : NULL;
++
++	if (!next)
 +		return;
 +	while (e->sq_n < 10) {
 +		uint8_t *dst = e->buf.tx.sq[(e->sq_head + e->sq_n) % 10];
 +
-+		if (!e->hooks.tx_voice(dst, e->ctx))
++		if (!next(dst, e->ctx))
 +			return;
 +		e->sq_n++;
 +	}
@@ -6583,17 +6614,24 @@ index 0000000..56f1315
 +	bool must = air_session_tx_state(&e->session) != AIR_TX_PRIMING &&
 +		    air_session_tx_queued(&e->session) < lead;
 +
-+	for (; e->stage_n < YSF_BLOCKS; e->stage_n++) {
++	bool vw = e->cfg.dt == YSF_DT_VOICE_FR;
++	unsigned blocks = e->txcfg.vw_subheader ?
++		YSF_BLOCKS - YSF_VW_SUBHEADER_FIRST_VOICE : YSF_BLOCKS;
++	unsigned size = vw ? FEC_IMBE88_BYTES : 9;
++	const uint8_t *silence = vw ? e->cfg.silence_vw : e->cfg.silence;
++	bool source = vw ? e->hooks.tx_vw != NULL : e->hooks.tx_voice != NULL;
++
++	for (; e->stage_n < blocks; e->stage_n++) {
 +		unsigned b = e->stage_n;
 +
 +		if (e->sq_n) {
-+			memcpy(e->buf.tx.stage[b], e->buf.tx.sq[e->sq_head], 9);
++			memcpy(e->buf.tx.stage[b], e->buf.tx.sq[e->sq_head], size);
 +			e->sq_head = (uint8_t)((e->sq_head + 1) % 10);
 +			e->sq_n--;
 +			continue;
 +		}
-+		if (!e->hooks.tx_voice || must) {
-+			memcpy(e->buf.tx.stage[b], e->cfg.silence, 9);
++		if (!source || must) {
++			memcpy(e->buf.tx.stage[b], silence, size);
 +			view_begin(e);
 +			e->view.tx_filler++;
 +			view_end(e);
@@ -6637,7 +6675,7 @@ index 0000000..56f1315
 +	else
 +		seq = e->frame_no;	// 1..8, communication
 +	if (seq >= 1 && seq <= 8 &&
-+	    half_rate(e->cfg.dt) && !stage_voice(e))
++	    (half_rate(e->cfg.dt) || e->cfg.dt == YSF_DT_VOICE_FR) && !stage_voice(e))
 +		return false;
 +	if (!ysf_tx_frame_build(&e->txcfg, seq, e->buf.tx.txframe))
 +		return false;	// unknown mode: nothing to send
@@ -6649,6 +6687,7 @@ index 0000000..56f1315
 +	} else if (seq == 9) {
 +		e->tx_ended = true;
 +	} else {
++		e->txcfg.vw_subheader = false;
 +		e->frame_no = e->frame_no >= 8 ? 1 : e->frame_no + 1;
 +		if (e->tx_stop && e->stop_frames < 255)
 +			e->stop_frames++;
@@ -6750,7 +6789,9 @@ index 0000000..56f1315
 +
 +bool ysf_engine_tx_prepare(ysf_engine_t *e)
 +{
-+	if (!air_session_is_open(&e->session) || !(e->session.fit & AIR_FIT_TX) || !e->cfg.silence)
++	const uint8_t *silence = e->cfg.dt == YSF_DT_VOICE_FR ? e->cfg.silence_vw : e->cfg.silence;
++
++	if (!air_session_is_open(&e->session) || !(e->session.fit & AIR_FIT_TX) || !silence)
 +		return false;
 +	if (air_session_tx_state(&e->session) == AIR_TX_IDLE) {
 +		e->frame_no = 0;
@@ -6763,6 +6804,7 @@ index 0000000..56f1315
 +		e->sq_head = 0;
 +		e->sq_n = 0;
 +		refresh_txcfg(e);
++		e->txcfg.vw_subheader = e->cfg.dt == YSF_DT_VOICE_FR;
 +	}
 +	return air_session_tx_prime(&e->session);
 +}
@@ -6807,10 +6849,10 @@ index 0000000..56f1315
 +}
 diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
 new file mode 100644
-index 0000000..ed7590a
+index 0000000..3bd4ff5
 --- /dev/null
 +++ b/core/ysf/ysf_engine.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,172 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF conventional voice and data on a channel (docs/spec/ysf.md): the
@@ -6823,9 +6865,8 @@ index 0000000..ed7590a
 +//
 +// Voice is half-rate AMBE+2, one 9-byte DMR-format frame per 20 ms block,
 +// both ways (ysf_voice.c): V/D-1 passes the VCH bytes through, DN converts
-+// them to and from its tripled/whitened/interleaved field. VW full-rate
-+// voice (DT 3) has no voice path: its frames are received (and sent) with
-+// zero voice blocks.
++// them to and from its tripled/whitened/interleaved field. VW uses the
++// separate full-rate hooks with 11-byte IMBE speech parameters.
 +#ifndef YSF_ENGINE_H
 +#define YSF_ENGINE_H
 +#include <stdbool.h>
@@ -6835,6 +6876,7 @@ index 0000000..ed7590a
 +#include "ysf_frame.h"
 +#include "ysf_rx.h"
 +#include "ysf_tx.h"
++#include "fec/imbe88.h"
 +
 +#ifdef __cplusplus
 +extern "C" {
@@ -6875,6 +6917,7 @@ index 0000000..ed7590a
 +	char rem3[YSF_CALLSIGN_LEN];
 +	char rem4[YSF_CALLSIGN_LEN];
 +	const uint8_t *silence;	// a 9-byte AMBE silence frame (the DMR one)
++	const uint8_t *silence_vw; // 11-byte packed IMBE silence for VW
 +} ysf_engine_cfg_t;
 +
 +typedef struct {
@@ -6893,6 +6936,8 @@ index 0000000..ed7590a
 +	// Transmit: one data unit (20 bytes, DN uses the first 10), indexed as
 +	// ysf_tx.h counts them. NULL: data units are zero-filled
 +	void (*tx_data)(void *ctx, unsigned index, uint8_t out[20]);
++	void (*rx_vw)(const uint8_t imbe[FEC_IMBE88_BYTES], uint8_t errs, void *ctx);
++	bool (*tx_vw)(uint8_t imbe[FEC_IMBE88_BYTES], void *ctx);
 +} ysf_engine_hooks_t;
 +
 +typedef struct {
@@ -6929,8 +6974,8 @@ index 0000000..ed7590a
 +		struct {	// transmit: the built frame, its dibits, the staged voice blocks
 +			uint8_t txframe[YSF_FRAME_BYTES];
 +			uint8_t dibits[YSF_FRAME_DIBITS / 4];
-+			uint8_t stage[YSF_BLOCKS][9];
-+			uint8_t sq[10][9];
++			uint8_t stage[YSF_BLOCKS][FEC_IMBE88_BYTES];
++			uint8_t sq[10][FEC_IMBE88_BYTES];
 +		} tx;
 +	} buf;
 +	uint16_t dib_pos;	// next dibit to queue from dibits[]
@@ -6982,10 +7027,10 @@ index 0000000..ed7590a
 +#endif
 diff --git a/core/ysf/ysf_frame.c b/core/ysf/ysf_frame.c
 new file mode 100644
-index 0000000..409e2f5
+index 0000000..79c0766
 --- /dev/null
 +++ b/core/ysf/ysf_frame.c
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,634 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// Ported from the host prototype (src/ysf/ysf_frame.c in donttellmeimcute/DM32-nxdn-p25):
@@ -7535,6 +7580,10 @@ index 0000000..409e2f5
 +		}
 +	} else if (f->dt == YSF_DT_VOICE_FR) {
 +		fill_voice(payload, YSF_PAYLOAD_BYTES);
++		if (ysf_vw_subheader(f)) {
++			ysf_dch1_encode(dch, payload);	// 45 contiguous bytes, then nine reserved bytes
++			memset(payload + 45, 0, 9);
++		}
 +	} else if (f->dt == YSF_DT_DATA_FR && dch2_or_null != NULL) {
 +// Data FR communication frame: two DCH1s, DCH-1 in bytes 0..8 of each
 +// block, DCH-2 in bytes 9..17 (MMDVM's processDataFRModeData gathers
@@ -7585,7 +7634,10 @@ index 0000000..409e2f5
 +		if (ok) memcpy(dch, tmp, 10);
 +		dch_len = 10;
 +	} else if (f->dt == YSF_DT_VOICE_FR) {
-+		dch_len = 0;
++		if (ysf_vw_subheader(f)) {
++			ok = ysf_dch1_decode(payload, dch);
++			dch_len = 20;
++		}
 +	} else if (f->dt == YSF_DT_DATA_FR) {
 +// Data FR communication frame: two DCH1s, DCH-1 in bytes 0..8 of each
 +// block, DCH-2 in bytes 9..17.
@@ -7615,10 +7667,10 @@ index 0000000..409e2f5
 +}
 diff --git a/core/ysf/ysf_frame.h b/core/ysf/ysf_frame.h
 new file mode 100644
-index 0000000..4277003
+index 0000000..8241946
 --- /dev/null
 +++ b/core/ysf/ysf_frame.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,165 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF frame layer: FICH and DCH (data channel) encode/decode, frame sync
@@ -7665,6 +7717,7 @@ index 0000000..4277003
 +	YSF_PAYLOAD_BYTES = 90,  // 5 blocks x 18 bytes
 +	YSF_BLOCK_BYTES = 18,
 +	YSF_BLOCKS = 5,
++	YSF_VW_SUBHEADER_FIRST_VOICE = 3,
 +	YSF_CALLSIGN_LEN = 10
 +};
 +
@@ -7738,6 +7791,12 @@ index 0000000..4277003
 +// Bit errors between five bytes and the frame sync.
 +unsigned ysf_sync_errors(const uint8_t sync5[YSF_SYNC_BYTES]);
 +
++// VW's first communication frame has a CSD3 sub-header followed by just two voice blocks.
++static inline bool ysf_vw_subheader(const ysf_fich *f)
++{
++	return f->dt == YSF_DT_VOICE_FR && f->fi == YSF_FI_COMMUNICATION && f->fn == 0 && f->ft == 1;
++}
++
 +// Build one whole 120-byte frame (sync + FICH + payload) from FICH fields and
 +// DCH data. dt selects the payload layout: DT 0/1 -> one DCH1 (20 bytes) per
 +// frame, DT 2 -> one DCH2 (10 bytes) per frame, DT 3 -> no DCH. For a header
@@ -7745,6 +7804,7 @@ index 0000000..4277003
 +// mode-independent: two DCH1s, dch2_or_null carrying the second (CSD2:
 +// downlink + uplink); for communication frames it is ignored, except in Data
 +// FR (DT 1), where it carries the second DCH1 (DCH-2) of the frame. The
++// VW sub-header carries one contiguous DCH1 before the reserved and voice slots. The
 +// VCH/VeCH blocks are filled with a deterministic pseudo-random pattern, not
 +// voice. dch is the first DCH's data (CSD1 for a header / FN0).
 +void ysf_frame_build(const ysf_fich *f, const uint8_t *dch, const uint8_t *dch2_or_null,
@@ -7778,10 +7838,10 @@ index 0000000..4277003
 +#endif
 diff --git a/core/ysf/ysf_rx.c b/core/ysf/ysf_rx.c
 new file mode 100644
-index 0000000..52667e7
+index 0000000..fc45f45
 --- /dev/null
 +++ b/core/ysf/ysf_rx.c
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,100 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF on the air interface: the profile and the framer hooks. The frame is
@@ -7822,10 +7882,11 @@ index 0000000..52667e7
 +	// Only communication frames carry voice blocks: a header or terminator
 +	// holds two DCH1s where the voice would be.
 +	if (out.fich.fi == YSF_FI_COMMUNICATION) {
-+		for (unsigned b = 0; b < YSF_BLOCKS; b++) {
++		out.voice_first = ysf_vw_subheader(&out.fich) ? YSF_VW_SUBHEADER_FIRST_VOICE : 0;
++		for (unsigned b = out.voice_first; b < YSF_BLOCKS; b++) {
 +			unsigned len = ysf_voice_get(frame, out.fich.dt, b, out.voice[b]);
 +
-+			if (b == 0)
++			if (b == out.voice_first)
 +				out.voice_len = (uint8_t)len;
 +		}
 +	}
@@ -7883,10 +7944,10 @@ index 0000000..52667e7
 +};
 diff --git a/core/ysf/ysf_rx.h b/core/ysf/ysf_rx.h
 new file mode 100644
-index 0000000..a47ca20
+index 0000000..6011e7d
 --- /dev/null
 +++ b/core/ysf/ysf_rx.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,64 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF on the air interface (core/air): the air_mode_t profile and the
@@ -7922,6 +7983,7 @@ index 0000000..a47ca20
 +	unsigned dch_len;	// first DCH length in bytes: 20, 10 or 0 (absent or failed CRC)
 +	uint8_t voice[YSF_BLOCKS][18];	// voice bytes per 20 ms block (communication frames only;
 +					// header/terminator frames carry DCHs there instead, voice_len 0)
++	uint8_t voice_first; // first voice block (three slots hold the VW sub-header and reserved data)
 +	uint8_t voice_len;	// bytes per voice block: 0, 9, 13 or 18
 +	uint32_t t_us;		// framer time of the frame's sync
 +	int16_t rssi_dbm;
@@ -7952,10 +8014,10 @@ index 0000000..a47ca20
 +#endif
 diff --git a/core/ysf/ysf_tx.c b/core/ysf/ysf_tx.c
 new file mode 100644
-index 0000000..9185cc3
+index 0000000..d0deb8d
 --- /dev/null
 +++ b/core/ysf/ysf_tx.c
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,164 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF transmitter: sequence builder (one frame at a time). See ysf_tx.h for
@@ -8068,6 +8130,8 @@ index 0000000..9185cc3
 +	f.fi = YSF_FI_COMMUNICATION;
 +	f.fn = (uint8_t)fn;
 +	f.ft = 7;	// final index of the eight communication frames in the block
++	if (cfg->dt == YSF_DT_VOICE_FR && cfg->vw_subheader && frame_no == 1)
++		f.ft = 1;	// identify the CSD3 sub-header
 +	uint8_t dch[20], dch2[20];
 +	memset(dch, 0, sizeof dch);
 +	memset(dch2, 0, sizeof dch2);
@@ -8098,7 +8162,9 @@ index 0000000..9185cc3
 +			second = dch2;
 +		}
 +		break;
-+	default:  // VW: no DCH
++	default:  // VW has DCH only in the sub-header
++		if (ysf_vw_subheader(&f))
++			csd3(cfg, dch);
 +		break;
 +	}
 +	ysf_frame_build(&f, dch, second, frame);
@@ -8108,7 +8174,7 @@ index 0000000..9185cc3
 +	unsigned vlen = voice_len(cfg->dt);
 +	if (vlen) {
 +		uint8_t *payload = frame + YSF_SYNC_BYTES + YSF_FICH_BYTES;
-+		for (unsigned b = 0; b < YSF_BLOCKS; b++) {
++		for (unsigned b = ysf_vw_subheader(&f) ? YSF_VW_SUBHEADER_FIRST_VOICE : 0; b < YSF_BLOCKS; b++) {
 +			uint8_t *vch = payload + voice_off(cfg->dt, b);
 +			if (cfg->voice) cfg->voice(cfg->ctx, frame_no, b, vch, vlen);
 +			else memset(vch, 0, vlen);
@@ -8119,10 +8185,10 @@ index 0000000..9185cc3
 \ No newline at end of file
 diff --git a/core/ysf/ysf_tx.h b/core/ysf/ysf_tx.h
 new file mode 100644
-index 00000000..ee5ff5a1
+index 0000000..620305c
 --- /dev/null
 +++ b/core/ysf/ysf_tx.h
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,103 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// YSF transmitter, firmware: builds a whole transmission (header ->
 +// communication frames FN 0..7 -> terminator), one frame at a time. Mirror
@@ -8145,7 +8211,7 @@ index 00000000..ee5ff5a1
 +// Frame sequence (Yaesu Fig. 4-1; MMDVM YSFControl.cpp / YSFPayload.cpp):
 +// one header (FI 0), eight communication frames (FI 1, FN 0..7), one
 +// terminator (FI 2). Longer transmissions repeat the communication block
-+// (cycles > 1). FICH: FT/BN/BT are 0, as MMDVM leaves them on transmit; DT is
++// (cycles > 1). FICH: FT gives the last FN and BN/BT are 0; DT is
 +// the configured mode on every frame; Dev selects Wide (0) / Narrow (1);
 +// SC is the DG-ID.
 +//
@@ -8157,9 +8223,8 @@ index 00000000..ee5ff5a1
 +//     each), FN5=Rem3+Rem4, FN6/7 = data DT1/DT2 (10 bytes each).
 +//   Data FR (DT 1): FN0: DCH-1=CSD1, DCH-2=CSD2; FN1: DCH-1=CSD3,
 +//     DCH-2=DT1; FN2..7: DCH-1/DCH-2 = DT2/DT3 .. DT12/DT13 (20 bytes each).
-+//   VW (DT 3): no DCH in communication frames. The CC0 sub-header of Yaesu
-+//     Fig. 4-22 (5x72 DCH + 72 reserved + 2x144 VCH) is NOT built: no source
-+//     states what its DCH carries.
++//   VW (DT 3): optionally send CSD3 and two voice blocks in the first CC
++//     (FT=1/FN=0). Subsequent communication frames carry five voice blocks.
 +// The header and the terminator always carry CSD1 + CSD2 (two DCH1s),
 +// whatever the mode (MMDVM writeHeader / processHeaderData).
 +//
@@ -8167,9 +8232,7 @@ index 00000000..ee5ff5a1
 +// voice callback (9 bytes V/D-1, 13 bytes DN: VCH 9 + VeCH 4, 18 bytes VW).
 +// With no callback the voice blocks are all zero: a deterministic test
 +// payload, NOT a valid AMBE silence frame. The engine (ysf_engine.c)
-+// supplies real voice: half-rate AMBE+2 frames through the DMR vocoder
-+// path (ysf_voice.c). VW full-rate voice (88 parameter bits) is NOT
-+// implemented: its blocks stay zero (docs/spec/ysf.md).
++// supplies AMBE+2 for V/D-1 and DN, and IMBE-compatible full-rate voice for VW.
 +//
 +// Integer arithmetic only, no allocation.
 +#ifndef YSF_TX_H
@@ -8189,7 +8252,7 @@ index 00000000..ee5ff5a1
 +typedef void (*ysf_tx_data_fn)(void *ctx, unsigned index, uint8_t out[20]);
 +// Voice blocks: fills one 20 ms block's voice bytes (vch_len: 9 V/D-1,
 +// 13 DN, 18 VW). frame_no is the sequence frame number (1..8*cycles,
-+// communication frames only).
++// communication frames only). The VW sub-header calls back only for blocks 3 and 4.
 +typedef void (*ysf_tx_voice_fn)(void *ctx, unsigned frame_no, unsigned block,
 +								uint8_t *vch, unsigned vch_len);
 +
@@ -8210,6 +8273,7 @@ index 00000000..ee5ff5a1
 +	char rem2[YSF_CALLSIGN_LEN];
 +	char rem3[YSF_CALLSIGN_LEN];
 +	char rem4[YSF_CALLSIGN_LEN];
++	bool vw_subheader;  // send the CSD3 sub-header in the first VW communication frame
 +	unsigned cycles;  // communication-block repeats, >= 1 (1 = 10 frames)
 +	ysf_tx_data_fn data;  // NULL: data units are zero-filled
 +	ysf_tx_voice_fn voice;  // NULL: voice blocks are zero-filled (test payload, not AMBE)
@@ -8230,10 +8294,10 @@ index 00000000..ee5ff5a1
 +#endif
 diff --git a/core/ysf/ysf_voice.c b/core/ysf/ysf_voice.c
 new file mode 100644
-index 00000000..09ebba07
+index 0000000..e77292e
 --- /dev/null
 +++ b/core/ysf/ysf_voice.c
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,150 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF voice: half-rate AMBE+2 between a decoded YSF frame and the 9-byte
@@ -8342,12 +8406,54 @@ index 00000000..09ebba07
 +	for (unsigned i = 0; i < 104; i++)
 +		put_bit(field, dn_table(i), get_bit(vch, i));
 +}
++
++
++// VW air bit for each consecutive bit in the eight IMBE codewords (MSB first).
++// Same permutation as MMDVMHost AMBEFEC::regenerateIMBE and DSD-FME fr_interleave.
++static const uint8_t vw_interleave[144] = {
++	  0,   7,  12,  19,  24,  31,  36,  43,  48,  55,  60,  67,
++	 72,  79,  84,  91,  96, 103, 108, 115, 120, 127, 132, 139,
++	  1,   6,  13,  18,  25,  30,  37,  42,  49,  54,  61,  66,
++	 73,  78,  85,  90,  97, 102, 109, 114, 121, 126, 133, 138,
++	  2,   9,  14,  21,  26,  33,  38,  45,  50,  57,  62,  69,
++	 74,  81,  86,  93,  98, 105, 110, 117, 122, 129, 134, 141,
++	  3,   8,  15,  20,  27,  32,  39,  44,  51,  56,  63,  68,
++	 75,  80,  87,  92,  99, 104, 111, 116, 123, 128, 135, 140,
++	  4,  11,  16,  23,  28,  35,  40,  47,  52,  59,  64,  71,
++	 76,  83,  88,  95, 100, 107, 112, 119, 124, 131, 136, 143,
++	  5,  10,  17,  22,  29,  34,  41,  46,  53,  58,  65,  70,
++	 77,  82,  89,  94, 101, 106, 113, 118, 125, 130, 137, 142,
++};
++static const uint8_t vw_word_bits[8] = { 23, 23, 23, 23, 15, 15, 15, 7 };
++
++uint8_t ysf_voice_vw_decode(const uint8_t field[18], uint8_t imbe[FEC_IMBE88_BYTES])
++{
++	uint32_t words[8] = {0};
++	unsigned k = 0;
++
++	for (unsigned i = 0; i < 8; i++)
++		for (unsigned b = 0; b < vw_word_bits[i]; b++)
++			words[i] = (words[i] << 1) | (uint32_t)get_bit(field, vw_interleave[k++]);
++	return fec_imbe88_decode(words, imbe);
++}
++
++void ysf_voice_vw_encode(const uint8_t imbe[FEC_IMBE88_BYTES], uint8_t field[18])
++{
++	uint32_t words[8];
++	unsigned k = 0;
++
++	fec_imbe88_encode(imbe, words);
++	memset(field, 0, 18);
++	for (unsigned i = 0; i < 8; i++)
++		for (unsigned b = vw_word_bits[i]; b > 0; b--)
++			put_bit(field, vw_interleave[k++], (words[i] >> (b - 1)) & 1u);
++}
 diff --git a/core/ysf/ysf_voice.h b/core/ysf/ysf_voice.h
 new file mode 100644
-index 00000000..de1f2a54
+index 0000000..c8b79cc
 --- /dev/null
 +++ b/core/ysf/ysf_voice.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,59 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF voice: half-rate AMBE+2 (49 parameter bits) between a decoded YSF
@@ -8365,16 +8471,16 @@ index 00000000..de1f2a54
 +// the same AMBE+2 parameters the DVSI blob expects. The channel mapping is
 +// proven against MMDVMHost (see the test), the parameter semantics are not:
 +// no public YSF voice vector or air capture exists to prove them against.
-+// The DN triplet order (first 27 parameters) is read from Yaesu Fig. 4-32,
-+// not observed in MMDVM (which never extracts DN parameters). VW full-rate
-+// voice (DT 3, 88 parameter bits) is NOT implemented: its blocks are read
-+// as 18 raw bytes and never reach the vocoder (docs/spec/ysf.md).
++//
++// VW (DT 3) uses the IMBE-compatible 88-bit speech data, with its own permutation
++// of the Golay/Hamming-protected bits.
 +#ifndef YSF_VOICE_H
 +#define YSF_VOICE_H
 +#include <stdbool.h>
 +#include <stdint.h>
 +
 +#include "ysf_frame.h"
++#include "fec/imbe88.h"
 +
 +#ifdef __cplusplus
 +extern "C" {
@@ -8398,6 +8504,10 @@ index 00000000..de1f2a54
 +// 9-byte DMR-format AMBE frame -> DN voice field: ambeFecDecode, triplicate
 +// the first 27 parameters, whiten, interleave. The pad bit is sent as 0.
 +void ysf_voice_dn_from_frame(const uint8_t frame9[9], uint8_t field[13]);
++
++// VW: 18 bytes on air, 11 packed vocoder bytes. Decode returns the IMBE FEC error byte.
++uint8_t ysf_voice_vw_decode(const uint8_t field[18], uint8_t imbe[FEC_IMBE88_BYTES]);
++void ysf_voice_vw_encode(const uint8_t imbe[FEC_IMBE88_BYTES], uint8_t field[18]);
 +
 +#ifdef __cplusplus
 +}
@@ -8895,10 +9005,10 @@ index b2a614fa..6f7fcac8 100644
  CPS shim's area 1 reads, can see them. The settings area is outside what the open-firmware CPS reads by region, but area 1
 diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
 new file mode 100644
-index 00000000..04cc73e2
+index 0000000..371d04e
 --- /dev/null
 +++ b/docs/spec/ysf.md
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,193 @@
 +<!-- SPDX-License-Identifier: MIT -->
 +<!-- Copyright (c) 2026 The RadioFoundry Authors -->
 +<!-- Copyright (c) 2026 lyra XE1POC (changes) -->
@@ -8919,7 +9029,7 @@ index 00000000..04cc73e2
 +| Frame codec: sync, FICH (Golay + Viterbi + deinterleave + CRC-16), DCH (deinterleave + Viterbi + whitening + CRC-16), whitening PN(9,5) | written, host tested |
 +| Receive, the call layer, the engine | written, host tested; RX through the generic soft modem and framer, TX through the provider's native 4FSK slot engine |
 +| Voice half-rate (V/D-1 and DN) | written, host tested in loopback; the 49 parameter bits go through the DMR side's voice path to the vocoder the board hosts (`hal_vocoder_t`) |
-+| Voice full-rate (VW, DT 3, 88 parameter bits) | not written: frames are received and sent, the voice blocks stay zero |
++| Voice full-rate (VW, DT 3, 88 parameter bits) | RX and TX use the shared IMBE voice path on a channel set to VW |
 +| DG-ID squelch | written, host tested; first cut, see below |
 +| The radio core: mode, settings, PTT, debug link, home screen | not written: no channel mode, no codeplug kind, no editor row, no UI |
 +| Codeplug channels, the site's Codeplug Editor | not written |
@@ -9019,9 +9129,14 @@ index 00000000..04cc73e2
 +"triplet k = parameter k" order is inferred from Yaesu figure 4-32, not
 +directly observed in MMDVM (which never extracts DN parameters).
 +
-+VW (DT 3): full-rate voice, 88 parameter bits, is a separate problem (an
-+IMBE-style path, not the blob's 49-bit interface). Frames are received and
-+sent, but the voice blocks stay zero and no voice hook runs.
++VW (DT 3) uses 88 speech bits per 20 ms block. It shares the Golay/Hamming
++codes and whitening with P25 and uses the YSF-specific 144-bit interleaver.
++The initial communication frame (FN=0, FT=1) carries CSD3, 72 reserved bits,
++and two voice blocks. Normal communication frames carry five voice blocks.
++
++Set the channel's YSF data type to VW to use full-rate receive and transmit.
++On the DM-32UV the IMBE path borrows the AMBE vocoder's RAM for the duration
++of the channel session. Select DN or V/D-1 for half-rate audio.
 +
 +## 5. The engine
 +
@@ -9055,7 +9170,14 @@ index 00000000..04cc73e2
 +queue runs short, silence goes instead. After the key, a communication
 +frame is still built while voice the encoder already made waits in the
 +ring, so the tail of the over is sent, not dropped, and the terminator
-+follows once the ring is empty.
++follows once the ring is empty. The tail is at most the ring (10 blocks in
++sq, 5 staged: 3 frames), so past 10 communication frames after the key the
++terminator is forced and the rest of the ring is dropped: a voice source
++that never stops cannot hold the transmitter on. The voice stream is
++restarted at every transmission (the DMR call does the same), so each over
++starts with a live audio callback and a fresh microphone route: the stream
++otherwise runs since the channel was selected, and a beep or a stream
++takeover can leave it stale or dead and every over goes out silent.
 +
 +## 6. DG-ID squelch
 +
@@ -9066,15 +9188,20 @@ index 00000000..04cc73e2
 +
 +## 7. Not written
 +
-+- Radio glue: no `RADIO_MODE_YSF`, no codeplug kind, no channel mode, no
-+  web editor, no UI mode row, no VFO or radio state-machine wiring. A full
-+  mode is a separate, larger job (NXDN is woven through about 20 places in
-+  the radio state machine) and cannot be validated on air yet.
-+- VW full-rate voice (section 4).
 +- The `hrc6000AirTest` provider fit case: the engine test's fake provider
 +  covers the YSF fit; the CI firmware build is the real check.
 +- On-air validation of any of it (M2, M4, M5b, M5c in
 +  `docs/ysf-c4fm.md`).
++
++## 8. The channel kind
++
++The radio glue is written: `RADIO_MODE_YSF`, `CODEPLUG_KIND_YSF` (kind 6),
++`core/radio/radio_ysf.c`, the channel editor rows, the mode row, dual watch,
++the debug link and zone import. The channel format is
++[ysf-codeplug.md](ysf-codeplug.md): a 13-byte tag block on the channel
++(data type, deviation, DG-IDs, destination call sign) and a 30-byte
++radio-wide identity record (source, downlink and uplink call signs). The
++web editor's `mode_ysf.js` is still to be written against that format.
 diff --git a/docs/user/05-keys-and-navigation.md b/docs/user/05-keys-and-navigation.md
 index 15839ccc..743dc2df 100644
 --- a/docs/user/05-keys-and-navigation.md
@@ -10038,7 +10165,7 @@ index cbc2ae9f..f85ed716 100644
  switch = "DMR"
  spec = "docs/spec/dmr-voice.md"
 diff --git a/tests/host/Makefile b/tests/host/Makefile
-index 620197b7..602e461d 100644
+index 620197b..7183340 100644
 --- a/tests/host/Makefile
 +++ b/tests/host/Makefile
 @@ -1,5 +1,6 @@
@@ -10082,8 +10209,8 @@ index 620197b7..602e461d 100644
 +# YSF frames, their FEC and voice, and the engine on two made-up providers (core/ysf)
 +YSF     := $(CORE)/ysf/ysf_frame.c $(CORE)/ysf/ysf_voice.c $(CORE)/ysf/ysf_rx.c $(CORE)/ysf/ysf_tx.c $(CORE)/dmr/ambe/ambeFec.c
 +TESTS   += ysfTest ysfEngineTest
-+ysfTest: ysfTest.c $(YSF) $(wildcard $(CORE)/ysf/*.h) $(CORE)/dmr/ambe/ambeFec.h
-+	$(CC) $(CFLAGS) -I$(ROOT)/hal -Wshadow -DCONFIG_YSF=1 -o $@ ysfTest.c $(YSF)
++ysfTest: ysfTest.c $(YSF) $(FEC) $(wildcard $(CORE)/ysf/*.h) $(CORE)/dmr/ambe/ambeFec.h
++	$(CC) $(CFLAGS) -I$(ROOT)/hal -Wshadow -DCONFIG_YSF=1 -o $@ ysfTest.c $(YSF) $(FEC)
 +ysfEngineTest: ysfEngineTest.c $(CORE)/ysf/ysf_engine.c $(YSF) $(wildcard $(CORE)/ysf/*.h) $(CORE)/air/air_session.c $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(FEC)
 +	$(CC) $(CFLAGS) -I$(ROOT)/hal -Wshadow -DCONFIG_YSF=1 -o $@ ysfEngineTest.c $(CORE)/ysf/ysf_engine.c $(YSF) $(CORE)/air/air_session.c $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(FEC) -lm
  
@@ -10132,7 +10259,7 @@ index 620197b7..602e461d 100644
  radioCoreTestP25: $(RCP25) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/dmr/dmrDataService.h \
                    $(CORE)/ui/ui_svc.h $(wildcard $(CORE)/p25/*.h) $(wildcard $(CORE)/air/*.h)
  	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
-@@ -314,15 +336,17 @@ radioCoreTestP25T: $(RCP25T) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dm
+@@ -314,15 +336,30 @@ radioCoreTestP25T: $(RCP25T) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dm
  # through the DMR side's vocoder path. No vocoder lends memory (as on the STM32 platform)
  TESTS   += radioCoreTestNxdn radioCoreTestP25Nxdn
  RCNXDN  := $(RCORE) $(CORE)/radio/radio_nxdn.c $(CORE)/nxdn/nxdn_engine.c $(NXDN) $(CORE)/air/air_session.c \
@@ -10144,6 +10271,19 @@ index 620197b7..602e461d 100644
  	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
  		-DCONFIG_NXDN=1 -DCONFIG_AIR_RAW=1 -o $@ $(RCNXDN) -lm
  
++# The same with YSF (CONFIG_YSF): the far end is a YSF engine on the fake board.air; the voice goes
++# through the DMR side's vocoder path. No vocoder lends memory (as on the STM32 platform)
++# (sorted: the lists share the AMBE FEC source, which sort drops the second copy of)
++TESTS   += radioCoreTestYsf
++RCYSF   := $(sort $(RCORE) $(CORE)/radio/radio_ysf.c $(CORE)/ysf/ysf_engine.c $(YSF) $(CORE)/ysf/ysf_codeplug.c \
++           $(CORE)/air/air_session.c $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(FEC) \
++           $(CORE)/debuglink/debuglink_view_ysf.c $(CORE)/hostlink/build_info.c $(CORE)/crypto/air_nonce.c \
++           $(CORE)/crypto/aes256.c)
++radioCoreTestYsf: $(RCYSF) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/dmr/dmrDataService.h \
++                   $(CORE)/ui/ui_svc.h $(wildcard $(CORE)/ysf/*.h) $(wildcard $(CORE)/air/*.h) $(wildcard $(CORE)/dmr/ambe/*.h)
++	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
++		-DCONFIG_YSF=1 -DCONFIG_AIR_RAW=1 -o $@ $(RCYSF) -lm
++
  # P25 and NXDN together, no lending vocoder: one engine at a time, NXDN in the memory P25 keeps for itself
 -RCP25NX := $(RCNXDN) $(CORE)/radio/radio_p25.c $(CORE)/p25/p25_engine.c $(P25) $(CORE)/p25/p25Voice.c $(MBE) \
 -           $(CORE)/debuglink/debuglink_view_p25.c
@@ -10153,7 +10293,7 @@ index 620197b7..602e461d 100644
  radioCoreTestP25Nxdn: $(RCP25NX) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/dmr/dmrDataService.h \
                        $(CORE)/ui/ui_svc.h $(wildcard $(CORE)/nxdn/*.h) $(wildcard $(CORE)/p25/*.h) $(wildcard $(CORE)/air/*.h) \
                        $(wildcard $(CORE)/dmr/ambe/*.h)
-@@ -349,7 +373,7 @@ radioCoreTestAprsDmr: $(RCAPRSD) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE
+@@ -349,7 +386,7 @@ radioCoreTestAprsDmr: $(RCAPRSD) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE
  TESTS   += radioFeaturesTest
  RFTEST  := radioFeaturesTest.c $(CORE)/radio/radio_sm.c $(CORE)/codeplug/codeplug_keys.c $(CORE)/radio/tones.c $(RFEAT) $(CORE)/dmr/call/dmr_call.c $(CORE)/dmr/fec/dmrCach.c \
             $(CORE)/dmr/call/dmr_lc.c $(CORE)/dmr/fec/dmrFec.c $(CORE)/dmr/ambe/ambeVoice.c $(CORE)/dmr/ambe/ambeFec.c \
@@ -10162,7 +10302,7 @@ index 620197b7..602e461d 100644
             $(CORE)/dmr/dmrLrrp.c $(CORE)/dmr/dmr_emergency.c $(CORE)/radio/morse.c $(CORE)/dmr/zoneShare.c $(CORE)/dmr/zoneShareSvc.c $(CORE)/dmr/dmrAirQueue.c \
             $(CORE)/settings/settings.c $(CORE)/storage/storage.c $(CORE)/usbaudio/audio_mux.c \
             $(CORE)/usbaudio/pcm_slip.c $(CORE)/dmr/sfrRunner.c $(CORE)/dmr/sfr.c $(POSLIB)
-@@ -445,6 +469,14 @@ resampleTest: resampleTest.c $(ROOT)/drivers/audio/resample/resample.h
+@@ -445,20 +482,29 @@ resampleTest: resampleTest.c $(ROOT)/drivers/audio/resample/resample.h
  TESTS   += batteryTest
  batteryTest: batteryTest.c $(ROOT)/drivers/power/battery/battery.h
  	$(CC) $(CFLAGS) -I$(ROOT)/drivers -Wshadow -o $@ batteryTest.c
@@ -10177,16 +10317,24 @@ index 620197b7..602e461d 100644
  # The band check of hal/board.h, which the core and the radios share
  TESTS   += boardBandTest
  boardBandTest: boardBandTest.c $(ROOT)/hal/board.h
-@@ -452,7 +484,7 @@ boardBandTest: boardBandTest.c $(ROOT)/hal/board.h
+ 	$(CC) $(CFLAGS) -I$(ROOT)/hal -Wshadow -o $@ boardBandTest.c
  
  run: run-core
- run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T radioCoreTestNxdn radioCoreTestP25Nxdn radioCoreTestAprs radioCoreTestAprsDmr radioFeaturesTest radioFeaturesTestNoDual roamTest radioListenBandsTest inputTest switchFollowTest aprsRadioTest quadratureTest serialmicTest miclevelTest resampleTest \
+-run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T radioCoreTestNxdn radioCoreTestP25Nxdn radioCoreTestAprs radioCoreTestAprsDmr radioFeaturesTest radioFeaturesTestNoDual roamTest radioListenBandsTest inputTest switchFollowTest aprsRadioTest quadratureTest serialmicTest miclevelTest resampleTest \
 -          rx2LinkTest keyassignTest powerSwitchTest powerKeyTest boardBandTest batteryTest
++run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T radioCoreTestNxdn radioCoreTestP25Nxdn radioCoreTestYsf radioCoreTestAprs radioCoreTestAprsDmr radioFeaturesTest radioFeaturesTestNoDual roamTest radioListenBandsTest inputTest switchFollowTest aprsRadioTest quadratureTest serialmicTest miclevelTest resampleTest \
 +          rx2LinkTest keyassignTest powerSwitchTest powerKeyTest boardBandTest batteryTest aesTest voiceCipherTest
  	./aprsRadioTest
  	./radioCoreTest
  	./radioCoreTestNoVfoDmr
-@@ -478,6 +510,8 @@ run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T
+ 	./radioCoreTestP25
+ 	./radioCoreTestNxdn
+ 	./radioCoreTestP25Nxdn
++	./radioCoreTestYsf
+ 	./radioCoreTestP25T
+ 	./radioCoreTestAprs
+ 	./radioCoreTestAprsDmr
+@@ -478,6 +524,8 @@ run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T
  	./powerKeyTest
  	./boardBandTest
  	./batteryTest
@@ -10195,7 +10343,7 @@ index 620197b7..602e461d 100644
  .PHONY: run-core
  
  # The read-only codeplug (open-firmware layout and built-in channels), on fake flash images
-@@ -830,10 +864,20 @@ TESTS   += dmrCallTest
+@@ -830,10 +878,20 @@ TESTS   += dmrCallTest
  
  dmrCallTest: $(CALL) $(wildcard $(CORE)/dmr/call/*.h sim/*.h)
  	$(CC) $(CFLAGS) -I$(ROOT)/hal -I. -Wshadow -DHAS_SFR -DDMR_RX_TRACE=0 -o $@ $(CALL)
@@ -10217,6 +10365,25 @@ index 620197b7..602e461d 100644
  .PHONY: run-call
  
  # The HR_C6000 DMR modem: register sequences, burst status decode, RX de-duplication, TX queue and slot scheduling
+@@ -1445,6 +1503,18 @@ run-nxdncp: nxdnCodeplugTest
+ 	./nxdnCodeplugTest
+ .PHONY: run-nxdncp
+ 
++# YSF in the codeplug (core/ysf/ysf_codeplug.c): the shared vectors, a channel's set-up, the radio-wide record, a channel saved from the radio
++TESTS   += ysfCodeplugTest
++YSFCP   := $(CPTAG) $(CORE)/codeplug/codeplug_talk.c $(CORE)/codeplug/codeplug_tag.c $(CORE)/codeplug/codeplug_records.c $(CORE)/ysf/ysf_codeplug.c
++
++ysfCodeplugTest: ysfCodeplugTest.c $(YSFCP) $(wildcard $(CORE)/codeplug/*.h $(CORE)/ysf/*.h) ../vectors/channel-modes.txt
++	$(CC) $(CFLAGS) -I$(ROOT)/hal -I. -Wshadow -DCONFIG_AIR=1 -DCONFIG_YSF=1 -o $@ ysfCodeplugTest.c $(YSFCP)
++
++run: run-ysfcp
++run-ysfcp: ysfCodeplugTest
++	./ysfCodeplugTest
++.PHONY: run-ysfcp
++
+ # Zone editing (core/codeplug/zone_edit.c) on the real codeplug over a simulated flash: add, move, remove, copy,
+ # rename, delete, a new channel added in one step, the limits
+ ZEDIT   := $(CORE)/codeplug/zone_edit.c $(CORE)/codeplug/zone_shift.c $(CORE)/codeplug/zone_settle.c $(CPEDIT) \
 diff --git a/tests/host/aesTest.c b/tests/host/aesTest.c
 new file mode 100644
 index 00000000..f62b6410
@@ -12569,10 +12736,10 @@ index 00000000..b36fd8b0
 +}
 diff --git a/tests/host/ysfEngineTest.c b/tests/host/ysfEngineTest.c
 new file mode 100644
-index 0000000..556e7d8
+index 0000000..41b4f69
 --- /dev/null
 +++ b/tests/host/ysfEngineTest.c
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,595 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// The YSF engine (core/ysf/ysf_engine.c) and the air interface session under
@@ -13085,6 +13252,76 @@ index 0000000..556e7d8
 +	ysf_engine_end(&r[1].e);
 +}
 +
++static const uint8_t vw_silence[FEC_IMBE88_BYTES] = { 0xD8 };
++static uint16_t vw_made, vw_taken, vw_heard;
++static uint8_t vw_rx[VMAX][FEC_IMBE88_BYTES];
++
++static void vw_params(uint16_t sample, uint8_t imbe[FEC_IMBE88_BYTES])
++{
++	for (unsigned i = 0; i < FEC_IMBE88_BYTES; i++)
++		imbe[i] = (uint8_t)(3u * sample + i * 17u);
++}
++
++static bool vw_encode(uint8_t imbe[FEC_IMBE88_BYTES], void *ctx)
++{
++	(void)ctx;
++	if (vw_taken == vw_made)
++		return false;
++	vw_params(vw_taken++, imbe);
++	return true;
++}
++
++static void vw_play(const uint8_t imbe[FEC_IMBE88_BYTES], uint8_t errs, void *ctx)
++{
++	(void)ctx;
++	CHECK(errs == 0, "VW channel FEC succeeds");
++	if (vw_heard < VMAX)
++		memcpy(vw_rx[vw_heard++], imbe, FEC_IMBE88_BYTES);
++}
++
++static void testVW(bool narrow)
++{
++	ysf_engine_cfg_t cfg = base_cfg(YSF_DT_VOICE_FR, narrow);
++	ysf_engine_hooks_t vw = hooks;
++	uint16_t n;
++	uint16_t heard = 0;
++
++	vw.rx_vw = vw_play;
++	vw.tx_vw = vw_encode;
++	cfg.silence_vw = vw_silence;
++	vw_made = vw_taken = vw_heard = 0;
++	begin(0, &cfg, &vw);
++	begin(1, &cfg, &vw);
++	CHECK(ysf_engine_tx_prepare(&r[0].e), "VW primes");
++	prov[0].keyed = true;
++	CHECK(ysf_engine_tx_go(&r[0].e), "VW keys");
++	for (n = 0; n < 115; n++) {
++		if (n < 80)
++			vw_made += (uint16_t)(1 + (n & 1));
++		if (n == 80)
++			ysf_engine_tx_stop(&r[0].e);
++		steps(1);
++		if (ysf_engine_tx_state(&r[0].e) == AIR_TX_DONE)
++			break;
++	}
++	CHECK(n < 115 && prov[0].underruns == 0 && r[1].ends == 1, "VW tail terminates cleanly");
++	for (unsigned i = 0; i < vw_heard; i++) {
++		uint8_t expected[FEC_IMBE88_BYTES];
++
++		if (!memcmp(vw_rx[i], vw_silence, sizeof vw_silence))
++			continue;
++		vw_params(heard++, expected);
++		CHECK(!memcmp(vw_rx[i], expected, sizeof expected), "VW keeps block order at %u", i);
++	}
++	CHECK(vw_taken == vw_made && heard == vw_made && vw_heard % 5 == 2,
++	      "VW all %u blocks heard (%u with filler), exactly one two-block sub-header", vw_made, vw_heard);
++	CHECK(r[1].starts == 1 && r[1].nvoice == 0 && r[1].ndata == 0 &&
++	      !strcmp(r[1].call.rem1, "REM1") && !strcmp(r[1].call.rem2, "REM2"),
++	      "VW preserves CSD3 and uses only the full-rate voice hooks");
++	ysf_engine_end(&r[0].e);
++	ysf_engine_end(&r[1].e);
++}
++
 +int main(void)
 +{
 +	testCall(YSF_DT_VD_MODE1, false);
@@ -13093,6 +13330,8 @@ index 0000000..556e7d8
 +	testSquelch();
 +	testBadData(YSF_DT_VD_MODE1);
 +	testBadData(YSF_DT_VD_MODE2);
++	testVW(false);
++	testVW(true);
 +	printf("ysfEngineTest: %d checks, %d failed\n", checks, failures);
 +	return failures ? 1 : 0;
 +}
@@ -14622,10 +14861,10 @@ index 968d8a8..5776a56 100644
  // The air interface bench's way to the radio (debuglink_air_core_t), from the debug link task. Enter and keying wait
 diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
 new file mode 100644
-index 0000000..c3f7da6
+index 0000000..3c9ad56
 --- /dev/null
 +++ b/core/radio/radio_ysf.c
-@@ -0,0 +1,441 @@
+@@ -0,0 +1,545 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF conventional on a channel, the radio core's side (radio_ysf.h)
@@ -14641,6 +14880,9 @@ index 0000000..c3f7da6
 +#include "codeplug/codeplug_modes.h"
 +#include "dmr/ambe/ambeVoice.h"
 +#include "dmr/call/dmr_call.h"
++#if CONFIG_P25 && CONFIG_IMBE
++#include "p25/p25Voice.h"
++#endif
 +#if CONFIG_P25 && !defined(HAL_VOCODER_LEND_BYTES)
 +#include "radio/radio_p25.h"
 +#endif
@@ -14820,12 +15062,81 @@ index 0000000..c3f7da6
 +// The encoder runs from the header on, so the first voice frames are ready when the engine asks
 +static void voice_tx(bool on)
 +{
++#if CONFIG_P25 && CONFIG_IMBE
++	if (eng->cfg.dt == YSF_DT_VOICE_FR) {
++		p25VoiceTx(on);
++		return;
++	}
++#endif
 +	const dmr_voice_source_t *s = ambeVoiceSource();
 +
 +	if (on)
 +		s->begin(s->ctx);
 +	else
 +		s->end(s->ctx);
++}
++
++#if CONFIG_P25 && CONFIG_IMBE
++// VW and AMBE+2 are exclusive on the DM-32UV: the IMBE voice path borrows the AMBE vocoder's state memory.
++static p25_voice_mem_t *vw_mem_get(void)
++{
++	size_t len = 0;
++#ifdef HAL_VOCODER_LEND_BYTES
++	_Static_assert(sizeof(p25_voice_mem_t) <= HAL_VOCODER_LEND_BYTES, "VW voice exceeds vocoder memory");
++	void *m = board.vocoder != NULL && board.vocoder->lend != NULL ? board.vocoder->lend(&len) : NULL;
++#else
++	size_t offset = (sizeof(ysf_engine_t) + 7u) & ~(size_t)7u;
++	void *m = radio_p25_idle_mem(&len);
++
++	if (m == NULL || len < offset)
++		return NULL;
++	m = (uint8_t *)m + offset;
++	len -= offset;
++#endif
++	return m != NULL && len >= sizeof(p25_voice_mem_t) && ((uintptr_t)m & 7u) == 0 ? m : NULL;
++}
++
++static bool vw_rx_open;	// provider task, while it owns the YSF session
++
++static void vw_start(const ysf_call_t *call, void *ctx)
++{
++	vw_rx_open = call->fich.dt == YSF_DT_VOICE_FR;
++	if (vw_rx_open)
++		p25VoiceHooks()->rx_start(NULL, ctx);
++}
++
++static void vw_end(void *ctx)
++{
++	if (vw_rx_open)
++		p25VoiceHooks()->rx_end(ctx);
++	vw_rx_open = false;
++}
++
++static void vw_voice(const uint8_t imbe[FEC_IMBE88_BYTES], uint8_t errs, void *ctx)
++{
++	p25VoiceHooks()->rx_voice(imbe, errs, ctx);
++}
++
++static bool vw_next(uint8_t imbe[FEC_IMBE88_BYTES], void *ctx)
++{
++	return p25VoiceHooks()->tx_voice(imbe, ctx);
++}
++
++static const ysf_engine_hooks_t vw_hooks = { .rx_start = vw_start, .rx_end = vw_end,
++					      .rx_vw = vw_voice, .tx_vw = vw_next };
++#endif
++
++static void voice_end(bool vw)
++{
++#if CONFIG_P25 && CONFIG_IMBE
++	if (vw) {
++		p25VoiceEnd();
++		return;
++	}
++#else
++	(void)vw;
++#endif
++	ambeVoiceStop();
 +}
 +
 +static ysf_engine_t *mem_get(void)
@@ -14855,9 +15166,30 @@ index 0000000..c3f7da6
 +		stats.begin_fails++;
 +		return false;
 +	}
-+	ambeVoiceStart();	// before the engine: its first call may come at once
-+	if (!ysf_engine_begin(eng, board.air, &cfg, &voice_hooks, NULL)) {
-+		ambeVoiceStop();
++	const ysf_engine_hooks_t *hooks = &voice_hooks;
++	bool vw = cfg.dt == YSF_DT_VOICE_FR;
++
++	if (vw) {
++#if CONFIG_P25 && CONFIG_IMBE
++		p25_voice_mem_t *mem = vw_mem_get();
++
++		if (mem != NULL) {
++			vw_rx_open = false;
++			p25VoiceBegin(mem, YSF_BLOCKS);
++			cfg.silence_vw = imbe_silence;
++			hooks = &vw_hooks;
++		}
++#endif
++		if (!cfg.silence_vw) {
++			eng = NULL;
++			stats.begin_fails++;
++			return false;
++		}
++	} else {
++		ambeVoiceStart();
++	}
++	if (!ysf_engine_begin(eng, board.air, &cfg, hooks, NULL)) {
++		voice_end(vw);
 +		eng = NULL;
 +		stats.begin_fails++;
 +		return false;
@@ -14872,7 +15204,7 @@ index 0000000..c3f7da6
 +	if (eng == NULL)
 +		return;
 +	ysf_engine_end(eng);	// the provider closed: no hook runs after this
-+	ambeVoiceStop();
++	voice_end(eng->cfg.dt == YSF_DT_VOICE_FR);
 +	eng = NULL;
 +}
 +
@@ -14898,6 +15230,7 @@ index 0000000..c3f7da6
 +		radio_ysf_begin(ch, number);	// the mode is the session's: a new data type or deviation is a new session
 +		return;
 +	}
++	cfg.silence_vw = eng->cfg.silence_vw;	// the voice path's memory stays lent
 +	ysf_engine_set(eng, &cfg);
 +}
 +
@@ -14975,13 +15308,21 @@ index 0000000..c3f7da6
 +		n.flags = 0;
 +		n.tx = AIR_TX_IDLE;
 +	} else {
++#if CONFIG_P25 && CONFIG_IMBE
++		if (eng->cfg.dt == YSF_DT_VOICE_FR)
++			p25VoicePoll();
++#endif
 +		ysf_engine_view(eng, &ev);
 +		count(&ev);
 +		memset(&n, 0, sizeof(n));
 +		n.flags = RADIO_YSF_ON;
 +		if (ev.rx_active) {
 +			n.flags |= RADIO_YSF_RX;
-+			if (ev.rx_played)
++			bool vw = eng->cfg.dt == YSF_DT_VOICE_FR;
++			bool voice = vw ? ev.rx.fich.dt == YSF_DT_VOICE_FR :
++				ev.rx.fich.dt == YSF_DT_VD_MODE1 || ev.rx.fich.dt == YSF_DT_VD_MODE2;
++
++			if (ev.rx_played && voice)
 +				n.flags |= RADIO_YSF_PLAYED;
 +		}
 +		if (ev.rx.late)
@@ -15011,8 +15352,10 @@ index 0000000..c3f7da6
 +	// stream takeover can leave it stale or dead (no callback, the speaker route on, the mic flat) and every over
 +	// goes out silent. Restart it here, so each over starts with a live callback and a fresh mic route;
 +	// voice_tx(true) starts it again below, through source_begin's ensure_streaming.
-+	ambeVoiceStop();
-+	ambeVoiceStart();
++	if (eng->cfg.dt != YSF_DT_VOICE_FR) {
++		ambeVoiceStop();
++		ambeVoiceStart();
++	}
 +	voice_tx(true);
 +	return true;
 +}
@@ -16834,49 +17177,6 @@ index 0000000..1ee15db
 +
 +A zone share carries a YSF channel's tag as it is ([zone-share.md](zone-share.md) 4.2): the block is 13 octets,
 +inside the share's limit of 64.
-diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
-index 04cc73e..3da26e2 100644
---- a/docs/spec/ysf.md
-+++ b/docs/spec/ysf.md
-@@ -154,7 +154,14 @@ provider's queue holds more than its lead (60 ms plus one chunk); once the
- queue runs short, silence goes instead. After the key, a communication
- frame is still built while voice the encoder already made waits in the
- ring, so the tail of the over is sent, not dropped, and the terminator
--follows once the ring is empty.
-+follows once the ring is empty. The tail is at most the ring (10 blocks in
-+sq, 5 staged: 3 frames), so past 10 communication frames after the key the
-+terminator is forced and the rest of the ring is dropped: a voice source
-+that never stops cannot hold the transmitter on. The voice stream is
-+restarted at every transmission (the DMR call does the same), so each over
-+starts with a live audio callback and a fresh microphone route: the stream
-+otherwise runs since the channel was selected, and a beep or a stream
-+takeover can leave it stale or dead and every over goes out silent.
- 
- ## 6. DG-ID squelch
- 
-@@ -165,12 +172,18 @@ any call starts; a DG-ID change mid-call ends the old call.
- 
- ## 7. Not written
- 
--- Radio glue: no `RADIO_MODE_YSF`, no codeplug kind, no channel mode, no
--  web editor, no UI mode row, no VFO or radio state-machine wiring. A full
--  mode is a separate, larger job (NXDN is woven through about 20 places in
--  the radio state machine) and cannot be validated on air yet.
- - VW full-rate voice (section 4).
- - The `hrc6000AirTest` provider fit case: the engine test's fake provider
-   covers the YSF fit; the CI firmware build is the real check.
- - On-air validation of any of it (M2, M4, M5b, M5c in
-   `docs/ysf-c4fm.md`).
-+
-+## 8. The channel kind
-+
-+The radio glue is written: `RADIO_MODE_YSF`, `CODEPLUG_KIND_YSF` (kind 6),
-+`core/radio/radio_ysf.c`, the channel editor rows, the mode row, dual watch,
-+the debug link and zone import. The channel format is
-+[ysf-codeplug.md](ysf-codeplug.md): a 13-byte tag block on the channel
-+(data type, deviation, DG-IDs, destination call sign) and a 30-byte
-+radio-wide identity record (source, downlink and uplink call signs). The
-+web editor's `mode_ysf.js` is still to be written against that format.
 diff --git a/docs/spec/zone-share.md b/docs/spec/zone-share.md
 index 9606eba..334e556 100644
 --- a/docs/spec/zone-share.md
@@ -17360,66 +17660,6 @@ index f85ed71..7aec6fa 100644
  # AES-256 voice encryption of P25 and NXDN (core/crypto, p25_aes.c, nxdn_aes.c): no hardware of its own, needs an air mode
  [feature.air_aes]
  switch = "AIR_AES"
-diff --git a/tests/host/Makefile b/tests/host/Makefile
-index 602e461..8aa3b65 100644
---- a/tests/host/Makefile
-+++ b/tests/host/Makefile
-@@ -343,6 +343,19 @@ radioCoreTestNxdn: $(RCNXDN) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dm
- 	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
- 		-DCONFIG_NXDN=1 -DCONFIG_AIR_RAW=1 -o $@ $(RCNXDN) -lm
- 
-+# The same with YSF (CONFIG_YSF): the far end is a YSF engine on the fake board.air; the voice goes
-+# through the DMR side's vocoder path. No vocoder lends memory (as on the STM32 platform)
-+# (sorted: the lists share the AMBE FEC source, which sort drops the second copy of)
-+TESTS   += radioCoreTestYsf
-+RCYSF   := $(sort $(RCORE) $(CORE)/radio/radio_ysf.c $(CORE)/ysf/ysf_engine.c $(YSF) $(CORE)/ysf/ysf_codeplug.c \
-+           $(CORE)/air/air_session.c $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(FEC) \
-+           $(CORE)/debuglink/debuglink_view_ysf.c $(CORE)/hostlink/build_info.c $(CORE)/crypto/air_nonce.c \
-+           $(CORE)/crypto/aes256.c)
-+radioCoreTestYsf: $(RCYSF) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/dmr/dmrDataService.h \
-+                   $(CORE)/ui/ui_svc.h $(wildcard $(CORE)/ysf/*.h) $(wildcard $(CORE)/air/*.h) $(wildcard $(CORE)/dmr/ambe/*.h)
-+	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
-+		-DCONFIG_YSF=1 -DCONFIG_AIR_RAW=1 -o $@ $(RCYSF) -lm
-+
- # P25 and NXDN together, no lending vocoder: one engine at a time, NXDN in the memory P25 keeps for itself
- # (sorted: the lists share the AES sources, which sort drops the second copy of)
- RCP25NX := $(sort $(RCNXDN) $(CORE)/radio/radio_p25.c $(CORE)/p25/p25_engine.c $(P25) $(CORE)/p25/p25Voice.c $(MBE) \
-@@ -483,7 +496,7 @@ boardBandTest: boardBandTest.c $(ROOT)/hal/board.h
- 	$(CC) $(CFLAGS) -I$(ROOT)/hal -Wshadow -o $@ boardBandTest.c
- 
- run: run-core
--run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T radioCoreTestNxdn radioCoreTestP25Nxdn radioCoreTestAprs radioCoreTestAprsDmr radioFeaturesTest radioFeaturesTestNoDual roamTest radioListenBandsTest inputTest switchFollowTest aprsRadioTest quadratureTest serialmicTest miclevelTest resampleTest \
-+run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T radioCoreTestNxdn radioCoreTestP25Nxdn radioCoreTestYsf radioCoreTestAprs radioCoreTestAprsDmr radioFeaturesTest radioFeaturesTestNoDual roamTest radioListenBandsTest inputTest switchFollowTest aprsRadioTest quadratureTest serialmicTest miclevelTest resampleTest \
-           rx2LinkTest keyassignTest powerSwitchTest powerKeyTest boardBandTest batteryTest aesTest voiceCipherTest
- 	./aprsRadioTest
- 	./radioCoreTest
-@@ -491,6 +504,7 @@ run-core: radioCoreTest radioCoreTestNoVfoDmr radioCoreTestP25 radioCoreTestP25T
- 	./radioCoreTestP25
- 	./radioCoreTestNxdn
- 	./radioCoreTestP25Nxdn
-+	./radioCoreTestYsf
- 	./radioCoreTestP25T
- 	./radioCoreTestAprs
- 	./radioCoreTestAprsDmr
-@@ -1489,6 +1503,18 @@ run-nxdncp: nxdnCodeplugTest
- 	./nxdnCodeplugTest
- .PHONY: run-nxdncp
- 
-+# YSF in the codeplug (core/ysf/ysf_codeplug.c): the shared vectors, a channel's set-up, the radio-wide record, a channel saved from the radio
-+TESTS   += ysfCodeplugTest
-+YSFCP   := $(CPTAG) $(CORE)/codeplug/codeplug_talk.c $(CORE)/codeplug/codeplug_tag.c $(CORE)/codeplug/codeplug_records.c $(CORE)/ysf/ysf_codeplug.c
-+
-+ysfCodeplugTest: ysfCodeplugTest.c $(YSFCP) $(wildcard $(CORE)/codeplug/*.h $(CORE)/ysf/*.h) ../vectors/channel-modes.txt
-+	$(CC) $(CFLAGS) -I$(ROOT)/hal -I. -Wshadow -DCONFIG_AIR=1 -DCONFIG_YSF=1 -o $@ ysfCodeplugTest.c $(YSFCP)
-+
-+run: run-ysfcp
-+run-ysfcp: ysfCodeplugTest
-+	./ysfCodeplugTest
-+.PHONY: run-ysfcp
-+
- # Zone editing (core/codeplug/zone_edit.c) on the real codeplug over a simulated flash: add, move, remove, copy,
- # rename, delete, a new channel added in one step, the limits
- ZEDIT   := $(CORE)/codeplug/zone_edit.c $(CORE)/codeplug/zone_shift.c $(CORE)/codeplug/zone_settle.c $(CPEDIT) \
 diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
 index 616cfb0..c570ffd 100644
 --- a/tests/host/radioCoreTest.c
@@ -17976,3 +18216,269 @@ index 9af0ef8..7535380 100644
      p.add_argument("args", nargs="*")
      p = sub.add_parser("data", help="DMR data: sms, call alert, radio check, settings, inbox")
      p.add_argument("op", choices=["sms", "alert", "check", "settings", "inbox", "read", "emergency", "em-settings",
+diff --git a/core/fec/imbe88.c b/core/fec/imbe88.c
+new file mode 100644
+index 0000000..16465fe
+--- /dev/null
++++ b/core/fec/imbe88.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++// IMBE 7200x4400 voice codewords, used by P25 and YSF VW with different interleavers.
++#include "imbe88.h"
++
++#include <string.h>
++#include "../air/air_syms.h"
++#include "golay.h"
++#include "hamming.h"
++
++// The PN masks m_1..m_6 from u_0 (5.3): 114 values of p = 173 p + 13849 mod 65536 from p0 = 16 u_0, bit 15 of each
++static void voice_masks(uint16_t u0, uint32_t m[8])
++{
++	static const uint8_t LEN[8] = { 0, 23, 23, 23, 15, 15, 15, 0 };
++	uint16_t p = (uint16_t)(16 * u0);
++
++	for (uint8_t c = 0; c < 8; c++) {
++		m[c] = 0;
++		for (uint8_t i = 0; i < LEN[c]; i++) {
++			p = (uint16_t)(173u * p + 13849u);
++			m[c] = (m[c] << 1) | (p >> 15);
++		}
++	}
++}
++
++uint8_t fec_imbe88_decode(const uint32_t c[8], uint8_t imbe[FEC_IMBE88_BYTES])
++{
++	uint32_t m[8];
++	uint16_t u[8], o = 0;
++	int errs, e0, e4 = 0;
++
++	// u_0 first: the masks of the other words come from it
++	errs = e0 = fec_golay23_decode(c[0], &u[0]);
++	voice_masks(u[0], m);
++	for (uint8_t k = 1; k < 4; k++)
++		errs += fec_golay23_decode(c[k] ^ m[k], &u[k]);
++	for (uint8_t k = 4; k < 7; k++) {
++		uint16_t cw = (uint16_t)(c[k] ^ m[k]), was = cw;
++
++		fec_hamming15_correct(&cw);
++		errs += cw != was;
++		if (k == 4)
++			e4 = cw != was;
++		u[k] = cw >> 4;
++	}
++	u[7] = (uint16_t)c[7];
++	memset(imbe, 0, FEC_IMBE88_BYTES);
++	for (uint8_t k = 0; k < 8; k++) {
++		uint8_t len = k < 4 ? 12 : k < 7 ? 11 : 7;
++
++		for (uint8_t b = 0; b < len; b++)
++			air_bit_put(imbe, o++, (uint8_t)((u[k] >> (len - 1 - b)) & 1));
++	}
++	return (uint8_t)(errs | (e0 << 4) | (e4 << 6));
++}
++
++void fec_imbe88_encode(const uint8_t imbe[FEC_IMBE88_BYTES], uint32_t c[8])
++{
++	uint32_t m[8];
++	uint16_t u[8], o = 0;
++
++	for (uint8_t k = 0; k < 8; k++) {
++		uint8_t len = k < 4 ? 12 : k < 7 ? 11 : 7;
++
++		u[k] = 0;
++		for (uint8_t b = 0; b < len; b++)
++			u[k] = (uint16_t)((u[k] << 1) | air_bit_get(imbe, o++));
++	}
++	voice_masks(u[0], m);
++	c[0] = fec_golay23_encode(u[0]);
++	for (uint8_t k = 1; k < 4; k++)
++		c[k] = fec_golay23_encode(u[k]) ^ m[k];
++	for (uint8_t k = 4; k < 7; k++)
++		c[k] = fec_hamming15_encode(u[k]) ^ m[k];
++	c[7] = u[7];
++}
+diff --git a/core/fec/imbe88.h b/core/fec/imbe88.h
+new file mode 100644
+index 0000000..d95d19f
+--- /dev/null
++++ b/core/fec/imbe88.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The RadioFoundry Authors
++#ifndef FEC_IMBE88_H
++#define FEC_IMBE88_H
++#include <stdint.h>
++
++#define FEC_IMBE88_BYTES 11
++// Eight systematic Golay/Hamming words, including whitening, before the mode's air interleaver.
++// Decode returns the total corrections in bits 0–3, C0 corrections in 4–5, and C4 correction in bit 6.
++void fec_imbe88_encode(const uint8_t imbe[FEC_IMBE88_BYTES], uint32_t words[8]);
++uint8_t fec_imbe88_decode(const uint32_t words[8], uint8_t imbe[FEC_IMBE88_BYTES]);
++#endif
+diff --git a/core/p25/p25Voice.c b/core/p25/p25Voice.c
+index 586307b..a9bba42 100644
+--- a/core/p25/p25Voice.c
++++ b/core/p25/p25Voice.c
+@@ -29,7 +29,7 @@ static imbe_mem_t dec;			// the decoder's pointers into mem
+ static imbe_enc_mem_t enc;		// the encoder's: the decoder's prediction state and scratch, its own history
+ 
+ // Queue: producer the provider's task (head), consumer the audio callback (tail)
+-static uint8_t rx_head, rx_tail;
++static uint8_t rx_head, rx_tail, rx_prime;
+ // Call boundaries, written by the provider's task only: a start bumps the sequence, an end copies it
+ static uint8_t rx_seq, rx_end_seq;
+ 
+@@ -164,7 +164,7 @@ static void rx_block(int16_t *spk)
+ 		return;
+ 	}
+ 	if (!cb_primed) {
+-		if (queued < P25_VOICE_PRIME && !(ended && queued > 0)) {
++		if (queued < rx_prime && !(ended && queued > 0)) {
+ 			if (ended) {
+ 				cb_live = false;	// a call that ended before playing anything
+ 			}
+@@ -263,6 +263,7 @@ void p25VoiceAudioBlock(const int16_t *mic, int16_t *spk, void *ctx)
+ 		if (g != cb_tx_gen) {
+ 			cb_tx_gen = g;
+ 			stats.tx_mic_peak = 0;
++			speaker(false);
+ 			imbe_enc_init(&enc);
+ 		}
+ 		tx_block(g, mic);
+@@ -294,10 +295,11 @@ void p25VoiceInit(const hal_audio_t *audio)
+ 	aud = audio;
+ }
+ 
+-void p25VoiceBegin(p25_voice_mem_t *m)
++void p25VoiceBegin(p25_voice_mem_t *m, uint8_t frames_per_burst)
+ {
+ 	// The stream is stopped (p25VoiceEnd) and the engine not started: nothing else touches this state now
+ 	rx_head = rx_tail = 0;
++	rx_prime = frames_per_burst;
+ 	rx_seq = rx_end_seq = 0;
+ 	tx_head = tx_tail = 0;
+ 	tx_gen = cb_tx_gen = 0;
+diff --git a/core/p25/p25Voice.h b/core/p25/p25Voice.h
+index b806df7..8ccc0a1 100644
+--- a/core/p25/p25Voice.h
++++ b/core/p25/p25Voice.h
+@@ -82,7 +82,7 @@ typedef struct {
+ // The board's PCM audio (NULL: frames are counted, nothing plays). Once, at start-up
+ void p25VoiceInit(const hal_audio_t *audio);
+ // Start on mem (radio task, before p25_engine_begin); the stream starts with the first call (p25VoicePoll)
+-void p25VoiceBegin(p25_voice_mem_t *mem);
++void p25VoiceBegin(p25_voice_mem_t *mem, uint8_t frames_per_burst);
+ // Radio task, every tick while P25 runs: starts the audio stream once a call is heard
+ void p25VoicePoll(void);
+ // A transmission starts (the stream starts if it was not running; from the next block the mic is encoded) or ends.
+diff --git a/core/p25/p25_unit.c b/core/p25/p25_unit.c
+index c3bf1c7..beb4847 100644
+--- a/core/p25/p25_unit.c
++++ b/core/p25/p25_unit.c
+@@ -11,6 +11,7 @@
+ #include "../fec/bch63.h"
+ #include "../fec/golay.h"
+ #include "../fec/hamming.h"
++#include "../fec/imbe88.h"
+ #include "../fec/rs63.h"
+ 
+ #define SS_EVERY	35	// information dibits between two status symbols (8.2: 2 bits after every 70)
+@@ -319,21 +320,6 @@ static const uint8_t VOICE_MAP[144] = {
+ 	V(0, 0), V(2, 22), V(3, 21), V(4, 12), V(5, 3), V(7, 1), V(2, 21), V(1, 22), V(4, 11), V(3, 20), V(7, 0), V(5, 2),
+ };
+ 
+-// The PN masks m_1..m_6 from u_0 (5.3): 114 values of p = 173 p + 13849 mod 65536 from p0 = 16 u_0, bit 15 of each
+-static void voice_masks(uint16_t u0, uint32_t m[8])
+-{
+-	static const uint8_t LEN[8] = { 0, 23, 23, 23, 15, 15, 15, 0 };
+-	uint16_t p = (uint16_t)(16 * u0);
+-
+-	for (uint8_t c = 0; c < 8; c++) {
+-		m[c] = 0;
+-		for (uint8_t i = 0; i < LEN[c]; i++) {
+-			p = (uint16_t)(173u * p + 13849u);
+-			m[c] = (m[c] << 1) | (p >> 15);
+-		}
+-	}
+-}
+-
+ uint16_t p25_ldu_voice_sym(uint8_t n)
+ {
+ 	uint16_t k;
+@@ -346,56 +332,20 @@ uint16_t p25_ldu_voice_sym(uint8_t n)
+ 
+ int p25_ldu_voice_get(const uint8_t *unit, uint8_t n, uint8_t imbe[P25_IMBE_BYTES])
+ {
+-	uint32_t c[8] = { 0 }, m[8];
+-	uint16_t u[8], at = VOICE_AT[n], o = 0;
+-	int errs, e0, e4 = 0;
++	uint32_t c[8] = { 0 };
++	uint16_t at = VOICE_AT[n];
+ 
+ 	for (uint8_t i = 0; i < 144; i++)
+ 		c[VOICE_MAP[i] >> 5] |= p25_bits_get(unit, (uint16_t)(at + i), 1) << (VOICE_MAP[i] & 31);
+-	// u_0 first: the masks of the other words come from it
+-	errs = e0 = fec_golay23_decode(c[0], &u[0]);
+-	voice_masks(u[0], m);
+-	for (uint8_t k = 1; k < 4; k++)
+-		errs += fec_golay23_decode(c[k] ^ m[k], &u[k]);
+-	for (uint8_t k = 4; k < 7; k++) {
+-		uint16_t cw = (uint16_t)(c[k] ^ m[k]), was = cw;
+-
+-		fec_hamming15_correct(&cw);
+-		errs += cw != was;
+-		if (k == 4)
+-			e4 = cw != was;
+-		u[k] = cw >> 4;
+-	}
+-	u[7] = (uint16_t)c[7];
+-	memset(imbe, 0, P25_IMBE_BYTES);
+-	for (uint8_t k = 0; k < 8; k++) {
+-		uint8_t len = k < 4 ? 12 : k < 7 ? 11 : 7;
+-
+-		for (uint8_t b = 0; b < len; b++)
+-			air_bit_put(imbe, o++, (uint8_t)((u[k] >> (len - 1 - b)) & 1));
+-	}
+-	return P25_VOICE_ERRS(errs, e0, e4);
++	return fec_imbe88_decode(c, imbe);
+ }
+ 
+ void p25_ldu_voice_put(uint8_t *unit, uint8_t n, const uint8_t imbe[P25_IMBE_BYTES])
+ {
+-	uint32_t c[8], m[8];
+-	uint16_t u[8], at = VOICE_AT[n], o = 0;
++	uint32_t c[8];
++	uint16_t at = VOICE_AT[n];
+ 
+-	for (uint8_t k = 0; k < 8; k++) {
+-		uint8_t len = k < 4 ? 12 : k < 7 ? 11 : 7;
+-
+-		u[k] = 0;
+-		for (uint8_t b = 0; b < len; b++)
+-			u[k] = (uint16_t)((u[k] << 1) | air_bit_get(imbe, o++));
+-	}
+-	voice_masks(u[0], m);
+-	c[0] = fec_golay23_encode(u[0]);
+-	for (uint8_t k = 1; k < 4; k++)
+-		c[k] = fec_golay23_encode(u[k]) ^ m[k];
+-	for (uint8_t k = 4; k < 7; k++)
+-		c[k] = fec_hamming15_encode(u[k]) ^ m[k];
+-	c[7] = u[7];
++	fec_imbe88_encode(imbe, c);
+ 	for (uint8_t i = 0; i < 144; i++)
+ 		p25_bits_put(unit, (uint16_t)(at + i), 1, (c[VOICE_MAP[i] >> 5] >> (VOICE_MAP[i] & 31)) & 1);
+ }
+diff --git a/tests/host/p25VoiceTest.c b/tests/host/p25VoiceTest.c
+index 595dcd7..ddd1c4b 100644
+--- a/tests/host/p25VoiceTest.c
++++ b/tests/host/p25VoiceTest.c
+@@ -67,7 +67,7 @@ static void begin(void)
+ 	p25VoiceResetStats();
+ 	running = spk_on = false;
+ 	starts = stops = 0;
+-	p25VoiceBegin(&vmem);
++	p25VoiceBegin(&vmem, P25_VOICE_PRIME);
+ }
+ 
+ static void testPlayback(void)
