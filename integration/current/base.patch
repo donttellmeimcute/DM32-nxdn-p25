@@ -18483,11 +18483,15 @@ index 595dcd7..ddd1c4b 100644
  
  static void testPlayback(void)
 diff --git a/tools/bench/nxdn/Makefile b/tools/bench/nxdn/Makefile
-index 67322d2..61b3d74 100644
+index 67322d2..08b4ed7 100644
 --- a/tools/bench/nxdn/Makefile
 +++ b/tools/bench/nxdn/Makefile
-@@ -10,10 +10,11 @@ CC      ?= cc
- CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal '-D__attribute__(x)=' \
+@@ -7,13 +7,14 @@ ROOT    := $(abspath $(HERE)/../../..)
+ CORE    := $(ROOT)/core
+ OUT     ?= $(ROOT)/build/bench
+ CC      ?= cc
+-CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal '-D__attribute__(x)=' \
++CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal \
             -DCONFIG_AIR=1 -DCONFIG_NXDN=1
  SRC     := $(HERE)/nxdntool.c $(CORE)/nxdn/nxdn_frame.c $(CORE)/nxdn/nxdn_rx.c $(CORE)/nxdn/nxdn_call.c \
 -           $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(CORE)/fec/conv.c
@@ -18515,11 +18519,15 @@ index 052bc90..c34123e 100755
          srcs += [os.path.join(p, f) for f in os.listdir(p) if f.endswith((".c", ".h"))]
      if not os.path.exists(BIN) or os.path.getmtime(BIN) < max(os.path.getmtime(s) for s in srcs):
 diff --git a/tools/bench/p25/Makefile b/tools/bench/p25/Makefile
-index 4a03fb1..70c88d9 100644
+index 4a03fb1..98bd534 100644
 --- a/tools/bench/p25/Makefile
 +++ b/tools/bench/p25/Makefile
-@@ -10,10 +10,11 @@ CC      ?= cc
- CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal '-D__attribute__(x)=' \
+@@ -7,13 +7,14 @@ ROOT    := $(abspath $(HERE)/../../..)
+ CORE    := $(ROOT)/core
+ OUT     ?= $(ROOT)/build/bench
+ CC      ?= cc
+-CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal '-D__attribute__(x)=' \
++CFLAGS  := -std=gnu99 -O2 -Wall -Wextra -Wshadow -I$(CORE) -I$(ROOT)/hal \
             -DCONFIG_AIR=1 -DCONFIG_P25=1 -DCONFIG_P25_TRUNK=1
  SRC     := $(HERE)/p25tool.c $(CORE)/p25/p25_unit.c $(CORE)/p25/p25_rx.c $(CORE)/p25/p25_call.c $(CORE)/p25/p25_tsbk.c \
 -           $(CORE)/air/air_framer.c $(CORE)/air/air_softmodem.c $(wildcard $(CORE)/fec/*.c)
