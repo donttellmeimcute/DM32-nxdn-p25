@@ -6214,10 +6214,10 @@ index 2745e456..ff6e172d 100644
  WEAK bool ui_svc_write_contact(uint16_t index, const contact_t *c) { (void)index; (void)c; return false; }
 diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
 new file mode 100644
-index 00000000..0dc9f535
+index 0000000..56f1315
 --- /dev/null
 +++ b/core/ysf/ysf_engine.c
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,587 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF conventional voice and data on a channel (ysf_engine.h).
@@ -6227,6 +6227,11 @@ index 00000000..0dc9f535
 +
 +#include "air/air_syms.h"
 +#include "ysf_voice.h"
++
++static bool half_rate(uint8_t dt)
++{
++	return dt == YSF_DT_VD_MODE1 || dt == YSF_DT_VD_MODE2;
++}
 +
 +const air_mode_t *ysf_engine_mode(bool narrow)
 +{
@@ -6269,6 +6274,9 @@ index 00000000..0dc9f535
 +static void merge_dch(ysf_engine_t *e, const ysf_rx_frame_t *f)
 +{
 +	ysf_call_t *c = &e->call;
++
++	if (!f->dch_len)
++		return;
 +
 +	if (f->fich.fi == YSF_FI_HEADER || f->fich.fi == YSF_FI_TERMINATOR) {
 +		copy_call(c->dest, f->dch, 10);
@@ -6328,7 +6336,7 @@ index 00000000..0dc9f535
 +// FN2..7 DCH-1/DCH-2 -> 2*FN-3 / 2*FN-2.
 +static void data_units(ysf_engine_t *e, const ysf_rx_frame_t *f)
 +{
-+	if (!e->hooks.rx_data || f->fich.fi != YSF_FI_COMMUNICATION)
++	if (!f->dch_len || !e->hooks.rx_data || f->fich.fi != YSF_FI_COMMUNICATION)
 +		return;
 +	switch (f->fich.dt) {
 +	case YSF_DT_VD_MODE1:
@@ -6519,11 +6527,11 @@ index 00000000..0dc9f535
 +	switch (e->cfg.dt) {
 +	case YSF_DT_VD_MODE1:
 +		if (vch_len == 9)
-+			memcpy(vch, e->stage[block], 9);
++			memcpy(vch, e->buf.tx.stage[block], 9);
 +		break;
 +	case YSF_DT_VD_MODE2:
 +		if (vch_len == 13)
-+			ysf_voice_dn_from_frame(e->stage[block], vch);
++			ysf_voice_dn_from_frame(e->buf.tx.stage[block], vch);
 +		break;
 +	default:
 +		if (vch_len)
@@ -6549,10 +6557,10 @@ index 00000000..0dc9f535
 +// from whatever the encoder happened to have made at that instant.
 +static void top_up(ysf_engine_t *e)
 +{
-+	if (!e->hooks.tx_voice)
++	if (!half_rate(e->cfg.dt) || !e->hooks.tx_voice)
 +		return;
 +	while (e->sq_n < 10) {
-+		uint8_t *dst = e->sq[(e->sq_head + e->sq_n) % 10];
++		uint8_t *dst = e->buf.tx.sq[(e->sq_head + e->sq_n) % 10];
 +
 +		if (!e->hooks.tx_voice(dst, e->ctx))
 +			return;
@@ -6579,13 +6587,13 @@ index 00000000..0dc9f535
 +		unsigned b = e->stage_n;
 +
 +		if (e->sq_n) {
-+			memcpy(e->stage[b], e->sq[e->sq_head], 9);
++			memcpy(e->buf.tx.stage[b], e->buf.tx.sq[e->sq_head], 9);
 +			e->sq_head = (uint8_t)((e->sq_head + 1) % 10);
 +			e->sq_n--;
 +			continue;
 +		}
 +		if (!e->hooks.tx_voice || must) {
-+			memcpy(e->stage[b], e->cfg.silence, 9);
++			memcpy(e->buf.tx.stage[b], e->cfg.silence, 9);
 +			view_begin(e);
 +			e->view.tx_filler++;
 +			view_end(e);
@@ -6610,23 +6618,30 @@ index 00000000..0dc9f535
 +// 0..7, repeated while PTT is held), 9 terminator. False when the frame
 +// waits for voice. After the key, a communication frame is still built while
 +// voice the encoder already made waits in the ring: the tail of the over is
-+// sent, not dropped, and the terminator follows once the ring is empty.
++// sent, not dropped, and the terminator follows once the ring is empty. The
++// tail is at most the ring (10 blocks in sq, 5 staged: 3 frames), so past the
++// bound below the voice source is still feeding, and waiting for it would
++// hold the transmitter on until the radio is switched off: the terminator is
++// forced and the rest of the ring is dropped. A normal over drains in at most
++// 3 frames, so the bound never fires there.
++#define YSF_TX_STOP_MAX_FRAMES	10u	// communication frames built after the key, at most
 +static bool build_next(ysf_engine_t *e)
 +{
 +	unsigned seq;
 +
 +	if (e->frame_no == 0)
 +		seq = 0;	// header
-+	else if (e->tx_stop && !e->tx_ended && e->sq_n == 0 && e->stage_n == 0)
-+		seq = 9;	// terminator: no voice left to drain
++	else if (e->tx_stop && !e->tx_ended &&
++		 ((e->sq_n == 0 && e->stage_n == 0) || e->stop_frames >= YSF_TX_STOP_MAX_FRAMES))
++		seq = 9;	// terminator: no voice left to drain, or the drain is stuck
 +	else
 +		seq = e->frame_no;	// 1..8, communication
 +	if (seq >= 1 && seq <= 8 &&
-+	    (e->cfg.dt == YSF_DT_VD_MODE1 || e->cfg.dt == YSF_DT_VD_MODE2) && !stage_voice(e))
++	    half_rate(e->cfg.dt) && !stage_voice(e))
 +		return false;
-+	if (!ysf_tx_frame_build(&e->txcfg, seq, e->txframe))
++	if (!ysf_tx_frame_build(&e->txcfg, seq, e->buf.tx.txframe))
 +		return false;	// unknown mode: nothing to send
-+	pack_dibits(e->txframe, e->dibits);
++	pack_dibits(e->buf.tx.txframe, e->buf.tx.dibits);
 +	e->dib_pos = 0;
 +	if (seq == 0) {
 +		e->frame_no = 1;
@@ -6635,6 +6650,8 @@ index 00000000..0dc9f535
 +		e->tx_ended = true;
 +	} else {
 +		e->frame_no = e->frame_no >= 8 ? 1 : e->frame_no + 1;
++		if (e->tx_stop && e->stop_frames < 255)
++			e->stop_frames++;
 +	}
 +	return true;
 +}
@@ -6660,7 +6677,7 @@ index 00000000..0dc9f535
 +		n = (uint16_t)(YSF_FRAME_DIBITS - e->dib_pos);
 +		if (n > space)
 +			n = space;
-+		if (!air_session_tx(&e->session, e->dibits, e->dib_pos, n))
++		if (!air_session_tx(&e->session, e->buf.tx.dibits, e->dib_pos, n))
 +			return;
 +		e->dib_pos += n;
 +	}
@@ -6705,7 +6722,7 @@ index 00000000..0dc9f535
 +	e->txcfg.cycles = 1;
 +	refresh_txcfg(e);
 +	ysf_rx_init(&e->rx, &sink, e);
-+	return air_session_open(&e->session, air, e->mode, &e->rx, e->frame, e->soft, YSF_FRAME_DIBITS,
++	return air_session_open(&e->session, air, e->mode, &e->rx, e->buf.rx.frame, e->buf.rx.soft, YSF_FRAME_DIBITS,
 +				&ops, e);
 +}
 +
@@ -6741,6 +6758,7 @@ index 00000000..0dc9f535
 +		e->tx_started = false;
 +		e->tx_stop = false;
 +		e->tx_ended = false;
++		e->stop_frames = 0;
 +		e->stage_n = 0;	// a new over: no staged frame, no queued blocks
 +		e->sq_head = 0;
 +		e->sq_n = 0;
@@ -6789,10 +6807,10 @@ index 00000000..0dc9f535
 +}
 diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
 new file mode 100644
-index 00000000..ffc044a7
+index 0000000..ed7590a
 --- /dev/null
 +++ b/core/ysf/ysf_engine.h
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,169 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF conventional voice and data on a channel (docs/spec/ysf.md): the
@@ -6886,7 +6904,7 @@ index 00000000..ffc044a7
 +	uint32_t rx_rejects;	// frames dropped by the DG-ID squelch
 +	uint32_t tx_calls;
 +	uint32_t tx_filler;	// silence blocks sent because the encoder had none ready
-+	uint32_t rx_frames;	// frames decoded (sync, FICH and DCH good)
++	uint32_t rx_frames;	// frames accepted after sync and FICH validation
 +	uint32_t rx_voice_frames;	// voice blocks played
 +} ysf_engine_view_t;
 +
@@ -6898,8 +6916,23 @@ index 00000000..ffc044a7
 +	ysf_engine_hooks_t hooks;
 +	void *ctx;
 +	ysf_tx_config txcfg;	// the sequence builder's config (refreshed on prepare)
-+	uint8_t txframe[YSF_FRAME_BYTES];	// one built frame, before dibits
-+	uint8_t dibits[YSF_FRAME_DIBITS / 4];	// one built frame, packed (480 dibits)
++	// The frame buffers, receive and transmit, share storage: the radio is half-duplex, so a transmission
++	// discards any partial received frame (unreceivable while transmitting), and reception never runs while
++	// a frame is being built. A frame assembled from the shared bytes still has to pass sync and FICH
++	// (ysf_rx.c), so a clobbered partial frame is rejected as noise, not played. The two sides apart cost
++	// 975 bytes of RAM; shared they cost 600.
++	union {
++		struct {	// receive: the framer's frame and its soft values
++			uint8_t frame[YSF_FRAME_BYTES];
++			int8_t soft[YSF_FRAME_DIBITS];
++		} rx;
++		struct {	// transmit: the built frame, its dibits, the staged voice blocks
++			uint8_t txframe[YSF_FRAME_BYTES];
++			uint8_t dibits[YSF_FRAME_DIBITS / 4];
++			uint8_t stage[YSF_BLOCKS][9];
++			uint8_t sq[10][9];
++		} tx;
++	} buf;
 +	uint16_t dib_pos;	// next dibit to queue from dibits[]
 +	unsigned frame_no;	// next sequence frame to build (0 header, 1..8 CC, 9 terminator)
 +	bool tx_started;	// the header is queued
@@ -6909,14 +6942,11 @@ index 00000000..ffc044a7
 +	bool played;		// the call in hand passes the squelch
 +	volatile bool recheck;	// ysf_engine_set changed what passes it
 +	volatile uint8_t seq;	// odd while the provider's task writes view
-+	uint8_t stage[YSF_BLOCKS][9];	// staged voice blocks for the next frame
 +	uint8_t stage_n;	// blocks already staged for the frame in hand
-+	uint8_t sq[10][9];	// voice blocks from the encoder, waiting for a frame
 +	uint8_t sq_head;	// next block to take from sq
 +	uint8_t sq_n;		// blocks held in sq
++	uint8_t stop_frames;	// communication frames built since tx_stop: the terminator is forced past the bound
 +	ysf_engine_view_t view;
-+	uint8_t frame[YSF_FRAME_BYTES];	// the framer's frame buffer ...
-+	int8_t soft[YSF_FRAME_DIBITS];	// ... and its soft values
 +} ysf_engine_t;
 +
 +// The mode for a deviation
@@ -6952,10 +6982,10 @@ index 00000000..ffc044a7
 +#endif
 diff --git a/core/ysf/ysf_frame.c b/core/ysf/ysf_frame.c
 new file mode 100644
-index 00000000..a2e4f6c8
+index 0000000..409e2f5
 --- /dev/null
 +++ b/core/ysf/ysf_frame.c
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,627 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// Ported from the host prototype (src/ysf/ysf_frame.c in donttellmeimcute/DM32-nxdn-p25):
@@ -7526,13 +7556,15 @@ index 00000000..a2e4f6c8
 +	}
 +}
 +
-+bool ysf_frame_decode(const uint8_t frame[YSF_FRAME_BYTES], ysf_fich *f, uint8_t dch[20],
-+					  uint8_t *dch2_or_null, unsigned *dch_len_or_null)
++bool ysf_frame_decode_fich(const uint8_t frame[YSF_FRAME_BYTES], ysf_fich *f)
 +{
-+// The sync is checked with tolerance (YSF_SYNC_MAX_ERRORS): the FICH and
-+// DCH CRCs below are what really validate the frame.
-+	if (ysf_sync_errors(frame) > YSF_SYNC_MAX_ERRORS) return false;
-+	if (!ysf_fich_decode(frame + YSF_SYNC_BYTES, f)) return false;
++	return ysf_sync_errors(frame) <= YSF_SYNC_MAX_ERRORS &&
++	       ysf_fich_decode(frame + YSF_SYNC_BYTES, f);
++}
++
++bool ysf_frame_decode_dch(const uint8_t frame[YSF_FRAME_BYTES], const ysf_fich *f, uint8_t dch[20],
++			  uint8_t *dch2_or_null, unsigned *dch_len_or_null)
++{
 +	const uint8_t *payload = frame + YSF_SYNC_BYTES + YSF_FICH_BYTES;
 +	unsigned dch_len = 0;
 +	bool ok = true;
@@ -7574,12 +7606,19 @@ index 00000000..a2e4f6c8
 +	if (dch_len_or_null != NULL) *dch_len_or_null = dch_len;
 +	return ok;
 +}
++
++bool ysf_frame_decode(const uint8_t frame[YSF_FRAME_BYTES], ysf_fich *f, uint8_t dch[20],
++		      uint8_t *dch2_or_null, unsigned *dch_len_or_null)
++{
++	return ysf_frame_decode_fich(frame, f) &&
++	       ysf_frame_decode_dch(frame, f, dch, dch2_or_null, dch_len_or_null);
++}
 diff --git a/core/ysf/ysf_frame.h b/core/ysf/ysf_frame.h
 new file mode 100644
-index 00000000..91a87c90
+index 0000000..4277003
 --- /dev/null
 +++ b/core/ysf/ysf_frame.h
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,157 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF frame layer: FICH and DCH (data channel) encode/decode, frame sync
@@ -7711,6 +7750,11 @@ index 00000000..91a87c90
 +void ysf_frame_build(const ysf_fich *f, const uint8_t *dch, const uint8_t *dch2_or_null,
 +					 uint8_t frame[YSF_FRAME_BYTES]);
 +
++// The FICH identifies the voice layout independently of the DCH checksum.
++bool ysf_frame_decode_fich(const uint8_t frame[YSF_FRAME_BYTES], ysf_fich *f);
++bool ysf_frame_decode_dch(const uint8_t frame[YSF_FRAME_BYTES], const ysf_fich *f, uint8_t dch[20],
++			  uint8_t *dch2_or_null, unsigned *dch_len_or_null);
++
 +// Decode one whole 120-byte frame: checks the sync bytes, decodes the FICH,
 +// then decodes the DCH the frame carries (a header or terminator always
 +// carries two DCH1s, 20 bytes each, the second going to dch2_or_null when
@@ -7734,10 +7778,10 @@ index 00000000..91a87c90
 +#endif
 diff --git a/core/ysf/ysf_rx.c b/core/ysf/ysf_rx.c
 new file mode 100644
-index 00000000..f4d4417e
+index 0000000..52667e7
 --- /dev/null
 +++ b/core/ysf/ysf_rx.c
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,99 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF on the air interface: the profile and the framer hooks. The frame is
@@ -7746,7 +7790,6 @@ index 00000000..f4d4417e
 +
 +#include <string.h>
 +
-+#include "air/air_syms.h"
 +#include "ysf_voice.h"
 +#include "../../hal/hal_radio.h"
 +
@@ -7760,43 +7803,27 @@ index 00000000..f4d4417e
 +static void rx_frame(const air_frame_t *f, void *ctx)
 +{
 +	ysf_rx_t *r = ctx;
-+	uint8_t frame[YSF_FRAME_BYTES];
-+	ysf_fich fich;
-+	uint8_t dch[20], dch2[20];
-+	unsigned dch_len = 0;
-+	ysf_rx_frame_t out;
++	const uint8_t *frame = f->hard;	// four dibits per byte, MSB first
++	ysf_rx_frame_t out = {0};
 +
-+	if (f->nsyms != YSF_FRAME_DIBITS) {
++	if (f->nsyms != YSF_FRAME_DIBITS || !ysf_frame_decode_fich(frame, &out.fich)) {
 +		r->fich_fail++;
 +		return;
 +	}
-+	// The framer's symbols are packed four to a byte, the first on air in
-+	// bits 7-6 of byte 0: exactly the YSF frame's own packing, so the 120
-+	// frame bytes are the packed symbols, not dibits to convert.
-+	memcpy(frame, f->hard, YSF_FRAME_BYTES);
-+	if (!ysf_frame_decode(frame, &fich, dch, dch2, &dch_len)) {
-+		// The sync and the FICH are what really validate the frame: a
-+		// frame that fails there is noise, a frame that passes them and
-+		// fails the DCH is a real frame with a broken data channel.
-+		if (ysf_sync_errors(frame) > YSF_SYNC_MAX_ERRORS ||
-+		    !ysf_fich_decode(frame + YSF_SYNC_BYTES, &fich))
-+			r->fich_fail++;
-+		else
-+			r->dch_fail++;
-+		return;
++	if (!ysf_frame_decode_dch(frame, &out.fich, out.dch, out.dch2, &out.dch_len)) {
++		r->dch_fail++;
++		out.dch_len = 0;
++		// The CRC covers data only. Keep call boundaries and independently coded voice.
++		if (out.fich.fi == YSF_FI_COMMUNICATION && out.fich.dt == YSF_DT_DATA_FR)
++			return;
 +	}
-+	memset(&out, 0, sizeof out);
-+	out.fich = fich;
-+	memcpy(out.dch, dch, sizeof out.dch);
-+	memcpy(out.dch2, dch2, sizeof out.dch2);
-+	out.dch_len = dch_len;
 +	out.t_us = f->t_us;
 +	out.rssi_dbm = f->rssi_dbm;
 +	// Only communication frames carry voice blocks: a header or terminator
 +	// holds two DCH1s where the voice would be.
-+	if (fich.fi == YSF_FI_COMMUNICATION) {
++	if (out.fich.fi == YSF_FI_COMMUNICATION) {
 +		for (unsigned b = 0; b < YSF_BLOCKS; b++) {
-+			unsigned len = ysf_voice_get(frame, fich.dt, b, out.voice[b]);
++			unsigned len = ysf_voice_get(frame, out.fich.dt, b, out.voice[b]);
 +
 +			if (b == 0)
 +				out.voice_len = (uint8_t)len;
@@ -7856,10 +7883,10 @@ index 00000000..f4d4417e
 +};
 diff --git a/core/ysf/ysf_rx.h b/core/ysf/ysf_rx.h
 new file mode 100644
-index 00000000..38596f1b
+index 0000000..a47ca20
 --- /dev/null
 +++ b/core/ysf/ysf_rx.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,63 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF on the air interface (core/air): the air_mode_t profile and the
@@ -7872,8 +7899,7 @@ index 00000000..38596f1b
 +// 20-symbol frame sync D471C9634D at the start of every 480-symbol frame,
 +// no head hook (fixed-length frames), lost after 4 missed syncs (N2).
 +// The sync tolerance is 2 symbols (up to 4 bit errors); the frame is really
-+// validated by the FICH and DCH CRCs, so a loose sync only admits frames
-+// whose FEC already checks out.
++// validated by the FICH CRC. The DCH CRC controls whether its data is used.
 +#ifndef YSF_RX_H
 +#define YSF_RX_H
 +#include <stdbool.h>
@@ -7893,7 +7919,7 @@ index 00000000..38596f1b
 +	ysf_fich fich;
 +	uint8_t dch[20];	// first DCH's data (CSD1 / DN unit / DT unit)
 +	uint8_t dch2[20];	// second DCH (CSD2 / Data FR DCH-2), zeros when none
-+	unsigned dch_len;	// first DCH length in bytes: 20, 10 or 0
++	unsigned dch_len;	// first DCH length in bytes: 20, 10 or 0 (absent or failed CRC)
 +	uint8_t voice[YSF_BLOCKS][18];	// voice bytes per 20 ms block (communication frames only;
 +					// header/terminator frames carry DCHs there instead, voice_len 0)
 +	uint8_t voice_len;	// bytes per voice block: 0, 9, 13 or 18
@@ -7909,9 +7935,9 @@ index 00000000..38596f1b
 +typedef struct {
 +	ysf_rx_sink_t sink;
 +	void *ctx;
-+	uint32_t frames;	// frames decoded (sync, FICH and DCH good)
++	uint32_t frames;	// frames delivered to the engine
 +	uint32_t fich_fail;	// frames dropped: sync or FICH bad
-+	uint32_t dch_fail;	// frames dropped: FICH good, DCH bad
++	uint32_t dch_fail;	// frames with valid FICH and failed DCH CRC
 +} ysf_rx_t;
 +
 +void ysf_rx_init(ysf_rx_t *r, const ysf_rx_sink_t *sink, void *ctx);
@@ -7926,10 +7952,10 @@ index 00000000..38596f1b
 +#endif
 diff --git a/core/ysf/ysf_tx.c b/core/ysf/ysf_tx.c
 new file mode 100644
-index 00000000..c2e4cd2c
+index 0000000..9185cc3
 --- /dev/null
 +++ b/core/ysf/ysf_tx.c
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,160 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF transmitter: sequence builder (one frame at a time). See ysf_tx.h for
@@ -8041,6 +8067,7 @@ index 00000000..c2e4cd2c
 +	unsigned fn = (frame_no - 1) % 8;
 +	f.fi = YSF_FI_COMMUNICATION;
 +	f.fn = (uint8_t)fn;
++	f.ft = 7;	// final index of the eight communication frames in the block
 +	uint8_t dch[20], dch2[20];
 +	memset(dch, 0, sizeof dch);
 +	memset(dch2, 0, sizeof dch2);
@@ -12542,10 +12569,10 @@ index 00000000..b36fd8b0
 +}
 diff --git a/tests/host/ysfEngineTest.c b/tests/host/ysfEngineTest.c
 new file mode 100644
-index 00000000..961f93b9
+index 0000000..556e7d8
 --- /dev/null
 +++ b/tests/host/ysfEngineTest.c
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,523 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// The YSF engine (core/ysf/ysf_engine.c) and the air interface session under
@@ -12561,6 +12588,7 @@ index 00000000..961f93b9
 +#include <string.h>
 +
 +#include "ysf/ysf_engine.h"
++#include "ysf/ysf_voice.h"
 +#include "air/air_syms.h"
 +#include "dmr/ambe/ambeFec.h"
 +
@@ -12707,6 +12735,7 @@ index 00000000..961f93b9
 +	uint16_t nvoice;
 +	uint8_t enc[VMAX][9];
 +	uint16_t enc_made, enc_taken;
++	bool stuck;		// the encoder never stops: h_tx_voice keeps returning blocks after the key
 +	uint8_t data[16][20];
 +	uint8_t data_len[16];
 +	uint16_t ndata;
@@ -12737,6 +12766,10 @@ index 00000000..961f93b9
 +{
 +	radio_t *x = ctx;
 +
++	if (x->stuck) {
++		memcpy(vch, silence, 9);	// the encoder never stops: blocks keep coming after the key
++		return true;
++	}
 +	if (x->enc_taken == x->enc_made)
 +		return false;
 +	memcpy(vch, x->enc[x->enc_taken++], 9);
@@ -12899,6 +12932,38 @@ index 00000000..961f93b9
 +	CHECK(r[1].starts == 1 && r[1].ends == 1 && check_order(&r[1], &r[0], &first) == 0,
 +	      "%s: stall: starts %u ends %u", name, r[1].starts, r[1].ends);
 +
++	// The encoder never stops after the key: the terminator is forced past the bound, so the over still ends
++	// (without it the transmitter would stay on until the radio is switched off)
++	r[1].starts = r[1].ends = 0;
++	r[1].nvoice = 0;
++	r[1].ndata = 0;
++	r[0].enc_made = r[0].enc_taken = 0;
++	r[0].stuck = false;
++	CHECK(ysf_engine_tx_prepare(&r[0].e), "prime");
++	prov[0].keyed = true;
++	CHECK(ysf_engine_tx_go(&r[0].e), "go");
++	for (n = 0; n < 600; n++) {
++		if (n == 100) {
++			ysf_engine_tx_stop(&r[0].e);
++			r[0].stuck = true;	// the voice source keeps feeding after the key
++		}
++		if (n < 100)
++			encode(&r[0], (uint8_t)(1 + (n & 1)));
++		steps(1);
++		if (ysf_engine_tx_state(&r[0].e) == AIR_TX_DONE) {
++			prov[0].keyed = false;
++			ysf_engine_tx_clear(&r[0].e);
++			break;
++		}
++	}
++	steps(20);
++	CHECK(n > 100 && n < 170 && prov[0].underruns == 0,
++	      "%s: stuck encoder: the over ended %u periods after 100, underruns %u", name, n,
++	      prov[0].underruns);
++	CHECK(r[1].starts == 1 && r[1].ends == 1 && check_order(&r[1], &r[0], &first) == 0,
++	      "%s: stuck encoder: starts %u ends %u", name, r[1].starts, r[1].ends);
++	r[0].stuck = false;
++
 +	// Late entry: radio 1 opens its session 1 s into the over. Its voice starts at a frame's end, in order (the
 +	// queue's lead of about 90 ms puts the frame on air at 990 ms a few blocks back)
 +	ysf_engine_end(&r[1].e);
@@ -12975,18 +13040,65 @@ index 00000000..961f93b9
 +	ysf_engine_end(&r[1].e);
 +}
 +
++static void send_frame(const uint8_t frame[YSF_FRAME_BYTES])
++{
++	for (unsigned i = 0; i < YSF_FRAME_DIBITS; i += CHUNK_MAX) {
++		unsigned remaining = YSF_FRAME_DIBITS - i;
++
++		deliver(&prov[1], frame + i / 4, remaining < CHUNK_MAX ? remaining : CHUNK_MAX);
++	}
++}
++
++static void testBadData(uint8_t dt)
++{
++	ysf_engine_cfg_t cfg = base_cfg(dt, false);
++	ysf_fich fich = { .fi = YSF_FI_HEADER, .sc = 7, .dt = dt };
++	const uint8_t csd1[20] = "DEST      SOURCE    ";
++	const uint8_t csd2[20] = "DOWN      UP        ";
++	uint8_t frame[YSF_FRAME_BYTES];
++
++	begin(1, &cfg, &hooks);
++	ysf_frame_build(&fich, csd1, csd2, frame);
++	send_frame(frame);
++	CHECK(!strcmp(r[1].e.call.src, "SOURCE"), "call header gives the source");
++
++	fich.fi = YSF_FI_COMMUNICATION;
++	fich.ft = 7;
++	fich.fn = dt == YSF_DT_VD_MODE2 ? 6 : 3;
++	ysf_frame_build(&fich, csd1, NULL, frame);
++	for (unsigned b = 0; b < YSF_BLOCKS; b++) {
++		unsigned dch_bytes = dt == YSF_DT_VD_MODE2 ? 5 : 9;
++		uint8_t *payload = frame + YSF_SYNC_BYTES + YSF_FICH_BYTES + 18 * b;
++
++		memset(payload, 0, dch_bytes);
++		if (dt == YSF_DT_VD_MODE2)
++			ysf_voice_dn_from_frame(silence, payload + dch_bytes);
++		else
++			memcpy(payload + dch_bytes, silence, sizeof silence);
++	}
++	send_frame(frame);
++	CHECK(r[1].e.rx.dch_fail == 1 && r[1].ndata == 0, "bad data is counted and never delivered");
++	CHECK(r[1].nvoice == YSF_BLOCKS && !strcmp(r[1].e.call.src, "SOURCE"),
++	      "bad data leaves all five voice blocks and the callsign intact");
++	for (unsigned b = 0; b < YSF_BLOCKS && b < r[1].nvoice; b++)
++		CHECK(!memcmp(r[1].voice[b], silence, sizeof silence), "voice block %u survives unchanged", b);
++	ysf_engine_end(&r[1].e);
++}
++
 +int main(void)
 +{
 +	testCall(YSF_DT_VD_MODE1, false);
 +	testCall(YSF_DT_VD_MODE2, false);
 +	testCall(YSF_DT_VD_MODE1, true);
 +	testSquelch();
++	testBadData(YSF_DT_VD_MODE1);
++	testBadData(YSF_DT_VD_MODE2);
 +	printf("ysfEngineTest: %d checks, %d failed\n", checks, failures);
 +	return failures ? 1 : 0;
 +}
 diff --git a/tests/host/ysfTest.c b/tests/host/ysfTest.c
 new file mode 100644
-index 00000000..cc831d61
+index 0000000..ae98cb3
 --- /dev/null
 +++ b/tests/host/ysfTest.c
 @@ -0,0 +1,502 @@
@@ -13330,7 +13442,7 @@ index 00000000..cc831d61
 +		} else {
 +			unsigned cc = fn - 1;
 +
-+			CHECK(f.fi == YSF_FI_COMMUNICATION && f.fn == cc, "vd1 cc %u fn", cc);
++			CHECK(f.fi == YSF_FI_COMMUNICATION && f.fn == cc && f.ft == 7, "vd1 cc %u fn/ft", cc);
 +			if (cc == 0)
 +				CHECK(!memcmp(dch, "DEST      SRC       ", 20), "vd1 fn0 csd1");
 +			else if (cc == 1)
@@ -13367,7 +13479,7 @@ index 00000000..cc831d61
 +			CHECK(len == 20 && !memcmp(dch, "DEST      SRC       ", 20), "dn header/term dch");
 +			continue;
 +		}
-+		CHECK(len == 10, "dn cc %u dch_len", fn - 1);
++		CHECK(len == 10 && f.fn == fn - 1 && f.ft == 7, "dn cc %u dch_len/fn/ft", fn - 1);
 +		switch (fn - 1) {
 +		case 0: CHECK(!memcmp(dch, "DEST      ", 10), "dn fn0 dest"); break;
 +		case 1: CHECK(!memcmp(dch, "SRC       ", 10), "dn fn1 src"); break;
@@ -16420,166 +16532,6 @@ index 0000000..02f5835
 +bool ysf_conv_save(uint16_t number, const channel_t *ch, const ysf_conv_t *conv);
 +
 +#endif
-diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
-index 0dc9f53..32c144e 100644
---- a/core/ysf/ysf_engine.c
-+++ b/core/ysf/ysf_engine.c
-@@ -299,11 +299,11 @@ static void tx_voice_cb(void *ctx, unsigned frame_no, unsigned block, uint8_t *v
- 	switch (e->cfg.dt) {
- 	case YSF_DT_VD_MODE1:
- 		if (vch_len == 9)
--			memcpy(vch, e->stage[block], 9);
-+			memcpy(vch, e->buf.tx.stage[block], 9);
- 		break;
- 	case YSF_DT_VD_MODE2:
- 		if (vch_len == 13)
--			ysf_voice_dn_from_frame(e->stage[block], vch);
-+			ysf_voice_dn_from_frame(e->buf.tx.stage[block], vch);
- 		break;
- 	default:
- 		if (vch_len)
-@@ -332,7 +332,7 @@ static void top_up(ysf_engine_t *e)
- 	if (!e->hooks.tx_voice)
- 		return;
- 	while (e->sq_n < 10) {
--		uint8_t *dst = e->sq[(e->sq_head + e->sq_n) % 10];
-+		uint8_t *dst = e->buf.tx.sq[(e->sq_head + e->sq_n) % 10];
- 
- 		if (!e->hooks.tx_voice(dst, e->ctx))
- 			return;
-@@ -359,13 +359,13 @@ static bool stage_voice(ysf_engine_t *e)
- 		unsigned b = e->stage_n;
- 
- 		if (e->sq_n) {
--			memcpy(e->stage[b], e->sq[e->sq_head], 9);
-+			memcpy(e->buf.tx.stage[b], e->buf.tx.sq[e->sq_head], 9);
- 			e->sq_head = (uint8_t)((e->sq_head + 1) % 10);
- 			e->sq_n--;
- 			continue;
- 		}
- 		if (!e->hooks.tx_voice || must) {
--			memcpy(e->stage[b], e->cfg.silence, 9);
-+			memcpy(e->buf.tx.stage[b], e->cfg.silence, 9);
- 			view_begin(e);
- 			e->view.tx_filler++;
- 			view_end(e);
-@@ -390,23 +390,30 @@ static void pack_dibits(const uint8_t *frame, uint8_t *packed)
- // 0..7, repeated while PTT is held), 9 terminator. False when the frame
- // waits for voice. After the key, a communication frame is still built while
- // voice the encoder already made waits in the ring: the tail of the over is
--// sent, not dropped, and the terminator follows once the ring is empty.
-+// sent, not dropped, and the terminator follows once the ring is empty. The
-+// tail is at most the ring (10 blocks in sq, 5 staged: 3 frames), so past the
-+// bound below the voice source is still feeding, and waiting for it would
-+// hold the transmitter on until the radio is switched off: the terminator is
-+// forced and the rest of the ring is dropped. A normal over drains in at most
-+// 3 frames, so the bound never fires there.
-+#define YSF_TX_STOP_MAX_FRAMES	10u	// communication frames built after the key, at most
- static bool build_next(ysf_engine_t *e)
- {
- 	unsigned seq;
- 
- 	if (e->frame_no == 0)
- 		seq = 0;	// header
--	else if (e->tx_stop && !e->tx_ended && e->sq_n == 0 && e->stage_n == 0)
--		seq = 9;	// terminator: no voice left to drain
-+	else if (e->tx_stop && !e->tx_ended &&
-+		 ((e->sq_n == 0 && e->stage_n == 0) || e->stop_frames >= YSF_TX_STOP_MAX_FRAMES))
-+		seq = 9;	// terminator: no voice left to drain, or the drain is stuck
- 	else
- 		seq = e->frame_no;	// 1..8, communication
- 	if (seq >= 1 && seq <= 8 &&
- 	    (e->cfg.dt == YSF_DT_VD_MODE1 || e->cfg.dt == YSF_DT_VD_MODE2) && !stage_voice(e))
- 		return false;
--	if (!ysf_tx_frame_build(&e->txcfg, seq, e->txframe))
-+	if (!ysf_tx_frame_build(&e->txcfg, seq, e->buf.tx.txframe))
- 		return false;	// unknown mode: nothing to send
--	pack_dibits(e->txframe, e->dibits);
-+	pack_dibits(e->buf.tx.txframe, e->buf.tx.dibits);
- 	e->dib_pos = 0;
- 	if (seq == 0) {
- 		e->frame_no = 1;
-@@ -415,6 +422,8 @@ static bool build_next(ysf_engine_t *e)
- 		e->tx_ended = true;
- 	} else {
- 		e->frame_no = e->frame_no >= 8 ? 1 : e->frame_no + 1;
-+		if (e->tx_stop && e->stop_frames < 255)
-+			e->stop_frames++;
- 	}
- 	return true;
- }
-@@ -440,7 +449,7 @@ static void tx_fill(void *ctx)
- 		n = (uint16_t)(YSF_FRAME_DIBITS - e->dib_pos);
- 		if (n > space)
- 			n = space;
--		if (!air_session_tx(&e->session, e->dibits, e->dib_pos, n))
-+		if (!air_session_tx(&e->session, e->buf.tx.dibits, e->dib_pos, n))
- 			return;
- 		e->dib_pos += n;
- 	}
-@@ -485,7 +494,7 @@ bool ysf_engine_begin(ysf_engine_t *e, const hal_air_t *air, const ysf_engine_cf
- 	e->txcfg.cycles = 1;
- 	refresh_txcfg(e);
- 	ysf_rx_init(&e->rx, &sink, e);
--	return air_session_open(&e->session, air, e->mode, &e->rx, e->frame, e->soft, YSF_FRAME_DIBITS,
-+	return air_session_open(&e->session, air, e->mode, &e->rx, e->buf.rx.frame, e->buf.rx.soft, YSF_FRAME_DIBITS,
- 				&ops, e);
- }
- 
-@@ -521,6 +530,7 @@ bool ysf_engine_tx_prepare(ysf_engine_t *e)
- 		e->tx_started = false;
- 		e->tx_stop = false;
- 		e->tx_ended = false;
-+		e->stop_frames = 0;
- 		e->stage_n = 0;	// a new over: no staged frame, no queued blocks
- 		e->sq_head = 0;
- 		e->sq_n = 0;
-diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
-index ffc044a..43219d4 100644
---- a/core/ysf/ysf_engine.h
-+++ b/core/ysf/ysf_engine.h
-@@ -103,8 +103,23 @@ typedef struct {
- 	ysf_engine_hooks_t hooks;
- 	void *ctx;
- 	ysf_tx_config txcfg;	// the sequence builder's config (refreshed on prepare)
--	uint8_t txframe[YSF_FRAME_BYTES];	// one built frame, before dibits
--	uint8_t dibits[YSF_FRAME_DIBITS / 4];	// one built frame, packed (480 dibits)
-+	// The frame buffers, receive and transmit, share storage: the radio is half-duplex, so a transmission
-+	// discards any partial received frame (unreceivable while transmitting), and reception never runs while
-+	// a frame is being built. A frame assembled from the shared bytes still has to pass sync and FICH
-+	// (ysf_rx.c), so a clobbered partial frame is rejected as noise, not played. The two sides apart cost
-+	// 975 bytes of RAM; shared they cost 600.
-+	union {
-+		struct {	// receive: the framer's frame and its soft values
-+			uint8_t frame[YSF_FRAME_BYTES];
-+			int8_t soft[YSF_FRAME_DIBITS];
-+		} rx;
-+		struct {	// transmit: the built frame, its dibits, the staged voice blocks
-+			uint8_t txframe[YSF_FRAME_BYTES];
-+			uint8_t dibits[YSF_FRAME_DIBITS / 4];
-+			uint8_t stage[YSF_BLOCKS][9];
-+			uint8_t sq[10][9];
-+		} tx;
-+	} buf;
- 	uint16_t dib_pos;	// next dibit to queue from dibits[]
- 	unsigned frame_no;	// next sequence frame to build (0 header, 1..8 CC, 9 terminator)
- 	bool tx_started;	// the header is queued
-@@ -114,14 +129,11 @@ typedef struct {
- 	bool played;		// the call in hand passes the squelch
- 	volatile bool recheck;	// ysf_engine_set changed what passes it
- 	volatile uint8_t seq;	// odd while the provider's task writes view
--	uint8_t stage[YSF_BLOCKS][9];	// staged voice blocks for the next frame
- 	uint8_t stage_n;	// blocks already staged for the frame in hand
--	uint8_t sq[10][9];	// voice blocks from the encoder, waiting for a frame
- 	uint8_t sq_head;	// next block to take from sq
- 	uint8_t sq_n;		// blocks held in sq
-+	uint8_t stop_frames;	// communication frames built since tx_stop: the terminator is forced past the bound
- 	ysf_engine_view_t view;
--	uint8_t frame[YSF_FRAME_BYTES];	// the framer's frame buffer ...
--	int8_t soft[YSF_FRAME_DIBITS];	// ... and its soft values
- } ysf_engine_t;
- 
- // The mode for a deviation
 diff --git a/docs/feature-matrix.md b/docs/feature-matrix.md
 index ac78fe7..8d499e9 100644
 --- a/docs/feature-matrix.md
@@ -17862,68 +17814,6 @@ index 0000000..a91d9cf
 +	printf("ysfCodeplugTest: all passed\n");
 +	return 0;
 +}
-diff --git a/tests/host/ysfEngineTest.c b/tests/host/ysfEngineTest.c
-index 961f93b..c401b59 100644
---- a/tests/host/ysfEngineTest.c
-+++ b/tests/host/ysfEngineTest.c
-@@ -159,6 +159,7 @@ typedef struct {
- 	uint16_t nvoice;
- 	uint8_t enc[VMAX][9];
- 	uint16_t enc_made, enc_taken;
-+	bool stuck;		// the encoder never stops: h_tx_voice keeps returning blocks after the key
- 	uint8_t data[16][20];
- 	uint8_t data_len[16];
- 	uint16_t ndata;
-@@ -189,6 +190,10 @@ static bool h_tx_voice(uint8_t vch[9], void *ctx)
- {
- 	radio_t *x = ctx;
- 
-+	if (x->stuck) {
-+		memcpy(vch, silence, 9);	// the encoder never stops: blocks keep coming after the key
-+		return true;
-+	}
- 	if (x->enc_taken == x->enc_made)
- 		return false;
- 	memcpy(vch, x->enc[x->enc_taken++], 9);
-@@ -351,6 +356,38 @@ static void testCall(uint8_t dt, bool narrow)
- 	CHECK(r[1].starts == 1 && r[1].ends == 1 && check_order(&r[1], &r[0], &first) == 0,
- 	      "%s: stall: starts %u ends %u", name, r[1].starts, r[1].ends);
- 
-+	// The encoder never stops after the key: the terminator is forced past the bound, so the over still ends
-+	// (without it the transmitter would stay on until the radio is switched off)
-+	r[1].starts = r[1].ends = 0;
-+	r[1].nvoice = 0;
-+	r[1].ndata = 0;
-+	r[0].enc_made = r[0].enc_taken = 0;
-+	r[0].stuck = false;
-+	CHECK(ysf_engine_tx_prepare(&r[0].e), "prime");
-+	prov[0].keyed = true;
-+	CHECK(ysf_engine_tx_go(&r[0].e), "go");
-+	for (n = 0; n < 600; n++) {
-+		if (n == 100) {
-+			ysf_engine_tx_stop(&r[0].e);
-+			r[0].stuck = true;	// the voice source keeps feeding after the key
-+		}
-+		if (n < 100)
-+			encode(&r[0], (uint8_t)(1 + (n & 1)));
-+		steps(1);
-+		if (ysf_engine_tx_state(&r[0].e) == AIR_TX_DONE) {
-+			prov[0].keyed = false;
-+			ysf_engine_tx_clear(&r[0].e);
-+			break;
-+		}
-+	}
-+	steps(20);
-+	CHECK(n > 100 && n < 170 && prov[0].underruns == 0,
-+	      "%s: stuck encoder: the over ended %u periods after 100, underruns %u", name, n,
-+	      prov[0].underruns);
-+	CHECK(r[1].starts == 1 && r[1].ends == 1 && check_order(&r[1], &r[0], &first) == 0,
-+	      "%s: stuck encoder: starts %u ends %u", name, r[1].starts, r[1].ends);
-+	r[0].stuck = false;
-+
- 	// Late entry: radio 1 opens its session 1 s into the over. Its voice starts at a frame's end, in order (the
- 	// queue's lead of about 90 ms puts the frame on air at 990 ms a few blocks back)
- 	ysf_engine_end(&r[1].e);
 diff --git a/tests/vectors/channel-modes.txt b/tests/vectors/channel-modes.txt
 index 1bfabe7..055a4cf 100644
 --- a/tests/vectors/channel-modes.txt

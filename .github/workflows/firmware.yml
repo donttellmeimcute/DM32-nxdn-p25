@@ -63,13 +63,13 @@ jobs:
       - name: Build firmware
         run: python3 tools/build_current.py --jobs 4
 
-      - name: Check AES voice, DMR, P25 and NXDN
+      - name: Check AES voice, DMR, P25, NXDN and YSF
         run: |
           set -eu
           T=build/current/tests/host
-          make -C "$T" -j4 voiceCipherTest dmrAesTest dmrCallTestAes p25EngineTest p25EngineTestAes nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest
-          for t in voiceCipherTest dmrAesTest dmrCallTestAes p25EngineTest p25EngineTestAes nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest; do
-            (cd "$T" && ./$t | tail -1)
+          make -C "$T" -j4 voiceCipherTest dmrAesTest dmrCallTestAes p25EngineTest p25EngineTestAes nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest
+          for t in voiceCipherTest dmrAesTest dmrCallTestAes p25EngineTest p25EngineTestAes nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest; do
+            (cd "$T" && ./"$t")
           done
 
       - name: Package the image
