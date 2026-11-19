@@ -1,0 +1,2391 @@
+diff --git a/core/codeplug/codeplug.c b/core/codeplug/codeplug.c
+index d4301e9..530c73e 100644
+--- a/core/codeplug/codeplug.c
++++ b/core/codeplug/codeplug.c
+@@ -62,10 +62,10 @@ static uint32_t fl_base = DEFAULT_FLASH_BASE;
+ #define CH_FLAG1	0x30u	// bits 0-1 talker alias on TS1, 2-3 on TS2: 0 off, 1 APRS, 2 text, 3 both
+ #define CH_FLAG2	0x31u
+ #define CH_FLAG4	0x33u
+-// These bytes hold offset/step only in VFO records. A named DMR memory
+-// needs both marker bytes before its key ID can override radio privacy.
+-#define CH_DMR_AES	0x34u
+-#define CH_DMR_AES_MARK	0x5AA5u
++// Named DMR memory only. AES retains its original marker; adjacent markers
++// identify other channel overrides. VFO records use these bytes for offset/step.
++#define CH_DMR_PRIV	0x34u
++#define CH_DMR_PRIV_BASE	0x5AA4u
+ #define FLAG2_TS2	0x40u
+ #define FLAG4_VOX	0x40u
+ #define FLAG4_ZONE_SKIP	0x20u	// zone scan skip
+@@ -755,8 +755,11 @@ static bool openfw_channel(uint16_t number, channel_t *out)
+ 		ch_errors++;
+ 		return false;
+ 	}
+-	if (out->mode == RADIO_MODE_DMR && le16(&r[CH_DMR_AES]) == CH_DMR_AES_MARK)
+-		out->dmr_aes_kid = r[CH_DMR_AES + 2];
++	uint16_t privacy = le16(&r[CH_DMR_PRIV]);
++	if (out->mode == RADIO_MODE_DMR && privacy > CH_DMR_PRIV_BASE && privacy <= CH_DMR_PRIV_BASE + CP_DMR_PRIV_OFF) {
++		out->dmr_privacy = (uint8_t)(privacy - CH_DMR_PRIV_BASE);
++		out->dmr_privacy_key = r[CH_DMR_PRIV + 2];
++	}
+ 	return true;
+ }
+ 
+@@ -774,8 +777,10 @@ bool codeplug_channel(uint16_t number, channel_t *out)
+ 		ok = openfw_channel(number, out);
+ 		if (ok) {
+ 			codeplug_tag_apply(number, out);	// so no caller takes a tagged channel for a plain one
+-			if (out->kind != CODEPLUG_KIND_NONE)
+-				out->dmr_aes_kid = 0;
++			if (out->kind != CODEPLUG_KIND_NONE) {
++				out->dmr_privacy = CP_DMR_PRIV_DEFAULT;
++				out->dmr_privacy_key = 0;
++			}
+ 		}
+ 		break;
+ 	case CODEPLUG_BUILTIN:
+@@ -1048,11 +1053,13 @@ bool codeplug_set_channel(uint16_t number, const channel_t *ch)
+ 		}
+ 		uint8_t base_mode = r[CH_MODE], base_flag4 = r[CH_FLAG4];
+ 		codeplug_openfw_encode(ch, r);
+-		if (ch->mode == RADIO_MODE_DMR && ch->kind == CODEPLUG_KIND_NONE && ch->dmr_aes_kid != 0) {
+-			put16(&r[CH_DMR_AES], CH_DMR_AES_MARK);
+-			r[CH_DMR_AES + 2] = ch->dmr_aes_kid;
+-		} else if (le16(&r[CH_DMR_AES]) == CH_DMR_AES_MARK) {
+-			memset(&r[CH_DMR_AES], 0, 3);
++		uint16_t stored_privacy = le16(&r[CH_DMR_PRIV]);
++		if (ch->mode == RADIO_MODE_DMR && ch->kind == CODEPLUG_KIND_NONE &&
++		    ch->dmr_privacy > CP_DMR_PRIV_DEFAULT && ch->dmr_privacy <= CP_DMR_PRIV_OFF) {
++			put16(&r[CH_DMR_PRIV], CH_DMR_PRIV_BASE + ch->dmr_privacy);
++			r[CH_DMR_PRIV + 2] = ch->dmr_privacy == CP_DMR_PRIV_OFF ? 0 : ch->dmr_privacy_key;
++		} else if (stored_privacy > CH_DMR_PRIV_BASE && stored_privacy <= CH_DMR_PRIV_BASE + CP_DMR_PRIV_OFF) {
++			memset(&r[CH_DMR_PRIV], 0, 3);
+ 		}
+ 		if (safe) {
+ 			r[CH_MODE] = 1;
+diff --git a/core/codeplug/codeplug.h b/core/codeplug/codeplug.h
+index 625d4c8..a17e676 100644
+--- a/core/codeplug/codeplug.h
++++ b/core/codeplug/codeplug.h
+@@ -53,12 +53,15 @@ typedef struct {
+ 	// parameter block, which its mode module fetches (codeplug_tag_params); none of them live here
+ 	uint8_t kind;
+ 	uint8_t system;
+-	uint8_t dmr_aes_kid;	// conventional DMR, 0 uses the radio privacy setting unless explicitly off on the VFO
++	uint8_t dmr_privacy_key;	// Basic key number or keyring ID; 0 = no key
++	uint8_t dmr_privacy;	// CP_DMR_PRIV_*; the VFO still keeps its AES selection separately
+ 	uint8_t vfo_digital;	// VFO_DIG_* below; runtime only on channels
+ 	uint8_t vfo_nxdn_key;	// AES-256 KID + 1 (0 = clear)
+ 	uint16_t vfo_p25_kid;
+ } channel_t;
+ 
++enum { CP_DMR_PRIV_DEFAULT, CP_DMR_PRIV_AES, CP_DMR_PRIV_BASIC, CP_DMR_PRIV_ENHANCED, CP_DMR_PRIV_OFF };
++
+ #define VFO_DIG_NXDN_MASK	0x03u	// 0 default, 1 NXDN48, 2 NXDN96
+ #define VFO_DIG_YSF_MASK		0x0Cu	// 0 default, 1 YSF Wide, 2 YSF Narrow (shifted by 2)
+ #define VFO_DIG_P25_AES		0x10u	// P25 KID 0 is valid
+diff --git a/core/codeplug/codeplug_records.c b/core/codeplug/codeplug_records.c
+index 73d1863..837a9de 100644
+--- a/core/codeplug/codeplug_records.c
++++ b/core/codeplug/codeplug_records.c
+@@ -140,7 +140,7 @@ int codeplug_system_secret(uint8_t n, uint8_t *buf, uint16_t cap)
+ 	return n == CODEPLUG_SYSTEM_NONE ? -1 : codeplug_kv_get((uint16_t)(CODEPLUG_KEY_SYS_KEY + n), buf, cap);
+ }
+ 
+-int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max)
++int codeplug_key_step(uint8_t alg, uint8_t bytes, int32_t current, int dir, uint16_t min, uint16_t max)
+ {
+ 	uint8_t hdr[CODEPLUG_TRAFFIC_HDR];
+ 	codeplug_kv_cursor_t cursor;
+@@ -151,7 +151,7 @@ int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, u
+ 	codeplug_kv_begin(&cursor, CODEPLUG_KEY_TRAFFIC, (uint16_t)(CODEPLUG_KEY_TRAFFIC + TRAFFIC_MAX - 1u));
+ 	int len;
+ 	while ((len = codeplug_kv_next(&cursor, &index, hdr, sizeof hdr)) >= 0) {
+-		if (len != CODEPLUG_TRAFFIC_HDR + 32 || hdr[0] != CODEPLUG_SYSTEM_NONE || hdr[1] != alg)
++		if (len != (int)CODEPLUG_TRAFFIC_HDR + bytes || hdr[0] != CODEPLUG_SYSTEM_NONE || hdr[1] != alg)
+ 			continue;
+ 		uint16_t id = rec_rd16(&hdr[2]);
+ 		if (id >= min && id <= max && (dir > 0 ? id > current && id < best : id < current && id > best))
+diff --git a/core/codeplug/codeplug_records.h b/core/codeplug/codeplug_records.h
+index d245b05..a2579b7 100644
+--- a/core/codeplug/codeplug_records.h
++++ b/core/codeplug/codeplug_records.h
+@@ -99,9 +99,13 @@ int codeplug_target_list(codeplug_ref_t ref, uint8_t kind, codeplug_rec_head_t *
+ // The traffic key of system with this algorithm and key id: its octets into key (at most cap); their length, -1 when
+ // there is none
+ int codeplug_traffic_key(uint8_t system, uint8_t alg, uint16_t key_id, uint8_t *key, uint16_t cap);
+-// Select the next or previous installed AES-256 ID (32-byte key). -1 is
++// Select the next or previous installed ID of matching algorithm and length. -1 is
+ // the clear/default entry at either end. Reads only record headers.
+-int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max);
++int codeplug_key_step(uint8_t alg, uint8_t bytes, int32_t current, int dir, uint16_t min, uint16_t max);
++static inline int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max)
++{
++	return codeplug_key_step(alg, 32, current, dir, min, max);
++}
+ // A reference from the 4 octets a record stores
+ codeplug_ref_t codeplug_ref_at(const uint8_t *p);
+ #endif
+diff --git a/core/dmr/call/dmr_call.c b/core/dmr/call/dmr_call.c
+index 261c9ce..fca44d1 100644
+--- a/core/dmr/call/dmr_call.c
++++ b/core/dmr/call/dmr_call.c
+@@ -16,9 +16,9 @@
+ #include "dmr/ambe/ambeFec.h"
+ #define SFR_DUALPATH_DEPTH	3	// bursts held: the repeat of the first comes 90 ms later, after the talker's next
+ #endif
+-#define DMR_AES_ON	(CONFIG_AIR_AES && CONFIG_DMR_PRIVACY)	// AES-256 voice (dmr_call_config_t.aes_key)
+-#if DMR_AES_ON
+ #include "dmr/dmrAes.h"
++#define DMR_AES_ON	(CONFIG_AIR_AES && CONFIG_DMR_PRIVACY)	// MI-based voice privacy
++#if DMR_AES_ON
+ #include "crypto/air_nonce.h"
+ #endif
+ 
+@@ -122,12 +122,15 @@ static struct {
+ 	uint32_t le_last_ms;
+ 	bool le_held;		// le_burst: the last burst, its LC taken before the pair was complete
+ 	uint8_t le_run;		// voice bursts in order (A-F) with no call, LC or not
++	bool le_private;	// a good EMB marked this run private, even if F or the LC did not
++	int8_t le_cc;		// -1 until a good EMB gives the CC
+ 	dmr_burst_t le_burst;
+ 	uint32_t le_burst_slot;
+ 	// PI header heard before the call was (late entry after a missed voice LC header)
+ 	bool pi_pending;
+ 	uint32_t pi_pending_ms;
+-	uint8_t pi_pending_alg, pi_pending_key;
++	uint8_t pi_pending_alg, pi_pending_key, pi_pending_cc;
++	int8_t pi_pending_ts;
+ 
+ 	// repeater outbound
+ 	uint32_t rpt_last_ms;
+@@ -552,6 +555,8 @@ static void le_reset(void)
+ 	s.le_active = false;
+ 	s.le_pair = false;
+ 	s.le_held = false;
++	s.le_private = false;
++	s.le_cc = -1;
+ }
+ 
+ static bool group_listened(uint32_t tg, uint32_t now)
+@@ -640,8 +645,13 @@ static void rx_lc(const uint8_t lc[DMR_LC_BYTES], const dmr_burst_t *b, bool lat
+ 	dmr_lc_unpack(lc, &l);
+ 
+ 	bool continuing = s.rx != RXC_NONE;
+-	bool new_talker = !continuing || l.src != s.view.caller.src;
+-	bool resumed = late && !continuing && rx_resuming(lc, b, now);
++	bool same_voice = continuing && (l.src == s.view.caller.src ||
++					   (late && s.view.caller.src == 0 && s.view.caller.dst == 0));
++	bool new_talker = !same_voice;
++	bool resumed = late && !continuing && l.src != 0 && rx_resuming(lc, b, now);
++	bool pending = s.pi_pending && !elapsed(now, s.pi_pending_ms, true, fade_ms()) &&
++		       (!b->ts || !s.pi_pending_ts || b->ts == s.pi_pending_ts) &&
++		       (!cc_known(b) || !b->crc_ok || b->cc == s.pi_pending_cc);
+ 
+ 	if (s.rx == RXC_PLAY) {
+ 		dual_flush();
+@@ -664,17 +674,17 @@ static void rx_lc(const uint8_t lc[DMR_LC_BYTES], const dmr_burst_t *b, bool lat
+ 	c->to_us = !c->group && l.dst == s.cfg.own_id;
+ 	c->fid = l.fid;
+ 	c->svc = l.svc;
+-	bool was_encrypted = continuing && c->encrypted;
++	bool was_encrypted = (same_voice && c->encrypted) || (late && !continuing && s.le_private);
+ 
+ 	c->encrypted = (l.svc & DMR_SVC_PRIVACY) != 0 || was_encrypted;
+ 	c->emergency = (l.svc & DMR_SVC_EMERGENCY) != 0;
+ 	c->late_entry = late;
+ 	memcpy(c->alias, s.ta.text, sizeof(c->alias));
+ 	c->alias_complete = s.ta.complete;
+-	if (!continuing) {
++	if (new_talker) {
+ 		c->pi_header = false;
+ 		c->pi_alg = c->pi_key = 0;
+-		if (s.pi_pending && !elapsed(now, s.pi_pending_ms, true, fade_ms())) {
++		if (pending) {
+ 			c->pi_header = true;	// heard just before the call was acquired
+ 			c->pi_alg = s.pi_pending_alg;
+ 			c->pi_key = s.pi_pending_key;
+@@ -703,15 +713,17 @@ static void rx_lc(const uint8_t lc[DMR_LC_BYTES], const dmr_burst_t *b, bool lat
+ #if DMR_AES_ON
+ 	// An AES keystream belongs to one talker's transmission; a call back after a fade keeps it (dmrAesBurst counts
+ 	// the superframes lost by the slot counter). A PI header held for the late entry starts its own (rx_pi_header)
+-	if (resumed && s.aes.ready) {
++	if (resumed && !pending && s.aes.ready) {
+ 		c->pi_header = true;
+ 		c->encrypted = true;
+-	} else if (new_talker && !(s.pi_pending && s.aes.ready)) {
++	} else if (new_talker && !(pending && s.aes.ready)) {
+ 		dmrAesStop(&s.aes);
+ 		s.aes_pi_mi = 0;
+ 		s.aes_le = false;
+-		s.le_sb_ms = 0;
+-		s.le_frag_mask = 0;
++		if (!late || continuing) {
++			s.le_sb_ms = 0;
++			s.le_frag_mask = 0;
++		}
+ 	}
+ #endif
+ 	s.pi_pending = false;
+@@ -769,19 +781,19 @@ static void rx_le_collect(const dmr_burst_t *b)
+ // superframe's MI, so the stream starts with the next burst, never this one. True when the stream just started
+ static bool rx_le_try(uint32_t now)
+ {
+-	if (s.aes.ready || s.rx != RXC_PLAY || s.cfg.aes_key == NULL || !s.view.caller.encrypted)
++	if (s.aes.ready || s.rx != RXC_PLAY || s.cfg.cipher_key == NULL || !s.view.caller.encrypted)
+ 		return false;
+ 	if (s.le_frag_mask != 0x3FFFFu)
+ 		return false;
+ 	if (s.le_sb_ms == 0 || (uint32_t)(now - s.le_sb_ms) > DMR_LE_SB_FRESH_MS)
+ 		return false;
+-	if (s.le_sb_kid == 0 || s.le_sb_kid != s.cfg.aes_kid || s.le_sb_alg != (DMR_AES_ALG & 0x07u))
++	if (s.le_sb_kid == 0 || s.le_sb_kid != s.cfg.cipher_kid || s.le_sb_alg != (s.cfg.cipher_alg & 0x07u))
+ 		return false;
+ 	uint32_t mi;
+ 
+ 	if (!dmrAesLeDecode(s.le_frag, &mi) || mi == 0)
+ 		return false;
+-	dmrAesStart(&s.aes, s.cfg.aes_key, mi);
++	dmrVoiceCipherStart(&s.aes, s.cfg.cipher_alg, s.cfg.cipher_key, mi);
+ 	s.aes_le = true;
+ 	s.aes_pi_mi = mi;
+ 	stats.rx_le_aes++;
+@@ -828,7 +840,7 @@ static void rx_play(const dmr_burst_t *b, uint32_t now, uint32_t slot)
+ 	s.last_voice_ms = now;
+ 	s.last_voice_slot = slot;
+ 
+-	bool enc = b->pi || (s.view.caller.svc & DMR_SVC_PRIVACY) || s.view.caller.pi_header;
++	bool enc = (b->pi && b->crc_ok) || s.view.caller.encrypted;
+ 
+ 	if (enc && !s.view.caller.encrypted) {
+ 		s.view.caller.encrypted = true;
+@@ -845,7 +857,7 @@ static void rx_play(const dmr_burst_t *b, uint32_t now, uint32_t slot)
+ 		sink_lost(DMR_AMBE_FRAMES_PER_BURST);
+ 		return;
+ 	}
+-	aes = enc && s.cfg.aes_key != NULL && (s.view.caller.pi_header || s.aes_le);
++	aes = enc && s.cfg.cipher_key != NULL && (s.view.caller.pi_header || s.aes_le);
+ #endif
+ 	// No key, or a PI header: an MI-based scheme the static key hook can't undo (docs/spec/gotchas.md 6.4), unless it
+ 	// is AES-256 with our key (dmrAes.h)
+@@ -998,6 +1010,10 @@ static void rx_no_lc(const dmr_burst_t *b, uint32_t now, uint32_t slot)
+ 		return;
+ 	uint8_t lc[DMR_LC_BYTES] = { DMR_FLCO_GROUP_VOICE };
+ 
++	bool configured_private = (s.cfg.basic_ras || s.cfg.cipher_alg != 0) &&
++				  b->cc == s.cfg.cc && (!ts_known(b) || b->ts == s.cfg.ts);
++	if (s.le_private || configured_private)
++		lc[2] = DMR_SVC_PRIVACY;	// no source, destination or feature ID was decoded
+ 	rx_lc(lc, b, true, now);
+ 	s.have_index = false;
+ 	stats.rx_no_lc_calls++;
+@@ -1020,14 +1036,22 @@ static void rx_late_entry(const dmr_burst_t *b, uint32_t now, uint32_t slot)
+ 		s.le_run = 1;
+ 	} else if (b->ts != s.le_ts && s.cfg.listen.both_ts && ts_known(b)) {
+ 		return;	// both slots heard: the slot counted first, so a pair or a held burst never spans the two calls
+-	} else if (i == (s.le_last_index + 1) % 6) {
++	} else if (i == (s.le_last_index + 1) % 6 &&
++		   (!cc_known(b) || !b->crc_ok || s.le_cc < 0 || b->cc == s.le_cc)) {
+ 		s.le_pair = true;
+ 		held = s.le_held;
+ 		if (s.le_run < 255)
+ 			s.le_run++;
+ 	} else {
++		le_reset();
++		s.le_active = true;
++		s.le_ts = b->ts;
+ 		s.le_run = 1;
+ 	}
++	if (cc_known(b) && b->crc_ok) {
++		s.le_cc = (int8_t)b->cc;
++		s.le_private |= b->pi;
++	}
+ 	s.le_held = false;
+ 	s.le_last_index = i;
+ 	s.le_last_ms = now;
+@@ -1106,10 +1130,8 @@ static void rx_embedded(const dmr_burst_t *b, uint32_t now)
+ 	}
+ }
+ 
+-// A PI header (data type 0, TS 102 361-1 7.1.2): 80 bits of privacy information and a CRC-CCITT masked 0x6969. It
+-// marks the call as protected; the octets are kept for the screens and the debug link but not interpreted (the
+-// static key schemes need none, MI-based ones would, docs/spec/gotchas.md 6.4). It comes between the voice LC header
+-// and burst A, so the call it belongs to is usually running; if not (header missed), it is held for the late entry
++// A PI header (TS 102 361-1 7.1.2) precedes burst A and starts the stream for a matching algorithm and KID.
++// Hold it briefly if the voice LC was missed. Basic Privacy has no PI header.
+ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
+ {
+ 	bool ok = b->crc_ok;
+@@ -1123,15 +1145,15 @@ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
+ 		return;
+ 	stats.rx_pi_headers++;
+ #if DMR_AES_ON
+-	// AES-256 with our key ID: the keystream of its MI (the same header again keeps the running one). Anything else
++	// The configured algorithm and key ID start a new stream (a repeated header keeps the running one). Anything else
+ 	// stops it, so the call is not played
+-	if (s.cfg.aes_key != NULL && b->len >= DMR_AES_PI_BYTES) {
++	if (s.cfg.cipher_key != NULL && b->len >= DMR_AES_PI_BYTES) {
+ 		uint8_t kid;
+ 		uint32_t mi;
+ 
+-		if (dmrAesPiParse(b->payload, &kid, &mi) && kid == s.cfg.aes_kid) {
++		if (dmrVoiceCipherPiParse(b->payload, s.cfg.cipher_alg, &kid, &mi) && kid == s.cfg.cipher_kid) {
+ 			if (!s.aes.ready || mi != s.aes_pi_mi)
+-				dmrAesStart(&s.aes, s.cfg.aes_key, mi);
++				dmrVoiceCipherStart(&s.aes, s.cfg.cipher_alg, s.cfg.cipher_key, mi);
+ 			s.aes_pi_mi = mi;
+ 			s.aes_le = false;	// the stream is PI-seeded now, not late-entered
+ 		} else {
+@@ -1147,7 +1169,9 @@ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
+ 		s.pi_pending = true;
+ 		s.pi_pending_ms = now;
+ 		s.pi_pending_alg = b->payload[0];
+-		s.pi_pending_key = b->payload[1];
++		s.pi_pending_key = b->payload[b->len >= DMR_AES_PI_BYTES ? 2 : 1];
++		s.pi_pending_cc = b->cc;
++		s.pi_pending_ts = b->ts;
+ 		return;
+ 	}
+ 
+@@ -1157,7 +1181,7 @@ static void rx_pi_header(const dmr_burst_t *b, uint32_t now)
+ 		stats.rx_encrypted_calls++;
+ 	c->pi_header = true;
+ 	c->pi_alg = b->payload[0];
+-	c->pi_key = b->payload[1];
++	c->pi_key = b->payload[b->len >= DMR_AES_PI_BYTES ? 2 : 1];
+ 	c->encrypted = true;
+ 	s.dirty = true;
+ }
+@@ -1199,7 +1223,9 @@ static void rx_burst(const dmr_burst_t *b, uint32_t now, uint32_t slot)
+ 	s.last_any_ms = now;
+ 	s.any_seen = true;
+ 
+-	if (cc_other(b)) {
++	if (cc_other(b) ||
++	    (!sfr_both() && s.rx != RXC_NONE && s.rx_cc_known && cc_known(b) && b->crc_ok &&
++	     (b->kind == DMR_BURST_VOICE || b->kind == DMR_BURST_PI_HEADER) && b->cc != s.view.rx_cc)) {
+ 		stats.rx_cc_dropped++;
+ 		TR_WHAT('x');
+ 		return;
+@@ -1286,8 +1312,12 @@ static void rx_burst(const dmr_burst_t *b, uint32_t now, uint32_t slot)
+ #if DMR_AES_ON
+ 		// Late entry: every voice burst's fragments, from its raw payload, before any play or hold decision
+ 		// (bursts heard while we transmit never reach here: rx_burst drops them at its top)
+-		if (s.cfg.aes_key != NULL)
++		if (s.cfg.cipher_key != NULL &&
++		    !(s.rx == RXC_NONE && s.le_active && s.cfg.listen.both_ts && slot_known && b->ts != s.le_ts)) {
++			if (s.rx == RXC_NONE && s.le_active && s.le_cc >= 0 && cc_known(b) && b->crc_ok && b->cc != s.le_cc)
++				s.le_frag_mask = s.le_sb_ms = 0;
+ 			rx_le_collect(b);
++		}
+ #endif
+ #if CONFIG_SFR
+ 		if (sfr_both() && !sfrDedupVoice(&s.sfr_dd, b->voice_index % 6, now)) {
+@@ -1502,11 +1532,14 @@ static void tx_fill(uint32_t now)
+ 		bool aes = false;
+ 
+ #if DMR_AES_ON
+-		aes = s.cfg.aes_key != NULL;
++		aes = s.cfg.cipher_key != NULL;
+ 		// Encrypted in place once: the keystream moves on with each burst, so a burst the modem refused is tried
+ 		// again as it is
+ 		if (aes && !s.stage_enc) {
+-			dmrAesBurst(&s.aes, (uint8_t *)s.stage, s.voice_index, 0, NULL);
++			if (!dmrAesBurst(&s.aes, (uint8_t *)s.stage, s.voice_index, 0, NULL)) {
++				tx_deny(DMR_TX_ERR_REJECTED);
++				return;
++			}
+ 			s.stage_enc = true;
+ 		}
+ #endif
+@@ -1515,7 +1548,7 @@ static void tx_fill(uint32_t now)
+ 		// Late entry: this superframe's fragments carry the NEXT superframe's MI (dmrAesBurst just stepped the
+ 		// stream to this superframe's), stuffed into the frames' least significant bits after encryption
+ 		if (aes && s.aes.ready) {
+-			uint32_t next = dmrAesMiNext(s.aes.mi);
++			uint32_t next = dmrVoiceCipherNextMi(s.cfg.cipher_alg, s.aes.mi);
+ 
+ 			if (next != s.tx_le_mi) {
+ 				dmrAesLeBuild(next, s.tx_le_frag);
+@@ -1554,11 +1587,17 @@ static void tx_start_voice(uint32_t now)
+ 
+ #if DMR_AES_ON
+ 	// AES-256 asked for and its key not in the keyring: never in the clear instead
+-	if (s.cfg.aes_kid != 0 && s.cfg.aes_key == NULL) {
++	if (s.cfg.cipher_alg != 0 &&
++	    ((s.cfg.cipher_alg != DMR_AES_ALG && s.cfg.cipher_alg != DMR_ARC4_ALG) ||
++	     s.cfg.cipher_key == NULL || s.cfg.cipher_kid == 0)) {
+ 		tx_deny(DMR_TX_ERR_REJECTED);
+ 		return;
+ 	}
+ #endif
++	if ((s.cfg.tx_svc & DMR_SVC_PRIVACY) && s.cfg.privacy == NULL && s.cfg.cipher_key == NULL) {
++		tx_deny(DMR_TX_ERR_REJECTED);
++		return;
++	}
+ 	if (s.cfg.rmo)
+ 		timing = DMR_TIMING_ALIGNED;
+ 	else	// DMO: answer in step with a station just heard, else on our own timing
+@@ -1597,18 +1636,20 @@ static void tx_start_voice(uint32_t now)
+ #if DMR_AES_ON
+ 	s.tx_pi_left = false;
+ 	s.stage_enc = false;
+-	if (s.cfg.aes_key != NULL) {
++	if (s.cfg.cipher_key != NULL) {
+ 		// An MI no transmission had before (air_nonce.h), its keystream and the PI header that carries it
+-		uint8_t n[AES_BLOCK_BYTES];
++		uint8_t n[AES_BLOCK_BYTES], nonce_key[AES256_KEY_BYTES] = { 0 };
+ 		uint32_t mi = 0;
+ 
++		memcpy(nonce_key, s.cfg.cipher_key, s.cfg.cipher_alg == DMR_ARC4_ALG ? DMR_ARC4_KEY_BYTES : AES256_KEY_BYTES);
+ 		while (mi == 0) {
+-			air_nonce(s.cfg.aes_key, now, n);
++			air_nonce(nonce_key, now, n);
+ 			mi = (uint32_t)n[0] << 24 | (uint32_t)n[1] << 16 | (uint32_t)n[2] << 8 | n[3];
+ 		}
+ 		memset(n, 0, sizeof(n));
+-		dmrAesStart(&s.aes, s.cfg.aes_key, mi);
+-		dmrAesPiBuild(s.cfg.aes_kid, mi, l.dst, s.tx_pi);
++		memset(nonce_key, 0, sizeof nonce_key);
++		dmrVoiceCipherStart(&s.aes, s.cfg.cipher_alg, s.cfg.cipher_key, mi);
++		dmrVoiceCipherPiBuild(s.cfg.cipher_alg, s.cfg.cipher_kid, mi, l.dst, s.tx_pi);
+ 
+ 		uint16_t crc = (uint16_t)(dmr_crc_ccitt(s.tx_pi, DMR_AES_PI_BYTES) ^ DMR_CRC_MASK_PI);
+ 
+@@ -1619,7 +1660,7 @@ static void tx_start_voice(uint32_t now)
+ 		// mid-call can start its keystream without the PI header (a modem that can't send it leaves the chip's
+ 		// own RC encoder on burst F)
+ 		if (s.modem->set_burst_f_emb != NULL) {
+-			uint32_t field = dmrFecSbEncode((uint16_t)((s.cfg.aes_kid << 3) | (DMR_AES_ALG & 0x07u)));
++			uint32_t field = dmrFecSbEncode((uint16_t)((s.cfg.cipher_kid << 3) | (s.cfg.cipher_alg & 0x07u)));
+ 			uint8_t filler[4] = { (uint8_t)(field >> 24), (uint8_t)(field >> 16), (uint8_t)(field >> 8),
+ 					      (uint8_t)field };
+ 
+@@ -1982,7 +2023,7 @@ static void tx_poll(uint32_t now)
+ // PTT must be released before the next. Twice, because a voice burst F's null fragment passes the 7-bit CRC once in
+ // 128; the site repeats it every 360 ms. A request is always accepted. Power commands are only counted: the radio
+ // keeps the power it was set to
+-static void rc_heard(uint32_t arg, uint32_t now)
++static void rc_heard(uint32_t arg, int8_t ts, uint32_t now)
+ {
+ #if DMR_AES_ON
+ 	// A burst-F single block, not a reverse-channel command. While we transmit, the repeater's RC is what the over
+@@ -1990,16 +2031,20 @@ static void rc_heard(uint32_t arg, uint32_t now)
+ 	// itself, even when its bits also read as a reverse-channel command (key IDs 27 and 188 do); anything else
+ 	// without a good RC CRC is a single block too (the core's check, as for the HR-C6000's burst-F null fragment)
+ 	if (((arg >> 16) & DMR_RC_EMBEDDED) && s.tx != TX_ON) {
++		int8_t rx_ts = s.rx != RXC_NONE ? s.call_ts : s.le_active ? s.le_ts : 0;
++		if (ts && rx_ts && ts != rx_ts)
++			return;
+ 		uint16_t info = (uint16_t)(arg & 0x7FFu);
+ 
+-		if ((s.cfg.aes_key != NULL && (info >> 3) == s.cfg.aes_kid &&
+-		     (info & 0x07u) == (DMR_AES_ALG & 0x07u)) ||
++		if ((s.cfg.cipher_key != NULL && (info >> 3) == s.cfg.cipher_kid &&
++		     (info & 0x07u) == (s.cfg.cipher_alg & 0x07u)) ||
+ 		    dmrFecRcInfoDecode(info) < 0) {
+ 			rx_le_sb(info, now);
+ 			return;
+ 		}
+ 	}
+ #endif
++	(void)ts;
+ 	int c = dmrFecRcInfoDecode((uint16_t)(arg & 0x7FFu));
+ 
+ 	if (c < 0) {
+@@ -2056,7 +2101,7 @@ static void handle_event(const evq_item_t *it, uint32_t now)
+ 		}
+ 		break;
+ 	case DMR_EV_RC:
+-		rc_heard(it->arg, now);
++		rc_heard(it->arg, it->ts, now);
+ 		break;
+ 	case DMR_EV_TX_REJECTED:
+ 		if (tx_rewake(now))
+@@ -2183,7 +2228,10 @@ void dmr_call_configure(const dmr_call_config_t *cfg)
+ 	bool filter_change = cfg->listen.any_cc != s.cfg.listen.any_cc || cfg->listen.both_ts != s.cfg.listen.both_ts;
+ 	bool target_change = !same_target(cfg->talk_target, s.cfg.talk_target);
+ 
+-	if (rf_change && s.configured) {
++	bool privacy_change = cfg->cipher_alg != s.cfg.cipher_alg || cfg->cipher_kid != s.cfg.cipher_kid ||
++			      cfg->cipher_key != s.cfg.cipher_key || cfg->privacy != s.cfg.privacy ||
++			      cfg->privacy_ctx != s.cfg.privacy_ctx || cfg->privacy_profile != s.cfg.privacy_profile;
++	if ((rf_change || privacy_change) && s.configured) {
+ 		if (s.data_active && s.modem)
+ 			data_end(DMR_TX_ERR_REJECTED);
+ 		if (transmitting() && s.modem)
+@@ -2193,6 +2241,12 @@ void dmr_call_configure(const dmr_call_config_t *cfg)
+ 		if (s.tx != TX_NONE)
+ 			s.tx = s.ptt ? TX_DENIED : TX_NONE;
+ 		rx_end(s.now);
++		s.pi_pending = false;
++		le_reset();
++#if DMR_AES_ON
++		dmrAesStop(&s.aes);
++		s.le_sb_ms = s.le_frag_mask = 0;
++#endif
+ 		s.rpt_seen = s.rpt_bursts = false;
+ 	}
+ 	s.cfg = *cfg;
+diff --git a/core/dmr/call/dmr_call.h b/core/dmr/call/dmr_call.h
+index fd00f81..9529d51 100644
+--- a/core/dmr/call/dmr_call.h
++++ b/core/dmr/call/dmr_call.h
+@@ -115,11 +115,12 @@ typedef struct {
+ 	uint8_t tx_svc;			// voice LC service options (privacy bit, emergency, priority)
+ 	dmr_privacy_fn privacy;		// NULL = none: bursts with PI set are not played
+ 	void *privacy_ctx;
+-	// AES-256 (CONFIG_AIR_AES with CONFIG_DMR_PRIVACY; core/dmr/dmrAes.h), instead of the privacy hook: aes_kid 1-255
+-	// is the key ID, aes_key its 32 octets (NULL: not in the keyring, PTT refused). Calls whose PI header names this
+-	// key ID are decrypted; TX sends a PI header and encrypts. aes_kid 0: none. (Unconditional fields: no layout per build)
+-	const uint8_t *aes_key;
+-	uint8_t aes_kid;
++	uint32_t privacy_profile;	// identity of the static configuration, even when its context address stays fixed
++	bool basic_ras;		// configured Motorola BP also applies to a no-LC call on the configured CC/slot
++	// MI-based voice privacy instead of the static hook. cipher_alg 0 means none. A configured algorithm
++	// requires its key and key ID for TX, and matching PI or late-entry signalling for RX.
++	const uint8_t *cipher_key;
++	uint8_t cipher_alg, cipher_kid;
+ 	char tx_alias[DMR_TA_TEXT_MAX + 1];	// our talker alias, "" = none (CONFIG_DMR_TALKER_ALIAS)
+ 	uint8_t tx_alias_format;	// DMR_TA_7BIT or DMR_TA_ISO8
+ 	// A user of a single frequency repeater (CONFIG_SFR, docs/spec/sfr.md 4; never with rmo): ts is the inbound slot.
+diff --git a/core/dmr/dmrAes.c b/core/dmr/dmrAes.c
+index c48e936..0666ade 100644
+--- a/core/dmr/dmrAes.c
++++ b/core/dmr/dmrAes.c
+@@ -9,6 +9,13 @@
+ 
+ #include <string.h>
+ 
++static void wipe(uint8_t *bytes, unsigned size)
++{
++	volatile uint8_t *p = bytes;
++	while (size--)
++		*p++ = 0;
++}
++
+ static uint32_t lfsr_bit(uint32_t m)
+ {
+ 	return ((m >> 31) ^ (m >> 21) ^ (m >> 1) ^ m) & 1u;
+@@ -21,9 +28,56 @@ uint32_t dmrAesMiNext(uint32_t mi)
+ 	return mi;
+ }
+ 
++uint32_t dmrVoiceCipherNextMi(uint8_t alg, uint32_t mi)
++{
++	if (alg == DMR_AES_ALG)
++		return dmrAesMiNext(mi);
++	for (unsigned i = 0; i < 32; i++) {
++		uint32_t bit = ((mi >> 31) ^ (mi >> 3) ^ (mi >> 1)) & 1u;
++		mi = (mi << 1) | bit;
++	}
++	return mi;
++}
++
++// Motorola ARC4 keys the stream with the five key octets followed by the big-endian MI.
++// Drop 256 bytes, then use seven per AMBE frame, including erased or silent frames.
++static void arc4_generate(dmr_aes_t *a)
++{
++	uint8_t state[256], seed[DMR_ARC4_KEY_BYTES + 4];
++	memcpy(seed, a->key, DMR_ARC4_KEY_BYTES);
++	for (unsigned i = 0; i < 4; i++)
++		seed[DMR_ARC4_KEY_BYTES + i] = (uint8_t)(a->mi >> (24 - 8 * i));
++	for (unsigned i = 0; i < sizeof state; i++)
++		state[i] = (uint8_t)i;
++	uint8_t j = 0;
++	for (unsigned i = 0; i < sizeof state; i++) {
++		uint8_t x = state[i];
++		j = (uint8_t)(j + x + seed[i % sizeof seed]);
++		state[i] = state[j];
++		state[j] = x;
++	}
++	j = 0;
++	for (unsigned n = 0; n < 256 + DMR_AES_SF_BYTES; n++) {
++		uint8_t i = (uint8_t)(n + 1);
++		uint8_t x = state[i];
++		j = (uint8_t)(j + x);
++		uint8_t y = state[j];
++		state[i] = y;
++		state[j] = x;
++		if (n >= 256)
++			a->ks[n - 256] = state[(uint8_t)(x + y)];
++	}
++	wipe(state, sizeof state);
++	wipe(seed, sizeof seed);
++}
++
+ // The superframe's keystream: IV = the MI, then 96 bits more of its LFSR
+ static void generate(dmr_aes_t *a)
+ {
++	if (a->alg == DMR_ARC4_ALG) {
++		arc4_generate(a);
++		return;
++	}
+ 	uint8_t blk[AES_BLOCK_BYTES] = { 0 };
+ 	uint32_t m = a->mi;
+ 
+@@ -44,35 +98,48 @@ static void generate(dmr_aes_t *a)
+ }
+ 
+ void dmrAesStart(dmr_aes_t *a, const uint8_t *key, uint32_t mi)
++{
++	dmrVoiceCipherStart(a, DMR_AES_ALG, key, mi);
++}
++
++void dmrVoiceCipherStart(dmr_aes_t *a, uint8_t alg, const uint8_t *key, uint32_t mi)
+ {
+ 	memset(a, 0, sizeof *a);
+ 	a->key = key;
+ 	a->mi = mi;
+ 	a->pos = 0xFF;
+-	a->ready = key != NULL && mi != 0;
++	a->alg = alg;
++	a->ready = key != NULL && mi != 0 && (alg == DMR_AES_ALG || alg == DMR_ARC4_ALG);
+ 	if (a->ready)
+ 		generate(a);
+ }
+ 
+ void dmrAesStop(dmr_aes_t *a)
+ {
+-	volatile uint8_t *p = (volatile uint8_t *)a;
+-
+-	for (unsigned i = 0; i < sizeof *a; i++)
+-		p[i] = 0;
++	wipe((uint8_t *)a, sizeof *a);
+ 	a->pos = 0xFF;
+ }
+ 
+ bool dmrAesPiParse(const uint8_t pi[DMR_AES_PI_BYTES], uint8_t *kid, uint32_t *mi)
++{
++	return dmrVoiceCipherPiParse(pi, DMR_AES_ALG, kid, mi);
++}
++
++bool dmrVoiceCipherPiParse(const uint8_t pi[DMR_AES_PI_BYTES], uint8_t alg, uint8_t *kid, uint32_t *mi)
+ {
+ 	*kid = pi[2];
+ 	*mi = (uint32_t)pi[3] << 24 | (uint32_t)pi[4] << 16 | (uint32_t)pi[5] << 8 | pi[6];
+-	return pi[1] == DMR_AES_FID && (pi[0] & 0xDFu) == (DMR_AES_ALG & 0xDFu) && *kid != 0 && *mi != 0;
++	return pi[1] == DMR_AES_FID && (pi[0] & 0xDFu) == (alg & 0xDFu) && *kid != 0 && *mi != 0;
+ }
+ 
+ void dmrAesPiBuild(uint8_t kid, uint32_t mi, uint32_t dst, uint8_t pi[DMR_AES_PI_BYTES])
+ {
+-	pi[0] = DMR_AES_ALG;
++	dmrVoiceCipherPiBuild(DMR_AES_ALG, kid, mi, dst, pi);
++}
++
++void dmrVoiceCipherPiBuild(uint8_t alg, uint8_t kid, uint32_t mi, uint32_t dst, uint8_t pi[DMR_AES_PI_BYTES])
++{
++	pi[0] = alg;
+ 	pi[1] = DMR_AES_FID;
+ 	pi[2] = kid;
+ 	for (unsigned i = 0; i < 4; i++)
+@@ -116,7 +183,7 @@ bool dmrAesBurst(dmr_aes_t *a, uint8_t ambe27[27], uint8_t index, uint32_t slot,
+ 	}
+ 	if (n) {
+ 		while (n--)
+-			a->mi = dmrAesMiNext(a->mi);
++			a->mi = dmrVoiceCipherNextMi(a->alg, a->mi);
+ 		generate(a);
+ 	}
+ 	for (unsigned f = 0; f < 3; f++) {
+diff --git a/core/dmr/dmrAes.h b/core/dmr/dmrAes.h
+index 243ecf6..1cdfe05 100644
+--- a/core/dmr/dmrAes.h
++++ b/core/dmr/dmrAes.h
+@@ -13,22 +13,29 @@
+ #include <stdint.h>
+ 
+ #define DMR_AES_ALG		0x25	// AES-256 in the PI header (0x05 is taken too: what some makers send)
++#define DMR_ARC4_ALG		0x21	// Motorola Enhanced Privacy (also 0x01 in a compatible PI)
++#define DMR_ARC4_KEY_BYTES	5
+ #define DMR_AES_FID		0x10
+ #define DMR_AES_PI_BYTES	10	// the PI header without its CRC
+ #define DMR_AES_SF_BYTES	126	// a superframe's keystream: 18 frames of 7 octets
+ #define DMR_AES_MAX_GAP		64	// superframes a call may lose and keep its keystream (23 s; a fade ends it sooner)
+ 
+ typedef struct {
+-	const uint8_t *key;		// the caller's 32 octets
++	const uint8_t *key;		// caller's 32 AES octets or 5 ARC4 octets
+ 	uint32_t mi;			// the MI of the superframe in hand
+ 	uint32_t slot;			// the modem's slot counter at the last burst, 0: none
+ 	uint8_t pos;			// the last burst's index (0-5), 0xFF: none yet
+ 	bool ready;
++	uint8_t alg;
+ 	uint8_t ks[DMR_AES_SF_BYTES];
+ } dmr_aes_t;
+ 
+ uint32_t dmrAesMiNext(uint32_t mi);
+ void dmrAesStart(dmr_aes_t *a, const uint8_t *key, uint32_t mi);
++void dmrVoiceCipherStart(dmr_aes_t *a, uint8_t alg, const uint8_t *key, uint32_t mi);
++uint32_t dmrVoiceCipherNextMi(uint8_t alg, uint32_t mi);
++bool dmrVoiceCipherPiParse(const uint8_t pi[DMR_AES_PI_BYTES], uint8_t alg, uint8_t *kid, uint32_t *mi);
++void dmrVoiceCipherPiBuild(uint8_t alg, uint8_t kid, uint32_t mi, uint32_t dst, uint8_t pi[DMR_AES_PI_BYTES]);
+ void dmrAesStop(dmr_aes_t *a);	// wipes the keystream
+ // The first 10 octets of a PI header: true for AES-256 in the Motorola layout, with a key ID and an MI
+ bool dmrAesPiParse(const uint8_t pi[DMR_AES_PI_BYTES], uint8_t *kid, uint32_t *mi);
+diff --git a/core/dmr/dmrPrivacy.c b/core/dmr/dmrPrivacy.c
+index d3334c7..851cc79 100644
+--- a/core/dmr/dmrPrivacy.c
++++ b/core/dmr/dmrPrivacy.c
+@@ -74,6 +74,7 @@ bool dmrPrivacyKeyIsValid(dmrPrivacyType_t type, uint16_t key)
+ 		case DMR_PRIVACY_ANYTONE_BP:
+ 			return true;
+ 		case DMR_PRIVACY_AES256:	// a key ID; without the AES build there is nothing to run it
++		case DMR_PRIVACY_MOTOROLA_EP:
+ 			return CONFIG_AIR_AES && (key >= 1) && (key <= 255);
+ 		default:
+ 			return false;
+@@ -95,6 +96,8 @@ const char *dmrPrivacyTypeName(dmrPrivacyType_t type)
+ 			return "Anytone BP";
+ 		case DMR_PRIVACY_AES256:
+ 			return "AES-256";
++		case DMR_PRIVACY_MOTOROLA_EP:
++			return "Moto EP";
+ 		default:
+ 			return "Off";
+ 	}
+diff --git a/core/dmr/dmrPrivacy.h b/core/dmr/dmrPrivacy.h
+index 7e80cef..cc760fa 100644
+--- a/core/dmr/dmrPrivacy.h
++++ b/core/dmr/dmrPrivacy.h
+@@ -26,6 +26,7 @@ typedef enum
+ 	DMR_PRIVACY_ANYTONE_BP,   // Anytone 16-bit Basic Privacy, key 0x0000-0xFFFF
+ 	DMR_PRIVACY_AES256,       // AES-256, Motorola layout: key = key ID 1-255 of the keyring (CONFIG_AIR_AES, dmrAes.h); not
+ 	                          // a static keystream, so the call stack's AES path runs it, never the privacy hook
++	DMR_PRIVACY_MOTOROLA_EP,  // ARC4-40, key = key ID 1-255 of the keyring
+ 	DMR_PRIVACY_NUM_TYPES
+ } dmrPrivacyType_t;
+ 
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index d66b455..169a61d 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -1374,7 +1374,7 @@ static dmrPrivacyKey_t privacy_key;	// the call stack's privacy hook context (ra
+ #include "codeplug/codeplug_records.h"
+ #include "dmr/dmrAes.h"
+ #include "crypto/aes256.h"
+-static uint8_t dmr_aes_key[AES256_KEY_BYTES];	// the DMR AES-256 key the call stack points at (radio task only)
++static uint8_t dmr_cipher_key[AES256_KEY_BYTES];	// the call stack points here (radio task only)
+ #endif
+ 
+ // Hang time (ms) as the call stack's reply window (whole seconds, rounded up); 0 keeps the stack's default
+@@ -1483,32 +1483,37 @@ static void dmr_configure(radio_sm_t *sm)
+ #if CONFIG_DMR_PRIVACY
+ 	privacy_key.type = (dmrPrivacyType_t)sm->privacy_type;
+ 	privacy_key.key = sm->privacy_key;
+-#if CONFIG_AIR_AES
+-	if (sm->view.vfo && (ch->vfo_digital & VFO_DIG_DMR_OFF)) {
+-		privacy_key.type = DMR_PRIVACY_OFF;
+-		privacy_key.key = 0;
+-	} else if (ch->kind == CODEPLUG_KIND_NONE && ch->dmr_aes_kid != 0) {
+-		privacy_key.type = DMR_PRIVACY_AES256;
+-		privacy_key.key = ch->dmr_aes_kid;
++	if (sm->view.vfo) {
++		if (ch->vfo_digital & VFO_DIG_DMR_OFF)
++			privacy_key.type = DMR_PRIVACY_OFF;
++		else if (ch->dmr_privacy_key != 0)
++			privacy_key = (dmrPrivacyKey_t){ DMR_PRIVACY_AES256, ch->dmr_privacy_key };
++	} else if (ch->kind == CODEPLUG_KIND_NONE && ch->dmr_privacy != CP_DMR_PRIV_DEFAULT) {
++		static const dmrPrivacyType_t types[] = {
++			[CP_DMR_PRIV_AES] = DMR_PRIVACY_AES256, [CP_DMR_PRIV_BASIC] = DMR_PRIVACY_MOTOROLA_BP,
++			[CP_DMR_PRIV_ENHANCED] = DMR_PRIVACY_MOTOROLA_EP, [CP_DMR_PRIV_OFF] = DMR_PRIVACY_OFF,
++		};
++		if (ch->dmr_privacy <= CP_DMR_PRIV_OFF)
++			privacy_key = (dmrPrivacyKey_t){ types[ch->dmr_privacy], ch->dmr_privacy_key };
+ 	}
+-#endif
+ 	privacy = privacy_key.type != DMR_PRIVACY_OFF;
+ 	if (privacy) {
+-		cfg.privacy = dmrPrivacyCallHook;
+-		cfg.privacy_ctx = &privacy_key;
+ 		cfg.tx_fid = dmrPrivacyFID(privacy_key.type, cfg.tx_fid);
+ 		cfg.tx_svc = dmrPrivacyServiceOptions(privacy_key.type, cfg.tx_svc);
++		if (privacy_key.type < DMR_PRIVACY_AES256 && dmrPrivacyKeyIsValid(privacy_key.type, privacy_key.key)) {
++			cfg.privacy = dmrPrivacyCallHook;
++			cfg.privacy_ctx = &privacy_key;
++			cfg.privacy_profile = (uint32_t)privacy_key.type << 16 | privacy_key.key;
++			cfg.basic_ras = privacy_key.type == DMR_PRIVACY_MOTOROLA_BP;
++		}
+ 	}
+ #if CONFIG_AIR_AES
+-	// AES-256: the key ID's key from the keyring (system 0xFF, algorithm 0x25). Missing: calls stay silent and PTT is
+-	// refused (the call stack never sends in the clear instead)
+-	if (privacy && privacy_key.type == DMR_PRIVACY_AES256) {
+-		cfg.privacy = NULL;
+-		cfg.privacy_ctx = NULL;
+-		cfg.aes_kid = (uint8_t)privacy_key.key;
+-		if (codeplug_traffic_key(CODEPLUG_SYSTEM_NONE, DMR_AES_ALG, cfg.aes_kid, dmr_aes_key, sizeof(dmr_aes_key)) ==
+-		    (int)sizeof(dmr_aes_key))
+-			cfg.aes_key = dmr_aes_key;
++	if (privacy_key.type == DMR_PRIVACY_AES256 || privacy_key.type == DMR_PRIVACY_MOTOROLA_EP) {
++		cfg.cipher_alg = privacy_key.type == DMR_PRIVACY_AES256 ? DMR_AES_ALG : DMR_ARC4_ALG;
++		cfg.cipher_kid = (uint8_t)privacy_key.key;
++		unsigned n = cfg.cipher_alg == DMR_AES_ALG ? AES256_KEY_BYTES : DMR_ARC4_KEY_BYTES;
++		if (cfg.cipher_kid && codeplug_traffic_key(CODEPLUG_SYSTEM_NONE, cfg.cipher_alg, cfg.cipher_kid, dmr_cipher_key, n) == (int)n)
++			cfg.cipher_key = dmr_cipher_key;
+ 	}
+ #endif
+ #endif
+@@ -6964,7 +6969,7 @@ static void restore_vfo(radio_sm_t *sm, const settings_t *st, uint8_t idx)
+ 	sm->vfo_ch.vfo_digital = st->vfo_digital[idx];
+ 	sm->vfo_ch.vfo_p25_kid = st->vfo_p25_kid[idx];
+ 	sm->vfo_ch.vfo_nxdn_key = st->vfo_nxdn_key[idx];
+-	sm->vfo_ch.dmr_aes_kid = st->vfo_dmr_kid[idx];
++	sm->vfo_ch.dmr_privacy_key = st->vfo_dmr_kid[idx];
+ 	sm->vfo_seeded = true;
+ }
+ 
+@@ -6977,7 +6982,7 @@ static void persist_vfo(const radio_sm_t *sm, settings_t *st, uint8_t idx)
+ 		st->vfo_digital[idx] = v->vfo_digital;
+ 		st->vfo_p25_kid[idx] = v->vfo_p25_kid;
+ 		st->vfo_nxdn_key[idx] = v->vfo_nxdn_key;
+-		st->vfo_dmr_kid[idx] = v->dmr_aes_kid;
++		st->vfo_dmr_kid[idx] = v->dmr_privacy_key;
+ 	}
+ #if CONFIG_DUAL_WATCH
+ 	if (idx != 0) {
+@@ -8125,7 +8130,7 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ 		case RADIO_MODE_DMR:
+ 			if (req->arg > UINT8_MAX || req->arg == 0)
+ 				break;
+-			v->dmr_aes_kid = req->arg < 0 ? 0 : (uint8_t)req->arg;
++			v->dmr_privacy_key = req->arg < 0 ? 0 : (uint8_t)req->arg;
+ 			v->vfo_digital &= ~VFO_DIG_DMR_OFF;
+ 			if (req->arg == -1)
+ 				v->vfo_digital |= VFO_DIG_DMR_OFF;
+@@ -8137,7 +8142,7 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ 		sm->view.ch.vfo_digital = v->vfo_digital;
+ 		sm->view.ch.vfo_p25_kid = v->vfo_p25_kid;
+ 		sm->view.ch.vfo_nxdn_key = v->vfo_nxdn_key;
+-		sm->view.ch.dmr_aes_kid = v->dmr_aes_kid;
++		sm->view.ch.dmr_privacy_key = v->dmr_privacy_key;
+ 		tune(sm, now_ms);
+ 		break;
+ 	}
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index 175da98..9eaed68 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -2507,7 +2507,8 @@ static const ui_scr_def_t chlist_screen = {
+ // Without CONFIG_CHANNEL_EDIT the rows are read only and OK goes to the channel
+ 
+ enum { CE_NAME, CE_NUMBER, CE_MODE, CE_CODE, CE_RATE, CE_DEST, CE_RX, CE_TX, CE_POWER, CE_RX_ONLY, CE_BW, CE_RX_TONE, CE_TX_TONE, CE_VOX,
+-       CE_BURST, CE_CC, CE_TS, CE_CONTACT, CE_LIST, CE_ID, CE_DMO, CE_BEEP, CE_ALIAS1, CE_ALIAS2, CE_TOT, CE_SCAN, CE_ECO, CE_AES,
++       CE_BURST, CE_CC, CE_TS, CE_CONTACT, CE_LIST, CE_ID, CE_DMO, CE_BEEP, CE_ALIAS1, CE_ALIAS2, CE_TOT, CE_SCAN, CE_ECO,
++       CE_DMR_PRIVACY, CE_DMR_KEY, CE_AES,
+        CE_ZONES, CE_GO, CE_SHARE, CE_SAVE, CE_SAVE_NEW, CE_COUNT, CE_NONE = 0xFF };
+ 
+ static channel_t ced_ch;		// what the screen shows (the working copy when editing)
+@@ -2533,7 +2534,7 @@ static int32_t ced_aes_id(void)
+ 	if (ced_is_nxdn(&ced_ch))
+ 		return ced_air.nxdn.aes ? ced_air.nxdn.kid : -1;
+ #endif
+-	return ced_ch.dmr_aes_kid != 0 ? ced_ch.dmr_aes_kid : -1;
++	return -1;
+ }
+ 
+ #if CONFIG_CHANNEL_EDIT
+@@ -2545,7 +2546,7 @@ static int32_t ced_aes_step(int32_t id, int dir)
+ 	if (ced_is_nxdn(&ced_ch))
+ 		return codeplug_aes_key_step(NXDN_CIPHER_AES, id, dir, 0, NXDN_CP_KID_MAX);
+ #endif
+-	return codeplug_aes_key_step(DMR_AES_ALG, id, dir, 1, UINT8_MAX);
++	return -1;
+ }
+ 
+ static void ced_aes_set(int32_t id)
+@@ -2564,7 +2565,6 @@ static void ced_aes_set(int32_t id)
+ 		return;
+ 	}
+ #endif
+-	ced_ch.dmr_aes_kid = id >= 0 ? (uint8_t)id : 0;
+ }
+ #endif
+ #endif
+@@ -2608,7 +2608,7 @@ static const struct { uint8_t off, len, bit; } ced_fields[CE_ZONES] = {
+ 	[CE_NAME] = CE_FIELD(name), [CE_MODE] = CE_FIELD(mode), [CE_RX] = CE_FIELD(rx_hz), [CE_TX] = CE_FIELD(tx_hz),
+ 	[CE_POWER] = CE_FIELD(power), [CE_RX_ONLY] = CE_FIELD(rx_only), [CE_BW] = CE_FIELD(bw),
+ 	[CE_RX_TONE] = CE_FIELD(rx_tone), [CE_TX_TONE] = CE_FIELD(tx_tone), [CE_VOX] = CE_FIELD(vox),
+-	[CE_BURST] = CE_FIELD(tone_burst), [CE_AES] = CE_FIELD(dmr_aes_kid),
++	[CE_BURST] = CE_FIELD(tone_burst), [CE_DMR_PRIVACY] = CE_FIELD(dmr_privacy), [CE_DMR_KEY] = CE_FIELD(dmr_privacy_key),
+ 	[CE_CC] = CE_FIELD(color_code), [CE_TS] = CE_FIELD(timeslot), [CE_CONTACT] = CE_FIELD(contact),
+ 	[CE_LIST] = CE_FIELD(listen_list), [CE_ID] = CE_FIELD(dmr_id), [CE_DMO] = CE_FIELD(dmo),
+ 	[CE_BEEP] = CE_FIELD(no_beep), [CE_ALIAS1] = { offsetof(channel_t, alias_tx), 1, CODEPLUG_ALIAS_TS1_TEXT },
+@@ -2693,6 +2693,12 @@ static void ced_from_view(void)
+ {
+ 	const radio_view_t *v = ui_view();
+ 	ced_ch = v->ch;
++	if (v->vfo && v->ch.mode == RADIO_MODE_DMR) {
++		if (v->ch.vfo_digital & VFO_DIG_DMR_OFF)
++			ced_ch.dmr_privacy = CP_DMR_PRIV_OFF;
++		else if (v->ch.dmr_privacy_key)
++			ced_ch.dmr_privacy = CP_DMR_PRIV_AES;
++	}
+ 	if (v->temp & RADIO_TEMP_POWER)
+ 		ced_ch.power = v->power;
+ 	ced_ch.roam = false;
+@@ -2982,8 +2988,11 @@ static void ced_build(void)
+ #endif
+ 	ced_n = 0;
+ 	for (uint8_t r = 0; r < CE_COUNT; r++) {
+-		if (r == CE_AES && (!CONFIG_AIR_AES || into ||
+-		    !(p25 || nxdn || (CONFIG_DMR_PRIVACY && dmr && ced_ch.kind == CODEPLUG_KIND_NONE))))
++		if (r == CE_AES && (!CONFIG_AIR_AES || into || !(p25 || nxdn)))
++			continue;
++		if ((r == CE_DMR_PRIVACY || r == CE_DMR_KEY) &&
++		    (!CONFIG_DMR_PRIVACY || !dmr || ced_ch.kind != CODEPLUG_KIND_NONE || into ||
++		     (r == CE_DMR_KEY && (ced_ch.dmr_privacy == CP_DMR_PRIV_DEFAULT || ced_ch.dmr_privacy == CP_DMR_PRIV_OFF))))
+ 			continue;
+ 		bool fm_only = r == CE_BW || r == CE_RX_TONE || r == CE_TX_TONE || r == CE_VOX || r == CE_BURST;
+ 		bool dmr_only = r >= CE_CC && r <= CE_ALIAS2;
+@@ -3191,6 +3200,17 @@ static void sb_ced_code(sbuf_t *b, const channel_t *ch, bool editing)
+ }
+ #endif
+ 
++static const char *ced_dmr_privacy_name(uint8_t type)
++{
++	switch (type) {
++	case CP_DMR_PRIV_OFF: return TR(VALUE_OFF, "Off");
++	case CP_DMR_PRIV_BASIC: return "Moto Basic";
++	case CP_DMR_PRIV_ENHANCED: return "Moto Enhanced";
++	case CP_DMR_PRIV_AES: return "AES-256";
++	default: return TR(CHAN_VALUE_RADIO_DEFAULT, "Radio's");
++	}
++}
++
+ static void chinfo_item(uint16_t i, ui_item_t *it)
+ {
+ 	static const tr_id_t labels[CE_COUNT] = { TRN(LABEL_NAME, "Name"), TRN(CHAN_LABEL_NUMBER, "Number"),
+@@ -3204,7 +3224,9 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
+ 		TRN(CHAN_LABEL_DIRECT_MODE, "Direct mode"), TRN(CHAN_LABEL_TALK_PERMIT_BEEPS, "Talk permit beeps"),
+ 		TRN(CHAN_LABEL_TALKER_ALIAS_TS1, "Talker alias TS1"),
+ 		TRN(CHAN_LABEL_TALKER_ALIAS_TS2, "Talker alias TS2"), TRN(CHAN_LABEL_TX_TIMEOUT, "TX time-out"),
+-		TRN(WORD_SCAN, "Scan"), TRN(LABEL_BATTERY_SAVER, "Battery saver"), TRN(CHAN_LABEL_AES_KEY, "AES-256 key"), TRN(TITLE_ZONES, "Zones"),
++		TRN(WORD_SCAN, "Scan"), TRN(LABEL_BATTERY_SAVER, "Battery saver"),
++		TRN(CHAN_LABEL_DMR_PRIVACY, "Privacy"), TRN(CHAN_LABEL_DMR_KEY, "Key ID"),
++		TRN(CHAN_LABEL_AES_KEY, "AES-256 key"), TRN(TITLE_ZONES, "Zones"),
+ 		TRN(CHAN_ROW_TUNE_TO, "Tune to this ch"), TRN(SHARE_ROW_CHANNEL_TO, GLYPH_SHARE " Share channel to..."),
+ 		TRN(ROW_SAVE, "Save"), TRN(CHAN_ROW_SAVE_AS_NEW, "Save as new channel") };
+ 	const channel_t *ch = &ced_ch;
+@@ -3292,6 +3314,17 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
+ 		break;
+ #endif
+ #endif
++	case CE_DMR_PRIVACY:
++		sb_str(&b, ced_dmr_privacy_name(editing ? (uint8_t)ced_val_or(ch->dmr_privacy) : ch->dmr_privacy));
++		break;
++	case CE_DMR_KEY: {
++		int32_t key = editing ? ced_val_or(ch->dmr_privacy_key) : ch->dmr_privacy_key;
++		if (key > 0)
++			sb_u32(&b, (uint32_t)key, 1);
++		else
++			sb_str(&b, TR(VALUE_NONE, "None"));
++		break;
++	}
+ #if CONFIG_AIR_AES
+ 	case CE_AES: {
+ 		int32_t id = ced_aes_id();
+@@ -3548,6 +3581,32 @@ static bool ced_typed_tone(subtone_t *t)
+ static void ced_spin(int dir)
+ {
+ 	switch (ced_edit) {
++	case CE_DMR_PRIVACY: {
++		static const uint8_t choices[] = { CP_DMR_PRIV_DEFAULT, CP_DMR_PRIV_OFF, CP_DMR_PRIV_BASIC,
++#if CONFIG_AIR_AES
++						  CP_DMR_PRIV_ENHANCED, CP_DMR_PRIV_AES,
++#endif
++		};
++		unsigned n = sizeof choices / sizeof choices[0], i = 0;
++		while (i + 1 < n && choices[i] != ced_val)
++			i++;
++		ced_val = choices[(i + n + dir) % n];
++		break;
++	}
++	case CE_DMR_KEY:
++		if (ced_ch.dmr_privacy == CP_DMR_PRIV_BASIC) {
++			ced_val = (ced_val + dir + 256) % 256;
++			ced_len = 0;
++		}
++#if CONFIG_AIR_AES
++		else {
++			bool ep = ced_ch.dmr_privacy == CP_DMR_PRIV_ENHANCED;
++			int id = codeplug_key_step(ep ? DMR_ARC4_ALG : DMR_AES_ALG, ep ? DMR_ARC4_KEY_BYTES : 32,
++						   ced_val == 0 ? -1 : ced_val, dir, 1, UINT8_MAX);
++			ced_val = id < 0 ? 0 : id;
++		}
++#endif
++		break;
+ #if CONFIG_AIR_AES
+ 	case CE_AES:
+ 		ced_val = ced_aes_step(ced_val, dir);
+@@ -3601,6 +3660,16 @@ static void ced_digit(char d)
+ {
+ 	int32_t v = ced_val * 10 + (d - '0');
+ 	switch (ced_edit) {
++	case CE_DMR_KEY:
++		if (ced_ch.dmr_privacy == CP_DMR_PRIV_BASIC) {
++			if (ced_len == 0 || ced_len == 3 || v > UINT8_MAX) {
++				ced_len = 0;
++				v = d - '0';
++			}
++			ced_len++;
++			ced_val = v;
++		}
++		break;
+ 	case CE_RX:
+ 	case CE_TX:
+ 		ui_freq_entry_digit(ced_digits, &ced_len, d);
+@@ -3705,6 +3774,15 @@ static void ced_commit(void)
+ {
+ 	channel_t *c = &ced_ch;
+ 	switch (ced_edit) {
++	case CE_DMR_PRIVACY:
++		if (c->dmr_privacy != ced_val) {
++			c->dmr_privacy = (uint8_t)ced_val;
++			c->dmr_privacy_key = 0;
++		}
++		break;
++	case CE_DMR_KEY:
++		c->dmr_privacy_key = (uint8_t)ced_val;
++		break;
+ #if CONFIG_AIR_AES
+ 	case CE_AES:
+ 		ced_aes_set(ced_val);
+@@ -3861,6 +3939,15 @@ static void chinfo_select(uint16_t i, bool hold)
+ 			ced_mode_step();
+ 		}
+ 		break;
++	case CE_DMR_PRIVACY:
++		ced_edit = r;
++		ced_val = c->dmr_privacy;
++		break;
++	case CE_DMR_KEY:
++		ced_edit = r;
++		ced_val = c->dmr_privacy_key;
++		ced_len = 0;
++		break;
+ #if CONFIG_AIR_AES
+ 	case CE_AES:
+ 		ced_edit = r;
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index c0a4fdd..4a7a278 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -3750,7 +3750,7 @@ int32_t ui_vfo_aes_id(const radio_view_t *v)
+ 	const channel_t *ch = &v->ch;
+ 	switch (ch->mode) {
+ 	case RADIO_MODE_DMR:
+-		return ch->dmr_aes_kid != 0 ? (int32_t)ch->dmr_aes_kid : ch->vfo_digital & VFO_DIG_DMR_OFF ? -1 : -2;
++		return ch->dmr_privacy_key != 0 ? (int32_t)ch->dmr_privacy_key : ch->vfo_digital & VFO_DIG_DMR_OFF ? -1 : -2;
+ 	case RADIO_MODE_NXDN: return (int32_t)ch->vfo_nxdn_key - 1;
+ 	case RADIO_MODE_P25: return ch->vfo_digital & VFO_DIG_P25_AES ? (int32_t)ch->vfo_p25_kid : -1;
+ 	default: return -1;
+diff --git a/docs/spec/air-encryption.md b/docs/spec/air-encryption.md
+index 13c3344..b16189a 100644
+--- a/docs/spec/air-encryption.md
++++ b/docs/spec/air-encryption.md
+@@ -21,7 +21,7 @@ modes). Not checked against another maker's radio on air: section 6 lists what t
+ | Channel | Its parameter block says AES on or off and the key ID (2.4, 3.4). Off: the channel is clear, as ever |
+ | No key | A channel with AES on whose key is not in the keyring plays nothing encrypted and **refuses PTT**: it never sends in the clear instead |
+ | Unique IV | Output feedback leaks the plaintext if a key is used twice with the same IV. Every transmission takes a fresh one from `air_nonce()`: AES-256 under the key of `epoch (2) / transmission count (4) / time in ms (4) / zeros`. The epoch is `settings_t.air_epoch`, raised by one at each boot, so no start repeats another's; the count restarts at 0 at each boot |
+-| Secrets | The keyring is traffic keys ([channel-modes.md](channel-modes.md) 5.4): never in a zone share, left out of a file saved without keys |
++| Secrets | The keyring uses traffic-key records ([channel-modes.md](channel-modes.md) 5.4). Codeplug exports and zone shares omit key material. |
+ 
+ ## 2. P25 (`CODEPLUG_KIND_P25`)
+ 
+@@ -105,14 +105,14 @@ Traffic key records ([channel-modes.md](channel-modes.md) 5.4) with **system 0xF
+ | Offset | Size | Field |
+ |---|---|---|
+ | 0 | 1 | System: 0xFF |
+-| 1 | 1 | Algorithm: 0x84 for P25, 3 for NXDN, 0x25 for DMR |
++| 1 | 1 | Algorithm: 0x84 for P25, 3 for NXDN, 0x25 for DMR AES, 0x21 for DMR Enhanced Privacy |
+ | 2 | 2 | Key ID, little endian |
+ | 4 | 1 | Flags (0) |
+-| 5 | 32 | The key |
++| 5 | 32 or 5 | AES-256 or ARC4-40 key |
+ 
+-The Codeplug Editor edits it in the Radio tab (AES-256 keys): an algorithm, a key ID and 64 hex digits for each key,
+-hidden unless asked. `codeplug_traffic_key(CODEPLUG_SYSTEM_NONE, alg, id, ...)` reads it, in the radio task when the
+-channel is tuned or its settings change, into 32 octets of the engine's memory.
++In the Codeplug Editor, use **Radio → Keys** to enter the algorithm, key ID and key. AES-256 accepts 64 hexadecimal
++digits and DMR Enhanced Privacy accepts 10. The input masks the key. The radio reads the matching algorithm, ID and
++key length when the channel is tuned.
+ 
+ ## 5. What the radio shows
+ 
+@@ -147,12 +147,33 @@ channel is tuned or its settings change, into 32 octets of the engine's memory.
+ | `radioCoreTestP25`, `radioCoreTestNxdn` | A stored channel with AES and a keyring: plays, another key id is silent, PTT sends encrypted (a far radio with the key hears it, one without does not), a key missing from the keyring refuses PTT |
+ | `p25CodeplugTest`, `nxdnCodeplugTest`, `site/tests/modes.test.mjs` | The channel block bytes (shared vectors) and the keyring records |
+ 
+-## 8. DMR (Settings > Privacy, key type AES-256)
++## 8. DMR privacy
+ 
+-The Motorola layout, which DMR radios of other makers read too. On the radio it is a privacy key type
+-(`DMR_PRIVACY_AES256`, [settings-store.md](settings-store.md) 3.1): the key is a key ID, 1-255, of a keyring key with
+-algorithm 0x25. The radio core loads its 32 octets into `dmr_call_config_t.aes_key`; the call stack runs it
+-(`core/dmr/dmrAes.c`), not the static privacy hook.
++In the conventional DMR channel editor, choose **Privacy** and then **Key ID**. **Radio's** inherits the radio-wide
++privacy setting, **Off** sends clear, **Moto Basic** accepts key numbers 1–255, and **Moto Enhanced** and **AES-256**
++use IDs 1–255 from their respective CPS keyrings. Digits can be typed directly for Basic Privacy. Selecting a private
++method with a missing key blocks PTT. Digital Monitor widens receive filtering without changing the transmit profile.
++
++Named memories use the existing three-byte extension at `0x34`. The little-endian markers `0x5AA5`, `0x5AA6`,
++`0x5AA7` and `0x5AA8` identify AES, Basic, Enhanced and Off, followed by the one-byte key number or ID. The absent
++marker preserves the radio-wide setting for existing channels. Normal CPS exports leave the selected method and
++keyring references intact and omit the Basic key number and raw traffic keys.
++
++### Basic Privacy and RAS
++
++Motorola Basic Privacy uses the existing AMBE+2 transform. Key 179 uses table seed `0xDCB9`. Digital Monitor
++can acquire six sequential voice bursts when RAS invalidates the LC. A valid EMB privacy bit stays effective
++through the rest of that call, including burst A, which carries voice sync in place of EMB. The configured Motorola
++Basic key also applies to an unidentified call on the configured color code and slot when the repeater omits the EMB
++privacy bit. Without signalling an unidentified clear call on the same color code and slot cannot be distinguished
++from Basic Privacy. A burst from another slot or color code never contributes to an active call's privacy state.
++
++### AES-256 and Enhanced Privacy
++
++Both use the Motorola PI header and late-entry framing below. Enhanced Privacy uses algorithm `0x21` or compatible
++`0x01` on receive. ARC4 uses five key bytes followed by the four big-endian MI bytes, discards 256 output bytes,
++and consumes seven bytes per frame. The next MI advances 32 times with feedback `bit31 XOR bit3 XOR bit1`. The two
++algorithms share the burst-position and late-entry checks and use separate keyring entries.
+ 
+ | Item | Rule |
+ |---|---|
+@@ -162,7 +183,7 @@ algorithm 0x25. The radio core loads its 32 octets into `dmr_call_config_t.aes_k
+ | Keystream | AES-256 OFB, the first block discarded; 126 octets a superframe, 7 for each of its 18 frames, the first 49 bits XORed onto the frame's voice bits before their FEC (RX corrects the frame first) |
+ | Next superframe | The MI shifted 32 times through the same LFSR |
+ | TX MI | From `air_nonce()` (1), never 0 |
+-| Single block (burst F) | The key ID in bits 10-3 and the algorithm's low 3 in bits 2-0 (AES-256 is 5), through the single burst BPTC (B.2.2.2) with the row sent twice (even column parity); a reverse channel sends the row and its complement instead. A receiver tells the two apart by the RC CRC-7: a command's CRC is good, a single block's is not, except key IDs 27 and 188, whose single blocks read as reverse-channel commands and so never start a late entry |
++| Single block (burst F) | The key ID in bits 10-3 and the algorithm's low 3 in bits 2-0, with single-burst BPTC (B.2.2.2). A matching algorithm and key ID takes priority over an ambiguous reverse-channel decode during receive. |
+ | Late-entry MI | Each superframe's AMBE frames carry the NEXT superframe's MI in their least significant bits (four per frame): three Golay(24,12) words hold the 32-bit MI and a 4-bit CRC (x^4 + x + 1, inverted). Bursts A-C carry the words' first halves, D-F the second halves |
+ | RX | A PI header with our key ID starts the keystream; another key ID or algorithm stops it, and the call is not played. Superframes lost are counted by the modem's slot counter (up to 64); a call back after a fade keeps its keystream. A frame that is silence on air, or whose C0 word fails, plays as silence. Late entry: a call joined after its PI header starts from burst F's single block (our key ID, AES-256) and the superframe's MI fragments, from the next superframe on; the superframe the fragments came in stays silent. A single block with another key ID or algorithm, or none, leaves the call unplayed |
+ | No key | The key ID set and no keyring key for it: calls with that key ID are not played and PTT is refused |
+diff --git a/drivers/modem/hrc7000/hrc7000_dmr.c b/drivers/modem/hrc7000/hrc7000_dmr.c
+index 0c198a9..8298f93 100644
+--- a/drivers/modem/hrc7000/hrc7000_dmr.c
++++ b/drivers/modem/hrc7000/hrc7000_dmr.c
+@@ -3,6 +3,7 @@
+ // HR_C7000 DMR slot engine (hrc7000_dmr.h; docs/spec/modem-hrc7000.md 3, 5, 6)
+ #include <string.h>
+ #include "hrc7000_dmr.h"
++#include "dmr/call/dmr_lc.h"
+ #include "dmr/fec/dmrFec.h"
+ #if defined(CONFIG_HOTSPOT_SPLIT) && CONFIG_HOTSPOT_SPLIT
+ #include "hrc7000_bs.h"	// split duplex TX half: the BS outbound takes the chip over (e->bs)
+@@ -100,6 +101,7 @@ void hrc7000_dmr_decode(uint32_t rti, hrc7000_rx_status_t *st)
+ 		st->voice_index = (uint8_t)(vb - 1u);
+ 		// Burst A has no EMB (nothing to check); B-F carry the QR coded EMB
+ 		st->crc_ok = vb == 1 ? true : (rti & RTI_QR) == 0;
++		st->pi = vb != 1 && st->crc_ok && st->pi;
+ 		return;
+ 	}
+ 	if (sync_type != 2 || dt > DMR_BURST_RATE_1_DATA) {
+@@ -427,13 +429,17 @@ static void arm(hrc7000_dmr_t *e, const dmr_tx_burst_t *b)
+ 			memcpy(buf10, lc, 9);
+ 			buf10[9] = hrc7000_dmr_emb_checksum(lc);
+ 			write_tx_ram(e, buf10, 10);
++			// Program the voice EMB PI from the call's service options, not from an alias or GPS fragment.
++			uint32_t emb = (e->call_lc[2] & DMR_SVC_PRIVACY) != 0 ? 1u : 0u;
+ 			if (e->emb_filler_set) {
+ 				// Burst F's EMB filler (modem-hrc7000.md 2.8): the single block, already BPTC-encoded, at
+ 				// TX RAM 0x29-0x2C, and the chip's own RC encoder off so it sends this instead of its own
+ 				for (uint8_t i = 0; i < 4; i++)
+ 					e->dev->buf[C7_TX_RAM + TXRAM_BURST_F_EMB + i] = e->emb_filler[i];
+-				w(e, C7_VOICE_EMB_CTRL, 0x00);
++			} else {
++				emb |= 2u;	// F uses the chip's RC encoder
+ 			}
++			w(e, C7_VOICE_EMB_CTRL, emb);
+ 		}
+ 		e->next_voice = (uint8_t)((idx + 1u) % 6u);
+ 		w(e, C7_LAYER2_SEND_TYPE, hrc7000_dmr_send_type(kind, idx, e->lcss));
+diff --git a/site/i18n/en.json b/site/i18n/en.json
+index 980a66b..d164608 100644
+--- a/site/i18n/en.json
++++ b/site/i18n/en.json
+@@ -2026,19 +2026,21 @@
+  "editor.problem.mode_no_control": "The system has no control channel: the radio can't use it.",
+  "editor.problem.mode_no_secret": "The system needs its key and has none: the radio can't use it.",
+  "editor.problem.mode_secret_bad": "The system's key is not valid.",
+- "editor.problem.key_bad": "A key is not 64 hex digits.",
++ "editor.problem.key_bad": "The key length does not match its algorithm.",
+  "editor.problem.key_id_range": "A key ID goes up to {max}.",
+  "editor.problem.key_duplicate": "Two keys have the same algorithm and key ID.",
+  "editor.keys.title": "AES-256 keys",
+- "editor.keys.intro": "Add a key for the corresponding mode and select it in the channel editor. Both radios need the same ID and key. Keys are omitted when exporting a codeplug without keys.",
++ "editor.keys.intro": "Add a key for the mode and select its ID on the channel. Both radios need the same ID and key. Codeplug exports omit keys.",
+  "editor.keys.alg.p25": "P25 AES-256",
+  "editor.keys.alg.nxdn": "NXDN AES-256",
++ "editor.col.dmr_privacy": "Privacy",
++ "editor.keys.alg.arc4": "DMR Enhanced Privacy (ARC4-40)",
+  "editor.keys.alg.dmr": "DMR AES-256",
+  "editor.keys.id": "key ID",
+  "editor.keys.key": "Key (64 hex digits)",
+  "editor.keys.show": "Show",
+  "editor.keys.add": "Add key",
+- "editor.keys.bad": "A key is 64 hex digits (32 bytes).",
++ "editor.keys.bad": "Enter {n} hexadecimal digits.",
+  "editor.problem.mode_fallback_stale": "The fallback channel {number} was changed or deleted: the radio ignores it.",
+  "editor.problem.mode_fallback_kind": "The fallback channel must be a plain FM or DMR channel.",
+  "editor.problem.mode_same_identity": "The same system as {other}: a share or the radio may take either.",
+diff --git a/site/i18n/es.json b/site/i18n/es.json
+index d5809c3..3f51133 100644
+--- a/site/i18n/es.json
++++ b/site/i18n/es.json
+@@ -2026,19 +2026,21 @@
+  "editor.problem.mode_no_control": "El sistema no tiene canal de control: la radio no puede usarlo.",
+  "editor.problem.mode_no_secret": "El sistema necesita su clave y no la tiene: la radio no puede usarlo.",
+  "editor.problem.mode_secret_bad": "La clave del sistema no es válida.",
+- "editor.problem.key_bad": "Una clave no tiene 64 dígitos hex.",
++ "editor.problem.key_bad": "La longitud de la clave no coincide con su algoritmo.",
+  "editor.problem.key_id_range": "Un ID de clave llega hasta {max}.",
+  "editor.problem.key_duplicate": "Dos claves tienen el mismo algoritmo y el mismo ID.",
+  "editor.keys.title": "Claves AES-256",
+- "editor.keys.intro": "Añade una clave del modo correspondiente y selecciónala al editar el canal. Ambos radios necesitan el mismo ID y la misma clave. Las claves se omiten al exportar un codeplug sin claves.",
++ "editor.keys.intro": "Añade una clave para el modo y selecciona su ID en el canal. Ambas radios necesitan el mismo ID y la misma clave. Las exportaciones del codeplug omiten las claves.",
+  "editor.keys.alg.p25": "P25 AES-256",
+  "editor.keys.alg.nxdn": "NXDN AES-256",
++ "editor.col.dmr_privacy": "Privacidad",
++ "editor.keys.alg.arc4": "Privacidad mejorada DMR (ARC4-40)",
+  "editor.keys.alg.dmr": "DMR AES-256",
+  "editor.keys.id": "ID de clave",
+  "editor.keys.key": "Clave (64 dígitos hex)",
+  "editor.keys.show": "Mostrar",
+  "editor.keys.add": "Añadir clave",
+- "editor.keys.bad": "Una clave son 64 dígitos hex (32 bytes).",
++ "editor.keys.bad": "Introduce {n} dígitos hexadecimales.",
+  "editor.problem.mode_fallback_stale": "El canal de respaldo {number} se cambió o eliminó: la radio lo ignora.",
+  "editor.problem.mode_fallback_kind": "El canal de respaldo debe ser un canal FM o DMR normal.",
+  "editor.problem.mode_same_identity": "El mismo sistema que {other}: un envío compartido o la radio pueden tomar cualquiera.",
+diff --git a/site/i18n/it.json b/site/i18n/it.json
+index fc85eb8..0b97621 100644
+--- a/site/i18n/it.json
++++ b/site/i18n/it.json
+@@ -2026,19 +2026,21 @@
+  "editor.problem.mode_no_control": "Il sistema non ha un canale di controllo: la radio non può usarlo.",
+  "editor.problem.mode_no_secret": "Il sistema richiede la sua chiave e non ce l'ha: la radio non può usarlo.",
+  "editor.problem.mode_secret_bad": "La chiave del sistema non è valida.",
+- "editor.problem.key_bad": "Una chiave non è di 64 cifre esadecimali.",
++ "editor.problem.key_bad": "La lunghezza della chiave non corrisponde al suo algoritmo.",
+  "editor.problem.key_id_range": "Un ID chiave arriva fino a {max}.",
+  "editor.problem.key_duplicate": "Due chiavi hanno lo stesso algoritmo e lo stesso ID.",
+  "editor.keys.title": "Chiavi AES-256",
+- "editor.keys.intro": "Chiavi dei canali cifrati di P25 e NXDN, e di AES-256 in DMR (sulla radio: Impostazioni > Privacy, tipo di chiave AES-256 e l'ID della chiave). Un canale indica la sua chiave con l'ID; entrambe le radio devono avere la stessa chiave con lo stesso ID. Le chiavi non si condividono con una zona e non finiscono in un file salvato senza chiavi.",
++ "editor.keys.intro": "Aggiungi una chiave per la modalità e seleziona il suo ID nel canale. Entrambe le radio devono usare lo stesso ID e la stessa chiave. Le esportazioni del codeplug omettono le chiavi.",
+  "editor.keys.alg.p25": "P25 AES-256",
+  "editor.keys.alg.nxdn": "NXDN AES-256",
++ "editor.col.dmr_privacy": "Privacy",
++ "editor.keys.alg.arc4": "Privacy avanzata DMR (ARC4-40)",
+  "editor.keys.alg.dmr": "DMR AES-256",
+  "editor.keys.id": "ID chiave",
+  "editor.keys.key": "Chiave (64 cifre esadecimali)",
+  "editor.keys.show": "Mostra",
+  "editor.keys.add": "Aggiungi chiave",
+- "editor.keys.bad": "Una chiave è di 64 cifre esadecimali (32 byte).",
++ "editor.keys.bad": "Inserisci {n} cifre esadecimali.",
+  "editor.problem.mode_fallback_stale": "Il canale di ripiego {number} è stato cambiato o eliminato: la radio lo ignora.",
+  "editor.problem.mode_fallback_kind": "Il canale di ripiego deve essere un normale canale FM o DMR.",
+  "editor.problem.mode_same_identity": "Lo stesso sistema di {other}: una condivisione o la radio possono prendere l'uno o l'altro.",
+diff --git a/site/i18n/zh.json b/site/i18n/zh.json
+index 6c8382f..6afc0f4 100644
+--- a/site/i18n/zh.json
++++ b/site/i18n/zh.json
+@@ -2026,19 +2026,21 @@
+  "editor.problem.mode_no_control": "该系统没有控制信道：电台无法使用。",
+  "editor.problem.mode_no_secret": "该系统需要密钥但没有：电台无法使用。",
+  "editor.problem.mode_secret_bad": "该系统的密钥无效。",
+- "editor.problem.key_bad": "密钥不是 64 位十六进制。",
++ "editor.problem.key_bad": "密钥长度与算法不符。",
+  "editor.problem.key_id_range": "密钥 ID 最大为 {max}。",
+  "editor.problem.key_duplicate": "两个密钥的算法和密钥 ID 相同。",
+  "editor.keys.title": "AES-256 密钥",
+- "editor.keys.intro": "P25 和 NXDN 加密信道的密钥，以及 DMR AES-256 的密钥（电台上：设置 > 加密，密钥类型 AES-256 及密钥 ID）。信道按密钥 ID 指定密钥；两台电台须在同一 ID 下使用同一密钥。密钥不会随区域共享，保存为不含密钥的文件时也会省略。",
++ "editor.keys.intro": "添加对应模式的密钥并在信道中选择其 ID。两台电台必须使用相同的 ID 和密钥。导出的码存储文件省略密钥。",
+  "editor.keys.alg.p25": "P25 AES-256",
+  "editor.keys.alg.nxdn": "NXDN AES-256",
++ "editor.col.dmr_privacy": "加密",
++ "editor.keys.alg.arc4": "DMR 增强保密 (ARC4-40)",
+  "editor.keys.alg.dmr": "DMR AES-256",
+  "editor.keys.id": "密钥 ID",
+  "editor.keys.key": "密钥（64 位十六进制）",
+  "editor.keys.show": "显示",
+  "editor.keys.add": "添加密钥",
+- "editor.keys.bad": "密钥为 64 位十六进制（32 字节）。",
++ "editor.keys.bad": "输入 {n} 个十六进制数字。",
+  "editor.problem.mode_fallback_stale": "备用信道 {number} 已被更改或删除：电台会忽略它。",
+  "editor.problem.mode_fallback_kind": "备用信道必须是普通 FM 或 DMR 信道。",
+  "editor.problem.mode_same_identity": "与 {other} 是同一系统：共享或电台可能使用其中任一个。",
+diff --git a/site/static/js/codeplug/channelmodes.js b/site/static/js/codeplug/channelmodes.js
+index 11f353b..7975f79 100644
+--- a/site/static/js/codeplug/channelmodes.js
++++ b/site/static/js/codeplug/channelmodes.js
+@@ -18,6 +18,7 @@
+ 
+ import { decodeArea, getValue, setValue, deleteValue, dedupe, putArea, KV_ADDR, KV_SIZE, KV_HDR, KEYS } from "./kv.js";
+ import { getName, putName } from "./fields.js";
++import { redactDmrBasicKeys } from "./records.js";
+ import { KINDS, kindRow, typeRow, radioRuns } from "./modes.js";
+ import { u16, u32, put16, put32, sameBytes, sameValue, nameCheck } from "./modebytes.js";
+ 
+@@ -307,6 +308,7 @@ export function modeEntries(m, entries, baseNames = () => new Map()) {
+ 		if (decodeKey(e.key, e.value) && !ring.some((k) => k.slot === e.key - KEY_BASE)) del(e.key);
+ 	}
+ 	for (const k of ring) {
++		if (!validKeyHex(k.alg, k.key)) continue;
+ 		if (k.slot == null) {
+ 			let n = 0;
+ 			while (n < KEY_MAX && getValue(out, KEY_BASE + n)) n++;
+@@ -315,7 +317,7 @@ export function modeEntries(m, entries, baseNames = () => new Map()) {
+ 		}
+ 		const prev = getValue(out, KEY_BASE + k.slot);
+ 		const v = Uint8Array.from([KEY_RING_SYSTEM, k.alg, k.id & 0xFF, (k.id >> 8) & 0xFF, k.flags ?? 0, ...hexToBytes(k.key)]);
+-		const keep = prev && prev.length > v.length ? prev.subarray(v.length) : new Uint8Array(0);
++		const keep = prev && prev[1] === k.alg && prev.length > v.length ? prev.subarray(v.length) : new Uint8Array(0);
+ 		const full = new Uint8Array(v.length + keep.length);
+ 		full.set(v);
+ 		full.set(keep, v.length);
+@@ -464,12 +466,12 @@ export function validateModes(m, err, warn, { features = null, baseNames } = {})
+ 		const st = k.module.settings, s = m.modeSettings?.[k.id];
+ 		if (st && s) st.validate(s, { err: (f, code, p = {}) => err("general", null, f, code, p), warn: (f, code, p = {}) => warn("general", null, f, code, p) });
+ 	}
+-	// the keyring: a key is 32 octets, its id in its algorithm's range, and no two keys share an algorithm and id
++	// The keyring validates the size and ID for each algorithm. No two keys share one algorithm and ID.
+ 	const seen = new Set();
+ 	for (const k of m.keyring ?? []) {
+ 		const a = keyAlg(k.alg);
+ 		if (!a) continue;
+-		if (!KEY_HEX.test(k.key)) err("general", null, "key", "key_bad");
++		if (!validKeyHex(k.alg, k.key)) err("general", null, "key", "key_bad");
+ 		if (!(Number.isInteger(k.id) && k.id >= (a.idMin ?? 0) && k.id <= a.idMax)) err("general", null, "id", "key_id_range", { max: a.idMax });
+ 		const tag = `${k.alg}:${k.id}`;
+ 		if (seen.has(tag)) err("general", null, "id", "key_duplicate");
+@@ -487,7 +489,7 @@ export function validateModes(m, err, warn, { features = null, baseNames } = {})
+ 	if (used > max) err(S, null, null, "settings_area_full", { used, max });
+ }
+ 
+-// --- The keyring (docs/spec/air-encryption.md 4): AES-256 keys of the air modes ---
++// --- The keyring (docs/spec/air-encryption.md 4) ---
+ 
+ export const KEY_BASE = 0x1900, KEY_MAX = 0x400;
+ export const KEY_RING_SYSTEM = 0xFF;			// "no system": the radio's own keyring
+@@ -496,17 +498,20 @@ export const KEY_ALGS = [
+ 	{ alg: 0x84, token: "p25", idMax: 0xFFFF, hex: true },
+ 	{ alg: 3, token: "nxdn", idMax: 63, hex: false },
+ 	{ alg: 0x25, token: "dmr", idMin: 1, idMax: 255, hex: false },	// DMR AES-256, Motorola layout
++	{ alg: 0x21, token: "arc4", idMin: 1, idMax: 255, hex: false, bytes: 5 },
+ ];
+ export const keyAlg = (alg) => KEY_ALGS.find((a) => a.alg === alg) ?? null;
++export const keyBytes = (alg) => keyAlg(alg)?.bytes ?? 32;
+ const hexToBytes = (s) => Uint8Array.from(s.match(/../g) ?? [], (x) => parseInt(x, 16));
+ const bytesToHex = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("").toUpperCase();
+-// A traffic key record of the keyring with an algorithm the editor knows: {slot, alg, id, flags, key: 64 hex digits}
++// A traffic key record of the keyring with an algorithm the editor knows.
+ function decodeKey(key, v) {
+-	if (!v || v.length < 5 + 32 || v[0] !== KEY_RING_SYSTEM || !keyAlg(v[1])) return null;
+-	return { slot: key - KEY_BASE, alg: v[1], id: v[2] | (v[3] << 8), flags: v[4], key: bytesToHex(v.subarray(5, 37)) };
++	if (!v || v[0] !== KEY_RING_SYSTEM || !keyAlg(v[1]) || v.length < 5 + keyBytes(v[1])) return null;
++	return { slot: key - KEY_BASE, alg: v[1], id: v[2] | (v[3] << 8), flags: v[4], key: bytesToHex(v.subarray(5, 5 + keyBytes(v[1]))) };
+ }
+ export const newKey = (alg) => ({ slot: null, alg, id: 1, flags: 0, key: "" });
+-export const KEY_HEX = /^[0-9A-Fa-f]{64}$/;
++export const validKeyHex = (alg, s) => keyAlg(alg) != null && typeof s === "string" &&
++	s.length === 2 * keyBytes(alg) && /^[0-9A-Fa-f]+$/.test(s);
+ 
+ // --- Secrets (8) ---
+ 
+@@ -522,6 +527,7 @@ export function countSecrets(b) {
+ 
+ // An image's bytes with every secret taken out of its settings area (a file export without keys)
+ export function withoutSecrets(b) {
++	redactDmrBasicKeys(b);
+ 	const a = decodeArea(b);
+ 	if (a.state !== "valid") return;
+ 	const entries = dedupe(a.entries);
+diff --git a/site/static/js/codeplug/model.js b/site/static/js/codeplug/model.js
+index 913a25a..4dce52c 100644
+--- a/site/static/js/codeplug/model.js
++++ b/site/static/js/codeplug/model.js
+@@ -9,7 +9,7 @@
+ 
+ import { CodeplugImage } from "./image.js";
+ import {
+-	LIMITS, CH_SIZE, bankBitmap, channelAddr, decodeChannel, encodeChannel, zoneLayout, decodeZone, encodeZone,
++	LIMITS, CH_SIZE, DMR_PRIV, bankBitmap, channelAddr, decodeChannel, encodeChannel, zoneLayout, decodeZone, encodeZone,
+ 	ZONE_BITMAP, ZONE_DATA, ZONE_RECORD, CONTACTS, CONTACT_SIZE, decodeContact, encodeContact, LIST_COUNTS, LISTS,
+ 	LIST_SIZE, decodeList, encodeList, DTMF_CONTACTS, decodeDtmf, encodeDtmf, validDtmf, APRS_BASE, APRS_SIZE,
+ 	decodeAprs, encodeAprs, decodeGeneral, encodeGeneral, VFO, LUCZ,
+@@ -137,12 +137,15 @@ function same(a, b, keys) {
+ 
+ const CHANNEL_KEYS = [
+ 	"name", "rxHz", "txHz", "mode", "power", "tot", "rxTone", "txTone", "bw", "rxOnly", "allSkip", "zoneSkip", "vox",
+-	"squelch", "colorCode", "timeslot", "contact", "rxList", "aprs", "dmrId", "dmrAesKid", "noBeep", "noEco", "dmo", "roam",
++	"squelch", "colorCode", "timeslot", "contact", "rxList", "aprs", "dmrId", "dmrPrivacy", "dmrPrivacyKey", "noBeep", "noEco", "dmo", "roam",
+ 	"aliasTs1", "aliasTs2", "useLocation", "lat", "lon", "sfr", "sfrA", "sfrB", "toneBurst",
+ ];
+ 
+ function flatChannel(c) {
+-	const out = { ...c, dmrAesKid: c.mode === "dmr" && !c.kind ? c.dmrAesKid || undefined : undefined };
++	const dmr = c.mode === "dmr" && !c.kind;
++	const privacy = dmr ? (c.dmrPrivacy ?? (c.dmrAesKid ? DMR_PRIV.aes : 0)) || undefined : undefined;
++	const out = { ...c, dmrPrivacy: privacy, dmrPrivacyKey: privacy ? c.dmrPrivacyKey ?? c.dmrAesKid ?? 0 : undefined };
++	delete out.dmrAesKid;
+ 	for (const k of REFS) out[k] = refNumber(c[k]);
+ 	return out;
+ }
+diff --git a/site/static/js/codeplug/records.js b/site/static/js/codeplug/records.js
+index 96b7e10..6f757fe 100644
+--- a/site/static/js/codeplug/records.js
++++ b/site/static/js/codeplug/records.js
+@@ -19,6 +19,8 @@ export const LIMITS = {
+ // --- Layout ---
+ 
+ export const CH_SIZE = 56;
++export const DMR_PRIV = { default: 0, aes: 1, basic: 2, enhanced: 3, off: 4 };
++const DMR_PRIV_BASE = 0x5AA4;
+ const CH_PER_BANK = 128;
+ const BANK0 = EE + 0x3780;
+ const BANK1 = FL + 0x7B1B0;
+@@ -83,7 +85,8 @@ export function decodeChannel(r, memory = false) {
+ 		contact: u16(r, 0x2E),
+ 		rxList: r[0x2B],
+ 		aprs: r[0x2D],
+-		...(memory && r[0x18] === 1 && u16(r, 0x34) === 0x5AA5 && r[0x36] ? { dmrAesKid: r[0x36] } : {}),
++		...(memory && r[0x18] === 1 && dmrPrivacy(r) ?
++			{ dmrPrivacy: dmrPrivacy(r), dmrPrivacyKey: r[0x36] } : {}),
+ 		dmrId: l1 & 0x80 ? (r[0x27] << 16) | (r[0x28] << 8) | r[0x29] : 0,
+ 		noBeep: (l1 & 0x40) !== 0,
+ 		noEco: (l1 & 0x20) !== 0,
+@@ -109,10 +112,11 @@ export function encodeChannel(c, r, memory = false) {
+ 	putFreq(r, 0x14, c.txHz);
+ 	r[0x18] = c.mode === "dmr" ? 1 : 0;
+ 	// Named DMR memory extension used by the DM32 firmware; the VFO uses these bytes for offset/step.
+-	if (memory && !c.kind && c.mode === "dmr" && c.dmrAesKid >= 1 && c.dmrAesKid <= 255) {
+-		put16(r, 0x34, 0x5AA5);
+-		r[0x36] = c.dmrAesKid;
+-	} else if (memory && u16(r, 0x34) === 0x5AA5) {
++	const priv = c.dmrPrivacy ?? (c.dmrAesKid ? DMR_PRIV.aes : DMR_PRIV.default);
++	if (memory && !c.kind && c.mode === "dmr" && priv > DMR_PRIV.default && priv <= DMR_PRIV.off) {
++		put16(r, 0x34, DMR_PRIV_BASE + priv);
++		r[0x36] = priv === DMR_PRIV.off ? 0 : clamp(c.dmrPrivacyKey ?? c.dmrAesKid ?? 0, 0, 255);
++	} else if (memory && dmrPrivacy(r)) {
+ 		r.fill(0, 0x34, 0x37);
+ 	}
+ 	r[0x19] = clamp(c.power, 0, 255);
+@@ -153,6 +157,20 @@ export function encodeChannel(c, r, memory = false) {
+ 	return r;
+ }
+ 
++function dmrPrivacy(r) {
++	const priv = u16(r, 0x34) - DMR_PRIV_BASE;
++	return priv > DMR_PRIV.default && priv <= DMR_PRIV.off ? priv : DMR_PRIV.default;
++}
++
++// Includes deleted channels, whose underlying record can still hold a Basic Privacy key number.
++export function redactDmrBasicKeys(b) {
++	for (let n = 1; n <= LIMITS.channels; n++) {
++		const at = channelAddr(n);
++		const r = b.subarray(at, at + CH_SIZE);
++		if (r.length === CH_SIZE && r[0x18] === 1 && dmrPrivacy(r) === DMR_PRIV.basic) r[0x36] = 0;
++	}
++}
++
+ function clamp(v, lo, hi) {
+ 	v = Math.round(Number(v) || 0);
+ 	return v < lo ? lo : v > hi ? hi : v;
+diff --git a/site/static/js/editor/app.js b/site/static/js/editor/app.js
+index ff861e5..b4bd25f 100644
+--- a/site/static/js/editor/app.js
++++ b/site/static/js/editor/app.js
+@@ -22,7 +22,7 @@ import { Grid } from "./grid.js";
+ import { History } from "./undo.js";
+ import { bulkColumns, columns, channelForm, formDialog, membersDialog, refLabel, parseAreaKey } from "./views.js";
+ import { systemsTab, systemsShown, modeSettingsPart, keyringPart } from "./modesview.js";
+-import { syncModes, countSecrets, withoutSecrets } from "../codeplug/channelmodes.js";
++import { syncModes, withoutSecrets } from "../codeplug/channelmodes.js";
+ import { openFile, saveBytes, tftpBytes, datedName, FileError, imageFrom, saveDraft, loadDraft, clearDraft } from "./files.js";
+ import { extensions } from "./extensions.js";
+ import "./parts.js";
+@@ -489,17 +489,8 @@ function saveFile(kind) {
+ 	const errors = problems().filter((p) => p.level === "error");
+ 	if (errors.length) return say(t("editor.err.fix_first", { n: errors.length }), "bad");
+ 	const img = encode(S.model);
+-	// keys (channel-modes.md 8) go into a file only when the user turns them on for this export
+-	const n = countSecrets(img.bytes);
+-	if (!n) return saveImage(kind, img);
+-	const box = h("input", { type: "checkbox", id: "keep-secrets" });
+-	dialog(t("editor.secrets.title"), [h("p", {}, t("editor.secrets.text", { n })),
+-		h("div", { class: "form-row form-check" }, h("label", { for: "keep-secrets" }, t("editor.secrets.include")), box)],
+-	t("editor.save"), (close) => {
+-		close();
+-		if (!box.checked) withoutSecrets(img.bytes);
+-		saveImage(kind, img);
+-	});
++	withoutSecrets(img.bytes);
++	saveImage(kind, img);
+ }
+ 
+ function saveImage(kind, img) {
+diff --git a/site/static/js/editor/modesview.js b/site/static/js/editor/modesview.js
+index d44e62f..e96d5e1 100644
+--- a/site/static/js/editor/modesview.js
++++ b/site/static/js/editor/modesview.js
+@@ -9,7 +9,7 @@
+ import { formDialog, fallbackOptions } from "./views.js";
+ import { specField, parseSpec, formatSpec, label } from "./modefields.js";
+ import { SYSTEM_TYPES, typeRow, typeName, offeredTypes, offeredKinds } from "../codeplug/modes.js";
+-import { newSystem, syncModes, SHARE, MODE_LIMITS, KEY_ALGS, KEY_HEX, KEY_MAX, keyAlg, newKey } from "../codeplug/channelmodes.js";
++import { newSystem, syncModes, SHARE, MODE_LIMITS, KEY_ALGS, KEY_MAX, keyAlg, keyBytes, validKeyHex, newKey } from "../codeplug/channelmodes.js";
+ import { remove, assignNumbers } from "../codeplug/model.js";
+ 
+ const SHARE_LEVELS = [SHARE.off, SHARE.identity, SHARE.whole];
+@@ -278,23 +278,23 @@ export function modeSettingsPart(api, features) {
+ 
+ // The keyring (docs/spec/air-encryption.md 4) in the Radio tab: AES-256 keys of the air modes the radio runs, or the
+ // codeplug holds. A channel names a key by its algorithm and key id; the key itself never goes in a shared zone and
+-// is left out of a file saved without keys. Each key is a row: its id, the key (hidden unless asked), delete
++// is left out of exported codeplugs. Each key is a row: its ID, masked key and delete.
+ export function keyringPart(api, features) {
+ 	const { model: m, t, h, button } = api;
+ 	const ring = m.keyring ?? [];
+ 	const offered = offeredKinds(m, features).map((k) => k.token);
+ 	const have = Array.isArray(features) ? features : String(features ?? "").split(",");
+ 	const algs = KEY_ALGS.filter((a) => offered.includes(a.token.toUpperCase()) ||
+-		(a.token === "dmr" && (have.includes("DMR") || m.channels.some((c) => c.mode === "dmr" && !c.kind))));
++		((a.token === "dmr" || a.token === "arc4") && (have.includes("DMR") || m.channels.some((c) => c.mode === "dmr" && !c.kind))));
+ 	if (!algs.length && !ring.length) return [];
+ 	const set = (k, patch) => api.change(t("editor.undo.edit"), () => (m.keyring = (m.keyring ?? []).map((x) => (x === k ? { ...x, ...patch } : x))));
+ 	const rows = ring.map((k, i) => {
+ 		const a = keyAlg(k.alg);
+ 		const id = h("input", { type: "text", id: `kr-id-${i}`, value: a.hex ? k.id.toString(16).toUpperCase().padStart(4, "0") : String(k.id), size: "6", spellcheck: "false" });
+-		const key = h("input", { type: "password", id: `kr-key-${i}`, value: k.key, size: "66", maxlength: "64", spellcheck: "false", autocomplete: "off" });
++		const hexLength = 2 * keyBytes(k.alg);
++		const key = h("input", { type: "password", id: `kr-key-${i}`, value: k.key, size: String(hexLength + 2),
++			maxlength: String(hexLength), spellcheck: "false", autocomplete: "off" });
+ 		const err = h("span", { class: "small ed-err" });
+-		const show = h("input", { type: "checkbox", id: `kr-show-${i}` });
+-		show.addEventListener("change", () => (key.type = show.checked ? "text" : "password"));
+ 		id.addEventListener("change", () => {
+ 			const n = a.hex ? parseInt(id.value, 16) : Number(id.value);
+ 			if (!/^[0-9A-Fa-f]+$/.test(id.value.trim()) || !(Number.isInteger(n) && n >= (a.idMin ?? 0) && n <= a.idMax)) return void (err.textContent = t("editor.err.range", { min: a.idMin ?? 0, max: a.idMax }));
+@@ -303,13 +303,12 @@ export function keyringPart(api, features) {
+ 		});
+ 		key.addEventListener("change", () => {
+ 			const v = key.value.replace(/[\s:-]/g, "").toUpperCase();
+-			if (!KEY_HEX.test(v)) return void (err.textContent = t("editor.keys.bad"));
++			if (!validKeyHex(k.alg, v)) return void (err.textContent = t("editor.keys.bad", { n: hexLength }));
+ 			err.textContent = "";
+ 			set(k, { key: v });
+ 		});
+ 		return h("div", { class: "form-row" }, h("label", { for: `kr-id-${i}` }, t(`editor.keys.alg.${a.token}`) + " " + t("editor.keys.id")), id,
+ 			h("label", { for: `kr-key-${i}` }, t("editor.keys.key")), key,
+-			h("label", { for: `kr-show-${i}`, class: "small" }, show, " " + t("editor.keys.show")),
+ 			button(t("editor.delete"), () => api.change(t("editor.undo.delete"), () => (m.keyring = (m.keyring ?? []).filter((x) => x !== k))), { quiet: true, danger: true }), err);
+ 	});
+ 	const pick = h("select", { "aria-label": t("editor.keys.title") }, ...KEY_ALGS.map((a) => h("option", { value: String(a.alg) }, t(`editor.keys.alg.${a.token}`))));
+diff --git a/site/static/js/editor/views.js b/site/static/js/editor/views.js
+index 2345dc2..d77c7c0 100644
+--- a/site/static/js/editor/views.js
++++ b/site/static/js/editor/views.js
+@@ -6,11 +6,11 @@
+ 
+ import { h, button } from "../flasher/dom.js";
+ import { parseFreq, parseTone, mhz } from "../codeplug/fields.js";
+-import { LIMITS, POWER_NAMES } from "../codeplug/records.js";
++import { LIMITS, POWER_NAMES, DMR_PRIV } from "../codeplug/records.js";
+ import { refNumber, listenBand } from "../codeplug/model.js";
+ import { keyValid } from "../codeplug/kv.js";
+ import { kindRow, kindName, offeredKinds } from "../codeplug/modes.js";
+-import { KEY_ALGS, KEY_HEX, setKind } from "../codeplug/channelmodes.js";
++import { KEY_ALGS, validKeyHex, setKind } from "../codeplug/channelmodes.js";
+ import { specField } from "./modefields.js";
+ 
+ // --- Parsers shared by the columns and the forms ---
+@@ -287,7 +287,7 @@ export function systemOptions(m, t, type, current) {
+ // reference where the image was deliberately exported without keys.
+ function aesOptions(m, t, alg, current, fallback) {
+ 	const format = (id) => alg.hex ? id.toString(16).toUpperCase().padStart(4, "0") : String(id);
+-	const ids = new Set((m.keyring ?? []).filter((k) => k.alg === alg.alg && KEY_HEX.test(k.key) &&
++	const ids = new Set((m.keyring ?? []).filter((k) => k.alg === alg.alg && validKeyHex(k.alg, k.key) &&
+ 		Number.isInteger(k.id) && k.id >= (alg.idMin ?? 0) && k.id <= alg.idMax).map((k) => k.id));
+ 	if (current != null) ids.add(current);
+ 	return [[null, t(fallback)], ...[...ids].sort((a, b) => a - b).map((id) => [id, format(id)])];
+@@ -330,6 +330,10 @@ export function channelForm(m, t, { features = null } = {}) {
+ 		}
+ 	}
+ 	const dmrAlg = KEY_ALGS.find((a) => a.token === "dmr");
++	const arc4Alg = KEY_ALGS.find((a) => a.token === "arc4");
++	const privacy = (r) => r.dmrPrivacy ?? (r.dmrAesKid ? DMR_PRIV.aes : DMR_PRIV.default);
++	const plainDmr = (r) => r.mode === "dmr" && !r.kind;
++	const keyId = (r) => (r.dmrPrivacyKey ?? r.dmrAesKid) || null;
+ 	return [
+ 		{ group: t("editor.form.basic") },
+ 		txt("name", "editor.col.name", name(LIMITS.name)(t)),
+@@ -366,12 +370,28 @@ export function channelForm(m, t, { features = null } = {}) {
+ 		dmr(sel("rxList", "editor.col.rx_list", () => refOptions(m.rxLists, t))),
+ 		dmr(txt("dmrId", "editor.col.channel_id", dmrId(t), (v) => (v ? String(v) : ""))),
+ 		dmr(chk("dmo", "editor.col.dmo")),
+-		sel("dmrAesKid", "editor.keys.alg.dmr",
+-			(r) => aesOptions(m, t, dmrAlg, r.dmrAesKid || null, "editor.tot.default"), {
+-				show: (r) => r.mode === "dmr" && !r.kind,
+-				get: (r) => r.dmrAesKid || null,
+-				set: (r, id) => { if (r.mode === "dmr" && !r.kind) r.dmrAesKid = id ?? 0; },
+-			}),
++		sel("dmrPrivacy", "editor.col.dmr_privacy", () => [
++			[DMR_PRIV.default, t("editor.tot.default")], [DMR_PRIV.off, t("editor.none")],
++			[DMR_PRIV.basic, "Motorola Basic Privacy"], [DMR_PRIV.enhanced, "Motorola Enhanced Privacy"],
++			[DMR_PRIV.aes, "AES-256"],
++		], {
++			show: plainDmr, get: privacy,
++			set: (r, kind) => {
++				if (!plainDmr(r) || privacy(r) === kind) return;
++				r.dmrPrivacy = kind;
++				r.dmrPrivacyKey = 0;
++				delete r.dmrAesKid;
++			},
++		}),
++		sel("dmrPrivacyKey", "editor.keys.id", (r) =>
++			privacy(r) === DMR_PRIV.basic
++				? [[null, t("editor.none")], ...Array.from({ length: 255 }, (_, n) => [n + 1, String(n + 1)])]
++				: aesOptions(m, t, privacy(r) === DMR_PRIV.enhanced ? arc4Alg : dmrAlg, keyId(r), "editor.none"), {
++			show: (r) => plainDmr(r) && privacy(r) !== DMR_PRIV.default && privacy(r) !== DMR_PRIV.off,
++			optionsKey: privacy,
++			get: keyId,
++			set: (r, id) => { if (plainDmr(r)) r.dmrPrivacyKey = id ?? 0; },
++		}),
+ 		dmr(sel("aliasTs1", "editor.col.alias_ts1", () => aliasOptions(t))),
+ 		dmr(sel("aliasTs2", "editor.col.alias_ts2", () => aliasOptions(t))),
+ 		dmr(chk("noBeep", "editor.col.no_beep")),
+@@ -425,6 +445,7 @@ export function formDialog(title, fields, record, t, onSave, opts = {}) {
+ 			input = h("select", { id }, ...opts.map(([, label], i) => h("option", { value: String(i) }, label)));
+ 			input.selectedIndex = Math.max(0, opts.findIndex(([v]) => v === get(work)));
+ 			input._opts = opts;
++			if (f.optionsKey) input._optionsKey = f.optionsKey(work);
+ 		} else {
+ 			const v = get(work);
+ 			input = h("input", { type: "text", id, value: f.format ? f.format(v ?? "") : v ?? "", spellcheck: "false" });
+@@ -508,6 +529,12 @@ export function formDialog(title, fields, record, t, onSave, opts = {}) {
+ 				continue;
+ 			}
+ 			if (f.type === "select") {
++				if (f.optionsKey && input._optionsKey !== f.optionsKey(work)) {
++					input._optionsKey = f.optionsKey(work);
++					input._opts = f.options(work);
++					input.replaceChildren(...input._opts.map(([, text], i) => h("option", { value: String(i) }, text)));
++					input.selectedIndex = Math.max(0, input._opts.findIndex(([v]) => v === f.get(work)));
++				}
+ 				const v = input._opts[input.selectedIndex]?.[0];
+ 				f.set ? f.set(work, v) : (work[f.key] = v);
+ 			}
+diff --git a/site/tests/channel-aes.test.mjs b/site/tests/channel-aes.test.mjs
+index a2076c1..8f1dc74 100644
+--- a/site/tests/channel-aes.test.mjs
++++ b/site/tests/channel-aes.test.mjs
+@@ -2,7 +2,8 @@
+ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ import { empty, encode, decode, newChannel } from "../static/js/codeplug/model.js";
+-import { setKind } from "../static/js/codeplug/channelmodes.js";
++import { setKind, validKeyHex, withoutSecrets } from "../static/js/codeplug/channelmodes.js";
++import { DMR_PRIV, channelAddr } from "../static/js/codeplug/records.js";
+ import { channelForm } from "../static/js/editor/views.js";
+ 
+ test("channel AES picks matching IDs, including zero, and survives codeplug encoding", () => {
+@@ -16,7 +17,8 @@ test("channel AES picks matching IDs, including zero, and survives codeplug enco
+ 	const key = "AB".repeat(32);
+ 	model.keyring = [{ alg: 0x25, id: 7, key }, { alg: 0x84, id: 65535, key }, { alg: 3, id: 0, key }];
+ 	const fields = channelForm(model, (s) => s);
+-	for (const [channel, name, id] of [[dmr, "dmrAesKid", 7], [p25, "k2.aes", 65535], [nxdn, "k4.aes", 0]]) {
++	fields.find((f) => f.key === "dmrPrivacy").set(dmr, DMR_PRIV.aes);
++	for (const [channel, name, id] of [[dmr, "dmrPrivacyKey", 7], [p25, "k2.aes", 65535], [nxdn, "k4.aes", 0]]) {
+ 		const f = fields.find((field) => field.key === name);
+ 		assert.ok(f.show(channel));
+ 		assert.deepEqual(f.options(channel).map(([keyId]) => keyId), [null, id]);
+@@ -24,7 +26,10 @@ test("channel AES picks matching IDs, including zero, and survives codeplug enco
+ 		assert.equal(f.get(channel), id);
+ 	}
+ 	const restored = decode(encode(model));
+-	assert.equal(restored.channels[0].dmrAesKid, 7);
++	assert.equal(restored.channels[0].dmrPrivacy, DMR_PRIV.aes);
++	assert.equal(restored.channels[0].dmrPrivacyKey, 7);
++	assert.deepEqual(Array.from(encode(model).bytes.subarray(channelAddr(dmr.number) + 0x34, channelAddr(dmr.number) + 0x37)),
++		[0xA5, 0x5A, 7]);
+ 	assert.equal(restored.channels[1].params.keyId, 65535);
+ 	assert.equal(restored.channels[2].params.aes, true);
+ 	assert.equal(restored.channels[2].params.keyId, 0);
+@@ -33,3 +38,34 @@ test("channel AES picks matching IDs, including zero, and survives codeplug enco
+ 	const field = fields.find((f) => f.key === "k2.aes");
+ 	assert.deepEqual(field.options(p25).map(([id]) => id), [null, 65535]);
+ });
++
++test("DMR Basic, Enhanced and Off persist independently, and exports redact keys", () => {
++	const m = empty();
++	for (const name of ["Basic", "Enhanced", "Off"])
++		m.channels.push(newChannel({ name, mode: "dmr", rxHz: 433000000, txHz: 433000000 }));
++	const [basic, ep, off] = m.channels;
++	m.keyring = [{ alg: 0x21, id: 15, key: "373374ABE8" }, { alg: 0x25, id: 9, key: "AB".repeat(32) }];
++	const fields = channelForm(m, (s) => s);
++	const kind = fields.find((f) => f.key === "dmrPrivacy");
++	const key = fields.find((f) => f.key === "dmrPrivacyKey");
++	kind.set(basic, DMR_PRIV.basic);
++	assert.equal(key.options(basic).length, 256);
++	key.set(basic, 179);
++	kind.set(ep, DMR_PRIV.enhanced);
++	assert.deepEqual(key.options(ep).map(([id]) => id), [null, 15]);
++	key.set(ep, 15);
++	kind.set(off, DMR_PRIV.off);
++	assert.equal(key.show(off), false);
++	assert.equal(validKeyHex(0x21, "373374ABE"), false);
++	assert.equal(validKeyHex(0x21, "373374ABE8"), true);
++	const image = encode(m);
++	const before = decode(image);
++	assert.deepEqual(before.channels.map((c) => [c.dmrPrivacy, c.dmrPrivacyKey]), [[2, 179], [3, 15], [4, 0]]);
++	assert.deepEqual(before.keyring.map((k) => [k.alg, k.key.length]), [[0x21, 10], [0x25, 64]]);
++	const exported = image.clone();
++	withoutSecrets(exported.bytes);
++	const after = decode(exported);
++	assert.deepEqual(after.channels.map((c) => [c.dmrPrivacy, c.dmrPrivacyKey]), [[2, 0], [3, 15], [4, 0]]);
++	assert.deepEqual(after.keyring, []);
++	assert.equal(decode(image).channels[0].dmrPrivacyKey, 179);
++});
+diff --git a/tests/host/codeplugEditTest.c b/tests/host/codeplugEditTest.c
+index e573cc9..70b58e4 100644
+--- a/tests/host/codeplugEditTest.c
++++ b/tests/host/codeplugEditTest.c
+@@ -168,18 +168,28 @@ static void test_channel_dmr_aes(void)
+ 	fresh();
+ 	channel_t ch = make("DMR AES", 433000000, 433000000), back;
+ 	ch.mode = RADIO_MODE_DMR;
+-	ch.dmr_aes_kid = 255;
++	ch.dmr_privacy = CP_DMR_PRIV_AES;
++	ch.dmr_privacy_key = 255;
+ 	CHECK(codeplug_set_channel(10, &ch));
+ 	CHECK(codeplug_init() == CODEPLUG_OPENFW);
+-	CHECK(codeplug_channel(10, &back) && back.dmr_aes_kid == 255);
+-	back.dmr_aes_kid = 0;
++	CHECK(codeplug_channel(10, &back) && back.dmr_privacy == CP_DMR_PRIV_AES && back.dmr_privacy_key == 255);
++	back.dmr_privacy = CP_DMR_PRIV_BASIC;
++	back.dmr_privacy_key = 179;
+ 	CHECK(codeplug_set_channel(10, &back));
+-	CHECK(codeplug_channel(10, &back) && back.dmr_aes_kid == 0);
+-	ch.dmr_aes_kid = 7;
++	CHECK(codeplug_channel(10, &back) && back.dmr_privacy == CP_DMR_PRIV_BASIC && back.dmr_privacy_key == 179);
++	back.dmr_privacy = CP_DMR_PRIV_ENHANCED;
++	back.dmr_privacy_key = 9;
++	CHECK(codeplug_set_channel(10, &back));
++	CHECK(codeplug_channel(10, &back) && back.dmr_privacy == CP_DMR_PRIV_ENHANCED && back.dmr_privacy_key == 9);
++	back.dmr_privacy = CP_DMR_PRIV_OFF;
++	CHECK(codeplug_set_channel(10, &back));
++	CHECK(codeplug_channel(10, &back) && back.dmr_privacy == CP_DMR_PRIV_OFF && back.dmr_privacy_key == 0);
++	ch.dmr_privacy_key = 7;
+ 	CHECK(codeplug_set_channel(10, &ch) && codeplug_delete_channel(10));
+-	ch.dmr_aes_kid = 0;
++	ch.dmr_privacy = CP_DMR_PRIV_DEFAULT;
++	ch.dmr_privacy_key = 0;
+ 	CHECK(codeplug_set_channel(10, &ch));
+-	CHECK(codeplug_channel(10, &back) && back.dmr_aes_kid == 0);
++	CHECK(codeplug_channel(10, &back) && back.dmr_privacy_key == 0);
+ }
+ 
+ static void test_materialize(void)
+diff --git a/tests/host/dmrAesTest.c b/tests/host/dmrAesTest.c
+index 26949d7..939c7b1 100644
+--- a/tests/host/dmrAesTest.c
++++ b/tests/host/dmrAesTest.c
+@@ -32,13 +32,26 @@ static const char *const masks[54] = {
+ 	"172CD579B45280", "BB0E10D71C7680", "0DD68D12129580", "A238BB0A0A9080", "A63C0190225600", "F9970EC8B04D00",
+ };
+ 
++// From the public RC4-40.wav sample, decoded with DSD-FME (dmrgo v2/privacy/testdata/rc4.txt).
++static const char *const arc4_masks[54] = {
++	"5372CDF4493B00", "2A0723F7F65100", "397D9C66D9A680", "4E86B08BBAA000", "773193A131EA80", "4D1659190FAC80",
++	"1D9F68F2E2AD80", "59F0AB529F1800", "3D861CD358F700", "8DC6C193A13000", "8BFD50FBFD1400", "F4DD5FA1564500",
++	"95CADECF1F1700", "74D7E3B9271180", "B7262149D3BC80", "7E7FB8717C8780", "11E2A173E7F800", "505B50274CFB80",
++	"FD0DE196292400", "7D684641EEF400", "A179A700A16800", "A3549C5EBFF000", "BB28126FBC2400", "8F17A94389DC00",
++	"C9C61EB9607880", "C0990707717500", "959CAEC89AA700", "4E4FBCFFB4DF80", "37B646E0763080", "439CC7767AB380",
++	"DE11FE25593200", "03FA2AE8876E00", "79D6658E062B00", "23B0CB4AF1B800", "2577D18F090880", "F98779BE982380",
++	"A2843841B65B00", "A97AA35EC11200", "1FB98827191600", "3463B3F6C70600", "EFC63F54527880", "06B51A7BCA2400",
++	"D56170E9BAC600", "E12E9AF0A8CB00", "85C74C554FAE80", "1A4A172C88FB80", "7871CB3B55FE80", "8C9433848AE100",
++	"A72AF39CAE0080", "397356F5528B00", "6463589CE15B80", "3BEB2C847B1200", "E8DE82DBB3A000", "40E68B9D862900",
++};
++
+ // A burst whose frames carry the mask of frames n..n+2 as their voice bits: decrypting it must give all-zero bits
+-static void masked_burst(unsigned n, uint8_t v[27])
++static void masked_burst(const char *const *frame_masks, unsigned n, uint8_t v[27])
+ {
+ 	for (unsigned f = 0; f < 3; f++) {
+ 		uint8_t m[7], bits[AMBE_PARAM_BITS];
+ 
+-		unhex(masks[n + f], m, 7);
++		unhex(frame_masks[n + f], m, 7);
+ 		for (unsigned b = 0; b < AMBE_PARAM_BITS; b++)
+ 			bits[b] = (uint8_t)((m[b / 8] >> (7 - b % 8)) & 1u);
+ 		ambeFecEncode(bits, &v[9 * f]);
+@@ -58,8 +71,41 @@ static unsigned zero_frames(const uint8_t v[27])
+ 	return z;
+ }
+ 
++static void test_arc4_capture(void)
++{
++	uint8_t key[DMR_ARC4_KEY_BYTES], pi[12], built[DMR_AES_PI_BYTES], v[27], kid;
++	uint32_t mi;
++	dmr_aes_t a;
++
++	unhex("373374ABE8", key, sizeof key);
++	unhex("21100F531699C40000010810", pi, sizeof pi);
++	assert(dmrVoiceCipherPiParse(pi, DMR_ARC4_ALG, &kid, &mi) && kid == 15 && mi == 0x531699C4u);
++	dmrVoiceCipherPiBuild(DMR_ARC4_ALG, kid, mi, 1, built);
++	assert(!memcmp(pi, built, sizeof built));
++	assert(!dmrAesPiParse(pi, &kid, &mi));
++	assert(dmrVoiceCipherNextMi(DMR_ARC4_ALG, mi) == 0x178D0B9Bu);
++	assert(dmrVoiceCipherNextMi(DMR_ARC4_ALG, 0x178D0B9Bu) == 0x7F900958u);
++	built[0] = 1;
++	assert(dmrVoiceCipherPiParse(built, DMR_ARC4_ALG, &kid, &mi));
++	built[1] = 0x68;
++	assert(!dmrVoiceCipherPiParse(built, DMR_ARC4_ALG, &kid, &mi));
++
++	for (unsigned skip = 0; skip < 2; skip++) {
++		dmrVoiceCipherStart(&a, DMR_ARC4_ALG, key, mi);
++		for (unsigned n = 0; n < 54; n += 3) {
++			if (skip && n >= 9 && n < 39)
++				continue;	// a whole superframe and surrounding bursts missing
++			masked_burst(arc4_masks, n, v);
++			assert(dmrAesBurst(&a, v, (uint8_t)(n / 3 % 6), 100 + 2 * n / 3, NULL));
++			assert(zero_frames(v) == 3);
++		}
++	}
++	puts("dmrAesTest: three DSD-FME ARC4-40 superframes, matching PI layout, and loss recovery passed");
++}
++
+ int main(void)
+ {
++	test_arc4_capture();
+ 	static const uint8_t silence[9] = { 0xB9, 0xE8, 0x81, 0x52, 0x61, 0x73, 0x00, 0x2A, 0x6B };
+ 	uint8_t key[32], pi[12], v[27], kid;
+ 	uint32_t mi;
+@@ -85,7 +131,7 @@ int main(void)
+ 	// Three superframes in order, without a slot counter: the index wrap steps the MI
+ 	dmrAesStart(&a, key, mi);
+ 	for (unsigned n = 0; n < 54; n += 3) {
+-		masked_burst(n, v);
++		masked_burst(masks, n, v);
+ 		assert(dmrAesBurst(&a, v, (uint8_t)(n / 3 % 6), 0, silence));
+ 		assert(zero_frames(v) == 3);
+ 	}
+@@ -93,18 +139,18 @@ int main(void)
+ 	// The second superframe lost whole: the slot counter (a burst every other tick) tells, the third still decrypts
+ 	dmrAesStart(&a, key, mi);
+ 	for (unsigned n = 0; n < 18; n += 3) {
+-		masked_burst(n, v);
++		masked_burst(masks, n, v);
+ 		assert(dmrAesBurst(&a, v, (uint8_t)(n / 3), 100 + 2 * n / 3, silence));
+ 	}
+ 	for (unsigned n = 36; n < 54; n += 3) {
+-		masked_burst(n, v);
++		masked_burst(masks, n, v);
+ 		assert(dmrAesBurst(&a, v, (uint8_t)(n / 3 % 6), 100 + 2 * n / 3, silence));
+ 		assert(zero_frames(v) == 3);
+ 	}
+ 
+ 	// A frame that is silence on air stays silence; a channel error in C0 is corrected before decrypting
+ 	dmrAesStart(&a, key, mi);
+-	masked_burst(0, v);
++	masked_burst(masks, 0, v);
+ 	memcpy(&v[9], silence, 9);
+ 	v[0] ^= 0x80;
+ 	assert(dmrAesBurst(&a, v, 0, 0, silence));
+diff --git a/tests/host/dmrCallTest.c b/tests/host/dmrCallTest.c
+index 2b356b0..fbd0895 100644
+--- a/tests/host/dmrCallTest.c
++++ b/tests/host/dmrCallTest.c
+@@ -2732,7 +2732,7 @@ static void test_pi_header_and_emergency(void)
+ {
+ 	dmr_call_config_t c = base_cfg();
+ 	uint8_t lc[9];
+-	static const uint8_t info[10] = { 0x21, 0x05, 0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x5B, 0x00 };
++	static const uint8_t info[10] = { 0x21, 0x10, 0x05, 0x34, 0x56, 0x78, 0x00, 0x00, 0x5B, 0x00 };
+ 	unsigned frame = 1;
+ 	dmr_call_stats_t st;
+ 
+@@ -2843,7 +2843,7 @@ static void test_private_calls(void)
+ // the encoder's frames back, one without it never plays them
+ static void test_basic_privacy(void)
+ {
+-	static dmrPrivacyKey_t key = { DMR_PRIVACY_MOTOROLA_BP, 7 };
++	static dmrPrivacyKey_t key = { DMR_PRIVACY_MOTOROLA_BP, 179 };
+ 	dmr_call_config_t c = base_cfg();
+ 
+ 	c.privacy = dmrPrivacyCallHook;
+@@ -2889,7 +2889,7 @@ static void test_basic_privacy(void)
+ 	}
+ 	CHECK(voice >= 12 && same == voice * 3);
+ 
+-	// RX: a call scrambled with key 7; played (descrambled) with the key, dropped without
++	// RX: a call scrambled with key 179; played (descrambled) with the key, dropped without
+ 	uint8_t lc[9], plain[27], scr[27], p49[49];
+ 	for (int f = 0; f < 3; f++) {
+ 		for (int k = 0; k < 49; k++)
+@@ -2930,15 +2930,61 @@ static void test_basic_privacy(void)
+ 		else
+ 			CHECK(sink_log.frames == 0 && sink_log.losts == 18);
+ 	}
++
++	// A RAS call with no usable LC. B signals privacy, F and both A bursts do not. The second
++	// superframe must still use Basic Privacy, even on a color code and slot other than our own.
++	c = base_cfg();
++	c.listen.hear_all = c.listen.any_cc = c.listen.both_ts = true;
++	c.privacy = dmrPrivacyCallHook;
++	c.privacy_ctx = &key;
++	setup(&c);
++	dmr_burst_t b = { .kind = DMR_BURST_VOICE, .cc = 9, .ts = 2, .crc_ok = true, .in_step = true, .len = 27 };
++	for (unsigned i = 0; i < 12; i++) {
++		b.voice_index = (uint8_t)(i % 6);
++		b.sync = b.voice_index == 0 ? DMR_SYNC_BS : DMR_SYNC_NONE;
++		b.pi = i == 1;
++		memcpy(b.payload, plain, 27);
++		dmrPrivacyCallHook(b.payload, b.voice_index, true, &key);
++		sim_rx(&b);
++		run_ms(60);
++	}
++	CHECK(V()->caller.encrypted && V()->caller.src == 0 && V()->caller.dst == 0);
++	CHECK(sink_log.frames == 21 && !memcmp(sink_log.first, plain, 9) && !memcmp(sink_log.last, plain + 18, 9));
++	run_ms(DMR_CALL_FADE_MS + 60);
++	b.ts = 1;
++	b.cc = 3;
++	memcpy(b.payload, plain, 27);
++	for (unsigned i = 0; i < 6; i++) {
++		b.voice_index = (uint8_t)i;
++		b.sync = i == 0 ? DMR_SYNC_BS : DMR_SYNC_NONE;
++		sim_rx(&b);
++		run_ms(60);
++	}
++	CHECK(!V()->caller.encrypted && sink_log.frames == 24 && !memcmp(sink_log.last, plain + 18, 9));
++
++	// The repeater omits the privacy indication altogether: use the operator's BP key only on the configured slot/CC.
++	c.basic_ras = true;
++	setup(&c);
++	b.cc = c.cc;
++	b.ts = (int8_t)c.ts;
++	for (unsigned i = 0; i < 6; i++) {
++		b.voice_index = (uint8_t)i;
++		b.sync = i == 0 ? DMR_SYNC_BS : DMR_SYNC_NONE;
++		memcpy(b.payload, plain, 27);
++		dmrPrivacyCallHook(b.payload, b.voice_index, true, &key);
++		sim_rx(&b);
++		run_ms(60);
++	}
++	CHECK(V()->caller.encrypted && sink_log.frames == 3 && !memcmp(sink_log.first, plain, 9));
+ }
+ 
+ 
+ #if CONFIG_AIR_AES
+-// AES-256 end to end (core/dmr/dmrAes.h): TX sends its voice LC headers, a PI header with the key ID and a fresh MI,
++// AES-256 and ARC4 end to end (core/dmr/dmrAes.h): TX sends its voice LC headers, a PI header with the key ID and a fresh MI,
+ // then encrypted bursts. Those bursts decrypt to the encoder's frames; a receiver with the key and key ID plays them,
+ // one with another key ID or without the key never does. The key ID without its key refuses PTT. Late entry: a
+ // receiver that never heard the PI header starts from burst F's single block and the superframes' MI fragments
+-static void test_aes(void)
++static void test_cipher(uint8_t alg)
+ {
+ 	static uint8_t key[32];
+ 	static uint8_t air_v[40][27], air_i[40], pi[12];
+@@ -2947,8 +2993,9 @@ static void test_aes(void)
+ 
+ 	for (int i = 0; i < 32; i++)
+ 		key[i] = (uint8_t)(i * 7 + 1);
+-	c.aes_key = key;
+-	c.aes_kid = 14;
++	c.cipher_key = key;
++	c.cipher_alg = alg;
++	c.cipher_kid = 14;
+ 	c.tx_fid = 0x10;
+ 	c.tx_svc = DMR_SVC_PRIVACY;
+ 	setup(&c);
+@@ -2970,17 +3017,17 @@ static void test_aes(void)
+ 			air_i[nv++] = a->voice_index;
+ 		}
+ 	}
+-	// The PI header: after the LC headers, before burst A; FID 0x10, AES-256, key ID 14, an MI, CRC masked 0x6969
++	// The PI header: after the LC headers, before burst A; FID 0x10, algorithm, key ID 14, an MI, CRC masked 0x6969
+ 	uint8_t kid;
+ 	uint32_t mi;
+ 	uint16_t crc = (uint16_t)(dmr_crc_ccitt(pi, 10) ^ DMR_CRC_MASK_PI);
+ 
+ 	CHECK(at_pi > 0 && at_pi < at_voice && sim.air[at_pi - 1].kind == DMR_BURST_VOICE_LC_HEADER);
+-	CHECK(dmrAesPiParse(pi, &kid, &mi) && kid == 14 && mi != 0 && pi[10] == (uint8_t)(crc >> 8) && pi[11] == (uint8_t)crc);
++	CHECK(dmrVoiceCipherPiParse(pi, alg, &kid, &mi) && kid == 14 && mi != 0 && pi[10] == (uint8_t)(crc >> 8) && pi[11] == (uint8_t)crc);
+ 	CHECK(sim.air[0].payload[1] == 0x10 && sim.air[0].payload[2] == DMR_SVC_PRIVACY);
+ 	CHECK(nv >= 12 && air_i[0] == 0);
+ 
+-	// Burst F carries the single block (key ID 14, AES-256: info 0x75, field 44 FC 88 FC), and the first
++	// Burst F carries the single block (key ID 14 and algorithm), and the first
+ 	// superframe's fragments decode to the next superframe's MI
+ 	{
+ 		uint8_t frag[6][3];
+@@ -3000,12 +3047,12 @@ static void test_aes(void)
+ 				CHECK(a->sb_set);
+ 				CHECK(dmrFecSbDecode(((uint32_t)a->sb[0] << 24) | ((uint32_t)a->sb[1] << 16) |
+ 						     ((uint32_t)a->sb[2] << 8) | a->sb[3], &info) == 0 &&
+-				      info == 0x75);
++				      info == (uint16_t)((14 << 3) | (alg & 7)));
+ 				sb_seen++;
+ 			}
+ 		}
+ 		CHECK(f_seen == 6 && sb_seen == 1);
+-		CHECK(dmrAesLeDecode(frag, &mi2) && mi2 == dmrAesMiNext(mi));
++		CHECK(dmrAesLeDecode(frag, &mi2) && mi2 == dmrVoiceCipherNextMi(alg, mi));
+ 	}
+ 
+ 	// Decrypted with the key and the PI header's MI: the encoder's frames (compared after the FEC decode, as the
+@@ -3014,7 +3061,7 @@ static void test_aes(void)
+ 	unsigned same = 0;
+ 	uint8_t first[9] = { 0 }, last[9] = { 0 };
+ 
+-	dmrAesStart(&rx, key, mi);
++	dmrVoiceCipherStart(&rx, alg, key, mi);
+ 	for (unsigned v = 0; v < nv; v++) {
+ 		uint8_t back[27];
+ 
+@@ -3041,36 +3088,45 @@ static void test_aes(void)
+ 	CHECK(same == nv * 3);
+ 
+ 	// The same bursts into a receiver: the key and key ID play them all; another key ID or no key, none
+-	for (int pass = 0; pass < 3; pass++) {
++	for (int pass = 0; pass < 5; pass++) {
++		bool ras = pass == 3;
+ 		uint8_t lc[9];
+ 
+ 		c = base_cfg();
+-		c.aes_kid = pass == 1 ? 15 : 14;
+-		c.aes_key = pass == 2 ? NULL : key;
++		c.cipher_alg = alg;
++		c.cipher_kid = pass == 1 ? 15 : 14;
++		c.cipher_key = pass == 2 ? NULL : key;
++		c.listen.hear_all = c.listen.any_cc = c.listen.both_ts = ras;
++		c.rmo = ras;
+ 		setup(&c);
+ 		mk_lc(lc, 0, TG_TALK, 9997030);
+ 		lc[1] = 0x10;
+ 		lc[2] = DMR_SVC_PRIVACY;
+-		rx_header(lc, 1, 0, DMR_SYNC_MS, false);
++		if (!ras)
++			rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+ 		run_ms(30);
+ 
+ 		dmr_burst_t b;
+ 
+ 		memset(&b, 0, sizeof(b));
+ 		b.kind = DMR_BURST_PI_HEADER;
+-		b.cc = 1;
++		b.cc = ras ? 9 : 1;
++		b.ts = ras ? 2 : 0;
+ 		b.crc_ok = true;
+ 		b.in_step = true;
+ 		b.len = 12;
+ 		memcpy(b.payload, pi, 12);
++		if (pass == 4)
++			b.payload[11] ^= 1;
+ 		sim_rx(&b);
+ 		run_ms(30);
+ 		for (unsigned v = 0; v < nv; v++) {
+ 			memset(&b, 0, sizeof(b));
+ 			b.kind = DMR_BURST_VOICE;
+ 			b.voice_index = air_i[v];
+-			b.sync = air_i[v] == 0 ? DMR_SYNC_MS : DMR_SYNC_NONE;
+-			b.cc = 1;
++			b.sync = air_i[v] == 0 ? (ras ? DMR_SYNC_BS : DMR_SYNC_MS) : DMR_SYNC_NONE;
++			b.cc = ras ? 9 : 1;
++			b.ts = ras ? 2 : 0;
+ 			b.crc_ok = true;
+ 			b.in_step = true;
+ 			b.len = 27;
+@@ -3078,24 +3134,27 @@ static void test_aes(void)
+ 			sim_rx(&b);
+ 			run_ms(60);
+ 		}
+-		CHECK(V()->caller.encrypted && V()->caller.pi_header);
++		CHECK(V()->caller.encrypted && V()->caller.pi_header == (pass != 4));
+ 		if (pass == 0)
+ 			CHECK(sink_log.frames == nv * 3 && sink_log.losts == 0 && memcmp(sink_log.first, first, 9) == 0 &&
+ 			      memcmp(sink_log.last, last, 9) == 0);
++		else if (ras)
++			CHECK(sink_log.frames == (nv - 5) * 3 && V()->caller.src == 0 && memcmp(sink_log.last, last, 9) == 0);
+ 		else
+ 			CHECK(sink_log.frames == 0);
+ 	}
+ 
+ 	// Late entry: the same bursts into a receiver that never heard the PI header. After each burst F the modem
+-	// reports its single block (key ID 14, AES-256); the fragments of each superframe then start the keystream
++	// reports its single block (key ID 14 and algorithm); the fragments of each superframe then start the keystream
+ 	// from the next superframe's MI, so the first superframe stays silent and the rest plays. A single block with
+ 	// another key ID, or none at all, starts nothing
+ 	for (int pass = 0; pass < 3; pass++) {
+ 		uint8_t lc[9];
+ 
+ 		c = base_cfg();
+-		c.aes_kid = 14;
+-		c.aes_key = key;
++		c.cipher_alg = alg;
++		c.cipher_kid = 14;
++		c.cipher_key = key;
+ 		setup(&c);
+ 		mk_lc(lc, 0, TG_TALK, 9997030);
+ 		lc[1] = 0x10;
+@@ -3117,7 +3176,7 @@ static void test_aes(void)
+ 			sim_rx(&b);
+ 			run_ms(60);
+ 			if (air_i[v] == 5 && pass < 2) {
+-				sim_rc((uint16_t)(((pass == 1 ? 15 : 14) << 3) | 5), DMR_RC_EMBEDDED);
++				sim_rc((uint16_t)(((pass == 1 ? 15 : 14) << 3) | (alg & 7)), DMR_RC_EMBEDDED);
+ 				run_ms(30);
+ 			}
+ 		}
+@@ -3133,7 +3192,7 @@ static void test_aes(void)
+ 			uint8_t want[27];
+ 
+ 			CHECK(air_i[6] == 0);
+-			dmrAesStart(&le, key, dmrAesMiNext(mi));
++			dmrVoiceCipherStart(&le, alg, key, dmrVoiceCipherNextMi(alg, mi));
+ 			memcpy(want, air_v[6], 27);
+ 			CHECK(dmrAesBurst(&le, want, 0, 0, dmr_ambe_silence));
+ 			CHECK(memcmp(sink_log.first, want, 9) == 0);
+@@ -3145,7 +3204,8 @@ static void test_aes(void)
+ 
+ 	// The key ID set and its key missing: PTT refused, nothing on air
+ 	c = base_cfg();
+-	c.aes_kid = 14;
++	c.cipher_alg = alg;
++	c.cipher_kid = 14;
+ 	setup(&c);
+ 	dmr_call_ptt(true);
+ 	run_ms(400);
+@@ -3675,7 +3735,8 @@ int main(void)
+ 	test_private_calls();
+ 	test_basic_privacy();
+ #if CONFIG_AIR_AES
+-	test_aes();
++	test_cipher(DMR_AES_ALG);
++	test_cipher(DMR_ARC4_ALG);
+ #endif
+ 	test_gps_lc();
+ 	test_gps_call();
+diff --git a/tests/host/dmrPrivacyTest.c b/tests/host/dmrPrivacyTest.c
+index c398318..7160628 100644
+--- a/tests/host/dmrPrivacyTest.c
++++ b/tests/host/dmrPrivacyTest.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: MIT AND ISC
+ // Copyright (c) 2026 The RadioFoundry Authors
+-// SPDX-FileCopyrightText: 2010 DSD Author (BPK_1_TO_4, from DSD-FME include/bp.h, ISC license, see LICENSES/ISC.txt)
++// SPDX-FileCopyrightText: 2010 DSD Author (BP test seeds, from DSD-FME include/bp.h, ISC license, see LICENSES/ISC.txt)
+ /*
+  * Host tests for the DMR voice privacy module
+  *
+@@ -24,12 +24,11 @@ static const uint64_t SILENCE_BITS = 0xF801A99F8CE080ULL; // 56 bits, the first
+ // --- Reference keystreams, as DSD-FME applies them on receive (the behavior, written independently here) ---
+ 
+ // Motorola BP table values for keys 0-4 (third-party data: DSD-FME include/bp.h, ISC, see LICENSES/ISC.txt)
+-static const uint16_t BPK_1_TO_4[] = { 0x0000, 0x1F00, 0xE300, 0xFC00, 0x2503 };
+ 
+ // Motorola BP: the table value three times over bits 0-47, the first copy with its bits 4-7 cleared; bit 48 stays
+-static void refMotorolaBP(uint16_t key, uint8_t *bits)
++static void refMotorolaBP(uint16_t seed, uint8_t *bits)
+ {
+-	const uint16_t words[3] = { (uint16_t)(BPK_1_TO_4[key] & 0xFF0F), BPK_1_TO_4[key], BPK_1_TO_4[key] };
++	const uint16_t words[3] = { (uint16_t)(seed & 0xFF0F), seed, seed };
+ 
+ 	for (int w = 0; w < 3; w++)
+ 	{
+@@ -111,8 +110,12 @@ static void testFec(void)
+ 
+ static void testMotorolaBP(void)
+ {
+-	for (uint16_t key = 1; key <= 4; key++)
++	static const struct { uint16_t id, seed; } cases[] = {
++		{ 1, 0x1F00 }, { 2, 0xE300 }, { 3, 0xFC00 }, { 4, 0x2503 }, { 179, 0xDCB9 }, { 255, 0x98F6 },
++	};
++	for (unsigned n = 0; n < sizeof cases / sizeof cases[0]; n++)
+ 	{
++		uint16_t key = cases[n].id;
+ 		uint8_t plain[3][49], burst[27], orig[27], got[3][49];
+ 
+ 		for (int f = 0; f < 3; f++)
+@@ -128,7 +131,7 @@ static void testMotorolaBP(void)
+ 		{
+ 			uint8_t expect[49];
+ 			memcpy(expect, plain[f], 49);
+-			refMotorolaBP(key, expect);
++			refMotorolaBP(cases[n].seed, expect);
+ 			CHECK(memcmp(got[f], expect, 49) == 0, "Motorola BP key %d frame %d matches DSD-FME", key, f);
+ 		}
+ 
+diff --git a/tests/host/hrc7000DmrTest.c b/tests/host/hrc7000DmrTest.c
+index 75116bd..0ff327b 100644
+--- a/tests/host/hrc7000DmrTest.c
++++ b/tests/host/hrc7000DmrTest.c
+@@ -126,12 +126,12 @@ static void test_pure(void)
+ 	CHECK(hrc7000_sig_center_dc(106) == 0x6A6AE9E9u);
+ 	CHECK(hrc7000_mod_bias_dc(106, 0x21) == 0x01E90021u);
+ 	hrc7000_rx_status_t s;
+-	hrc7000_dmr_decode(rti(2, 0, 5, 0, 1, 0), &s);
+-	CHECK(s.kind == DMR_BURST_VOICE && s.voice_index == 1 && s.cc == 5 && s.sync == DMR_SYNC_MS && s.chip_slot == 1 && s.crc_ok);
+-	hrc7000_dmr_decode(rti(2, 0, 5, 0, 1, 0) | (1u << 28), &s);	// QR error in the EMB
+-	CHECK(s.kind == DMR_BURST_VOICE && !s.crc_ok);
+-	hrc7000_dmr_decode(rti(1, 0, 5, 0, 0, 0) | (1u << 28), &s);	// burst A has no EMB to check
+-	CHECK(s.crc_ok);
++	hrc7000_dmr_decode(rti(2, 0, 5, 0, 1, 0) | (1u << 17), &s);
++	CHECK(s.kind == DMR_BURST_VOICE && s.voice_index == 1 && s.cc == 5 && s.sync == DMR_SYNC_MS && s.chip_slot == 1 && s.crc_ok && s.pi);
++	hrc7000_dmr_decode(rti(2, 0, 5, 0, 1, 0) | (1u << 28) | (1u << 17), &s);	// QR error in the EMB
++	CHECK(s.kind == DMR_BURST_VOICE && !s.crc_ok && !s.pi);
++	hrc7000_dmr_decode(rti(1, 0, 5, 0, 0, 0) | (1u << 28) | (1u << 17), &s);	// burst A has no EMB to check
++	CHECK(s.crc_ok && !s.pi);
+ 	hrc7000_dmr_decode(rti(0, DMR_BURST_VOICE_LC_HEADER, 1, 1, 0, 1), &s);
+ 	CHECK(s.kind == DMR_BURST_VOICE_LC_HEADER && s.sync == DMR_SYNC_BS && s.tc == 1 && s.crc_ok);
+ 	hrc7000_dmr_decode(rti(0, DMR_BURST_VOICE_LC_HEADER, 1, 1, 0, 1) | (1u << 25), &s);	// RS error
+@@ -457,16 +457,23 @@ static void test_tx_color_code(void)
+ 	CHECK(REG(C7_LOCAL_CC) == (LOCAL_CC_ANY | 5u));
+ 	CHECK(hrc7000_dmr_tx_begin(&eng, DMR_TIMING_OWN, 1, DMR_ACCESS_IMPOLITE));
+ 	dmr_tx_burst_t h = { .kind = DMR_BURST_VOICE_LC_HEADER, .len = 9 };
++	h.payload[2] = 0x40;
+ 	dmr_tx_burst_t a = voice(0, 0x11);
+ 	CHECK(hrc7000_dmr_tx_queue(&eng, &h) && hrc7000_dmr_tx_queue(&eng, &a));
++	bool voice_armed = false;
+ 	for (int i = 0; i < 68; i++) {
+ 		tick(false);	// a receive interrupt must not change CC during TX
+ 		tick(true);
+ 		if (REG(C7_LAYER2_TXRX_CTRL) == 0x80) {
+ 			CHECK((REG(C7_LOCAL_CC) & 0xFu) == 1);
++			if (REG(C7_LAYER2_SEND_TYPE) == 0x08) {
++				voice_armed = true;
++				CHECK(REG(C7_VOICE_EMB_CTRL) == 3);
++			}
+ 		}
+ 		count_kind(0xFF, NULL);
+ 	}
++	CHECK(voice_armed);
+ 	dmr_tx_burst_t term = { .kind = DMR_BURST_TERMINATOR_LC, .len = 9 };
+ 	CHECK(hrc7000_dmr_tx_queue(&eng, &term));
+ 	hrc7000_dmr_tx_end(&eng);
+@@ -476,6 +483,7 @@ static void test_tx_color_code(void)
+ 		tick(true);
+ 	}
+ 	CHECK(!hrc7000_dmr_is_transmitting(&eng));
++	CHECK(REG(C7_VOICE_EMB_CTRL) == 2);
+ 	CHECK(eng.cc_filter == -1 && REG(C7_LOCAL_CC) == (LOCAL_CC_ANY | 5u));
+ }
+ 
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 2bd3182..ea20281 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -1673,6 +1673,54 @@ static void dmr_start(bool codec)
+ 	run(50);
+ }
+ 
++#if CONFIG_AIR_AES && CONFIG_DMR_PRIVACY
++static void test_dmr_channel_privacy(void)
++{
++	static const uint8_t traffic[] = { CODEPLUG_SYSTEM_NONE, 0x21, 15, 0, 0, 0x37, 0x33, 0x74, 0xAB, 0xE8 };
++	static const struct { uint8_t type, key; bool privacy, tx; } tests[] = {
++		{ CP_DMR_PRIV_BASIC, 179, true, true },
++		{ CP_DMR_PRIV_OFF, 0, false, true },
++		{ CP_DMR_PRIV_ENHANCED, 15, true, true },
++		{ CP_DMR_PRIV_ENHANCED, 14, true, false },
++		{ CP_DMR_PRIV_BASIC, 0, true, false },
++	};
++
++	setup_codeplug();
++	channel_t source = chans[4];
++	kv_t3_set(CODEPLUG_KEY_TRAFFIC, traffic, sizeof traffic);
++	for (unsigned i = 0; i < sizeof tests / sizeof tests[0]; i++) {
++		unsigned n = 1 + i;
++		chans[n] = source;
++		chans[n].dmr_privacy = tests[i].type;
++		chans[n].dmr_privacy_key = tests[i].key;
++		used[n] = true;
++		zones[0].channels[i] = (uint16_t)n;
++	}
++	codec_present = true;
++	start();
++	for (unsigned i = 0; i < sizeof tests / sizeof tests[0]; i++) {
++		req(RREQ_ZONE_POS, (int32_t)i);
++		req(RREQ_DMR_HEAR_ALL, 1);
++		CHECK(sm.view.dmr.privacy == tests[i].privacy);
++		unsigned first = sim.air_count;
++		req(RREQ_PTT, 1);
++		run(660);
++		req(RREQ_PTT, 0);
++		run(580);
++		CHECK((sim.air_count > first) == tests[i].tx);
++		if (!tests[i].tx || sim.air_count == first)
++			continue;
++		CHECK(sim.air[first].kind == DMR_BURST_VOICE_LC_HEADER);
++		CHECK(((sim.air[first].payload[2] & DMR_SVC_PRIVACY) != 0) == tests[i].privacy);
++		if (tests[i].type == CP_DMR_PRIV_ENHANCED)
++			CHECK(sim.air[first + 3].kind == DMR_BURST_PI_HEADER && sim.air[first + 3].payload[0] == 0x21 &&
++			      sim.air[first + 3].payload[2] == tests[i].key);
++	}
++	kv_t3_clear();
++	setup_codeplug();
++}
++#endif
++
+ static void test_dmr_rx(void)
+ {
+ 	dmr_start(false);
+@@ -1973,7 +2021,7 @@ static void test_vfo_digital(void)
+ #if CONFIG_DMR_PRIVACY && CONFIG_AIR_AES
+ 	CHECK(ui_svc_vfo_mode(RADIO_MODE_DMR, VFO_VARIANT_DEFAULT));
+ 	CHECK(ui_svc_vfo_aes(RADIO_MODE_DMR, 7));
+-	CHECK(sm.view.ch.dmr_aes_kid == 7 && sm.view.dmr.privacy);
++	CHECK(sm.view.ch.dmr_privacy_key == 7 && sm.view.dmr.privacy);
+ #endif
+ #if CONFIG_YSF
+ 	radio_ysf_settings_t y;
+@@ -1997,7 +2045,7 @@ static void test_vfo_digital(void)
+ 	CHECK(sm.view.ch.mode == RADIO_MODE_YSF && radio_ysf_in_force(&y) && y.narrow);
+ #endif
+ #if CONFIG_DMR_PRIVACY && CONFIG_AIR_AES
+-	CHECK(sm.view.ch.dmr_aes_kid == 7);
++	CHECK(sm.view.ch.dmr_privacy_key == 7);
+ 	CHECK(ui_svc_vfo_mode(RADIO_MODE_DMR, VFO_VARIANT_DEFAULT));
+ 	CHECK(ui_svc_vfo_aes(RADIO_MODE_DMR, -1));
+ 	CHECK((sm.view.ch.vfo_digital & VFO_DIG_DMR_OFF) && !sm.view.dmr.privacy);
+@@ -10477,6 +10525,9 @@ int main(void)
+ 	test_dmr_rssi_hold();
+ 	test_fm_rssi_raw();
+ 	test_dmr_tx();
++#if CONFIG_AIR_AES && CONFIG_DMR_PRIVACY
++	test_dmr_channel_privacy();
++#endif
+ 	test_dmr_tx_end();
+ #if CONFIG_DMR_TRUNK_TX
+ 	test_t3_at();
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 12bbb8f..94ecd23 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -836,9 +836,11 @@ bool codeplug_channel(uint16_t number, channel_t *out)
+ }
+ 
+ #if CONFIG_AIR_AES
+-int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max)
++int codeplug_key_step(uint8_t alg, uint8_t bytes, int32_t current, int dir, uint16_t min, uint16_t max)
+ {
+-	uint16_t id = alg == 0x84 ? 0x1234 : alg == 3 ? 0 : 7;
++	uint16_t id = alg == 0x84 ? 0x1234 : alg == 3 ? 0 : alg == 0x21 ? 9 : 7;
++	if (bytes != (alg == 0x21 ? 5 : 32))
++		return -1;
+ 	return id >= min && id <= max && (dir > 0 ? current < id : current < 0 || current > id) ? id : -1;
+ }
+ #endif
+@@ -1926,7 +1928,7 @@ bool ui_svc_vfo_aes(uint8_t mode, int32_t kid)
+ 	if (!view.vfo || mode != view.ch.mode)
+ 		return false;
+ 	if (mode == RADIO_MODE_DMR) {
+-		view.ch.dmr_aes_kid = kid < 0 ? 0 : (uint8_t)kid;
++		view.ch.dmr_privacy_key = kid < 0 ? 0 : (uint8_t)kid;
+ 		view.ch.vfo_digital &= ~VFO_DIG_DMR_OFF;
+ 		if (kid == -1)
+ 			view.ch.vfo_digital |= VFO_DIG_DMR_OFF;
