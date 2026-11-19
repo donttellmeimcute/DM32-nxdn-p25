@@ -273,6 +273,21 @@ callsigns and data units exact, voice-region bit errors 0 in all runs
 transmission). The MMDVM oracle gained the Data FR cross-check
 (1,366,637 checks total, 0 failures).
 
+### Independent half-rate decoder check
+
+With DSD-FME installed and the firmware tree prepared by
+`tools/build_current.py`, run `python3 tools/test_ysf_dsd.py`. The test
+feeds the firmware TX engine AMBE parameters from the recorded DMR fixture
+and replays its emitted dibits through DSD-FME. It checks V/D-1 and DN
+against all 49 bits of each input block, checks decoder FEC errors, and
+verifies the synthesized WAV. This test starts at the vocoder output
+and checks the emitted symbols without the physical RF path. For DSD-FME
+`a77609a`, apply [the V/D-1 WAV fix](../tools/patches/dsd-fme-ysf-vd1-audio.patch)
+from its source tree before building the decoder. The original build can
+recover all AMBE bits while writing silent V/D-1 PCM with `-fy -o null -w`.
+For an off-air comparison, save a mono 48 kHz discriminator recording and run
+`dsd-fme -fy -i capture.wav -o null -w decoded.wav -Z`.
+
 ## Port to the radio (M5b — ported 2026-11-19, not validated on air)
 
 The port went in through `integration/current/base.patch` as `core/ysf/`

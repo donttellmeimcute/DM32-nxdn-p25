@@ -1,0 +1,46 @@
+diff --git a/src/ysf.c b/src/ysf.c
+index c413c21..a73ffe7 100644
+--- a/src/ysf.c
++++ b/src/ysf.c
+@@ -603,8 +603,7 @@ void ysf_ehr (dsd_opts * opts, dsd_state * state, uint8_t * dbuf, int start, int
+ 
+   const int *w, *x, *y, *z;
+ 
+-  int st = state->synctype;
+-  state->synctype = 28;
++  char ambe_d[49];
+ 
+   uint8_t b1, b2;
+   for (; start < stop; start++)
+@@ -637,11 +636,20 @@ void ysf_ehr (dsd_opts * opts, dsd_state * state, uint8_t * dbuf, int start, int
+ 
+     }
+ 
+-    processMbeFrame (opts, state, NULL, ambe_fr, NULL);
++    // Decode the clear YSF voice without borrowing the NXDN audio policy.
++    mbe_processAmbe3600x2450Framef (state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str,
++                                  ambe_fr, ambe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced,
++                                  opts->uvquality);
++    state->debug_audio_errors += state->errs2;
++
++    if (opts->payload == 1)
++      PrintAMBEData (opts, state, ambe_d);
++    if (opts->mbe_out_f != NULL)
++      saveAmbe2450Data (opts, state, ambe_d);
+ 
+     if (opts->floating_point == 0)
+     {
+-      // processAudio(opts, state); //needed here? -- nothign to test it with
++      processAudio (opts, state);
+ 
+       if (opts->wav_out_f != NULL && opts->dmr_stereo_wav == 1)
+         writeSynthesizedVoice (opts, state);
+@@ -671,8 +679,6 @@ void ysf_ehr (dsd_opts * opts, dsd_state * state, uint8_t * dbuf, int start, int
+   {
+     fprintf(stderr, "\n");
+   }
+-
+-  state->synctype = st;
+ }
+ 
+ void processYSF(dsd_opts * opts, dsd_state * state)

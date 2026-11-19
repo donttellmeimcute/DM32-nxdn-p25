@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 lyra XE1POC
-"""Build the DM-32UV firmware: RadioFoundry at a pinned public commit plus integration/current/base.patch (the DM32
+"""Build the DM-32UV firmware: RadioFoundry at a pinned public commit plus the patches in integration/current (the DM32
 fork: mode row with AM, extended RX, digital monitor on P25/NXDN, AES-256 for P25/NXDN). Never opens a radio and never
 fetches the AMBE codec.
 
@@ -17,7 +17,8 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 PIN = 'e89121e97a314f0ddd0475f848713ba10710d7db'
 UPSTREAM = 'https://github.com/RadioFoundry/RadioFoundry.git'
-PATCH = ROOT / 'integration/current/base.patch'
+PATCH_DIR = ROOT / 'integration/current'
+PATCHES = ('base.patch', 'channel-aes-ysf.patch')
 
 
 def run(*args, cwd=None):
@@ -41,7 +42,8 @@ def prepare(tree):
 		raise SystemExit('%s is not at %s: remove it and build again' % (tree, PIN))
 	run('git', 'reset', '-q', '--hard', PIN, cwd=tree)
 	run('git', 'clean', '-q', '-fdx', '-e', 'build/', cwd=tree)
-	run('git', 'apply', '--binary', PATCH, cwd=tree)
+	for patch in PATCHES:
+		run('git', 'apply', '--binary', PATCH_DIR / patch, cwd=tree)
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
 
 

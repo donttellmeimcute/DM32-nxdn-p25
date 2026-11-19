@@ -1,0 +1,813 @@
+diff --git a/core/codeplug/codeplug.c b/core/codeplug/codeplug.c
+index 19ff461..d4301e9 100644
+--- a/core/codeplug/codeplug.c
++++ b/core/codeplug/codeplug.c
+@@ -62,6 +62,10 @@ static uint32_t fl_base = DEFAULT_FLASH_BASE;
+ #define CH_FLAG1	0x30u	// bits 0-1 talker alias on TS1, 2-3 on TS2: 0 off, 1 APRS, 2 text, 3 both
+ #define CH_FLAG2	0x31u
+ #define CH_FLAG4	0x33u
++// These bytes hold offset/step only in VFO records. A named DMR memory
++// needs both marker bytes before its key ID can override radio privacy.
++#define CH_DMR_AES	0x34u
++#define CH_DMR_AES_MARK	0x5AA5u
+ #define FLAG2_TS2	0x40u
+ #define FLAG4_VOX	0x40u
+ #define FLAG4_ZONE_SKIP	0x20u	// zone scan skip
+@@ -751,6 +755,8 @@ static bool openfw_channel(uint16_t number, channel_t *out)
+ 		ch_errors++;
+ 		return false;
+ 	}
++	if (out->mode == RADIO_MODE_DMR && le16(&r[CH_DMR_AES]) == CH_DMR_AES_MARK)
++		out->dmr_aes_kid = r[CH_DMR_AES + 2];
+ 	return true;
+ }
+ 
+@@ -768,6 +774,8 @@ bool codeplug_channel(uint16_t number, channel_t *out)
+ 		ok = openfw_channel(number, out);
+ 		if (ok) {
+ 			codeplug_tag_apply(number, out);	// so no caller takes a tagged channel for a plain one
++			if (out->kind != CODEPLUG_KIND_NONE)
++				out->dmr_aes_kid = 0;
+ 		}
+ 		break;
+ 	case CODEPLUG_BUILTIN:
+@@ -1040,6 +1048,12 @@ bool codeplug_set_channel(uint16_t number, const channel_t *ch)
+ 		}
+ 		uint8_t base_mode = r[CH_MODE], base_flag4 = r[CH_FLAG4];
+ 		codeplug_openfw_encode(ch, r);
++		if (ch->mode == RADIO_MODE_DMR && ch->kind == CODEPLUG_KIND_NONE && ch->dmr_aes_kid != 0) {
++			put16(&r[CH_DMR_AES], CH_DMR_AES_MARK);
++			r[CH_DMR_AES + 2] = ch->dmr_aes_kid;
++		} else if (le16(&r[CH_DMR_AES]) == CH_DMR_AES_MARK) {
++			memset(&r[CH_DMR_AES], 0, 3);
++		}
+ 		if (safe) {
+ 			r[CH_MODE] = 1;
+ 			r[CH_FLAG4] |= FLAG4_RX_ONLY;
+diff --git a/core/codeplug/codeplug.h b/core/codeplug/codeplug.h
+index d91056f..5980534 100644
+--- a/core/codeplug/codeplug.h
++++ b/core/codeplug/codeplug.h
+@@ -53,6 +53,7 @@ typedef struct {
+ 	// parameter block, which its mode module fetches (codeplug_tag_params); none of them live here
+ 	uint8_t kind;
+ 	uint8_t system;
++	uint8_t dmr_aes_kid;	// stored conventional DMR only, 0 uses the radio privacy setting
+ } channel_t;
+ 
+ // channel_t.alias_tx: what the channel sends as talker alias on each timeslot (text = our radio name)
+diff --git a/core/codeplug/codeplug_records.c b/core/codeplug/codeplug_records.c
+index 53a5c02..73d1863 100644
+--- a/core/codeplug/codeplug_records.c
++++ b/core/codeplug/codeplug_records.c
+@@ -140,6 +140,26 @@ int codeplug_system_secret(uint8_t n, uint8_t *buf, uint16_t cap)
+ 	return n == CODEPLUG_SYSTEM_NONE ? -1 : codeplug_kv_get((uint16_t)(CODEPLUG_KEY_SYS_KEY + n), buf, cap);
+ }
+ 
++int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max)
++{
++	uint8_t hdr[CODEPLUG_TRAFFIC_HDR];
++	codeplug_kv_cursor_t cursor;
++	uint16_t index;
++	int32_t best = dir > 0 ? (int32_t)max + 1 : (int32_t)min - 1;
++	if (dir < 0 && current < 0)
++		current = (int32_t)max + 1;
++	codeplug_kv_begin(&cursor, CODEPLUG_KEY_TRAFFIC, (uint16_t)(CODEPLUG_KEY_TRAFFIC + TRAFFIC_MAX - 1u));
++	int len;
++	while ((len = codeplug_kv_next(&cursor, &index, hdr, sizeof hdr)) >= 0) {
++		if (len != CODEPLUG_TRAFFIC_HDR + 32 || hdr[0] != CODEPLUG_SYSTEM_NONE || hdr[1] != alg)
++			continue;
++		uint16_t id = rec_rd16(&hdr[2]);
++		if (id >= min && id <= max && (dir > 0 ? id > current && id < best : id < current && id > best))
++			best = id;
++	}
++	return best < min || best > max ? -1 : (int)best;
++}
++
+ int codeplug_traffic_key(uint8_t system, uint8_t alg, uint16_t key_id, uint8_t *key, uint16_t cap)
+ {
+ 	// A walk over the family: keys are few, and only a call that needs one looks
+diff --git a/core/codeplug/codeplug_records.h b/core/codeplug/codeplug_records.h
+index db2654c..d245b05 100644
+--- a/core/codeplug/codeplug_records.h
++++ b/core/codeplug/codeplug_records.h
+@@ -99,6 +99,9 @@ int codeplug_target_list(codeplug_ref_t ref, uint8_t kind, codeplug_rec_head_t *
+ // The traffic key of system with this algorithm and key id: its octets into key (at most cap); their length, -1 when
+ // there is none
+ int codeplug_traffic_key(uint8_t system, uint8_t alg, uint16_t key_id, uint8_t *key, uint16_t cap);
++// Select the next or previous installed AES-256 ID (32-byte key). -1 is
++// the clear/default entry at either end. Reads only record headers.
++int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max);
+ // A reference from the 4 octets a record stores
+ codeplug_ref_t codeplug_ref_at(const uint8_t *p);
+ #endif
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 52fdcdd..71d2b0a 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -1478,10 +1478,16 @@ static void dmr_configure(radio_sm_t *sm)
+ #endif
+ 	bool privacy = false;
+ #if CONFIG_DMR_PRIVACY
+-	privacy = sm->privacy_type != DMR_PRIVACY_OFF;
++	privacy_key.type = (dmrPrivacyType_t)sm->privacy_type;
++	privacy_key.key = sm->privacy_key;
++#if CONFIG_AIR_AES
++	if (!sm->view.vfo && ch->kind == CODEPLUG_KIND_NONE && ch->dmr_aes_kid != 0) {
++		privacy_key.type = DMR_PRIVACY_AES256;
++		privacy_key.key = ch->dmr_aes_kid;
++	}
++#endif
++	privacy = privacy_key.type != DMR_PRIVACY_OFF;
+ 	if (privacy) {
+-		privacy_key.type = (dmrPrivacyType_t)sm->privacy_type;
+-		privacy_key.key = sm->privacy_key;
+ 		cfg.privacy = dmrPrivacyCallHook;
+ 		cfg.privacy_ctx = &privacy_key;
+ 		cfg.tx_fid = dmrPrivacyFID(privacy_key.type, cfg.tx_fid);
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+index dbd1b61..cabfd50 100644
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -5176,3 +5176,9 @@ msgstr "Zona no legible por esta radio"
+ msgctxt "SHARE_ERR_OFFER_GONE"
+ msgid "The offer is gone"
+ msgstr "La oferta ya no existe"
++
++msgid "AES-256 key"
++msgstr "Clave AES-256"
++
++msgid "Load AES-256 keys with the CPS"
++msgstr "Carga las claves AES-256 en el CPS"
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index 5f3c1c8..e162b5e 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -16,6 +16,12 @@
+ #include "codeplug/codeplug.h"
+ #include "codeplug/codeplug_modes.h"
+ #include "codeplug/codeplug_tag.h"
++#if CONFIG_AIR_AES
++#include "codeplug/codeplug_records.h"
++#include "dmr/dmrAes.h"
++#include "p25/p25_aes.h"
++#include "nxdn/nxdn.h"
++#endif
+ #if CONFIG_P25
+ #include "p25/p25_codeplug.h"
+ #endif
+@@ -2501,7 +2507,7 @@ static const ui_scr_def_t chlist_screen = {
+ // Without CONFIG_CHANNEL_EDIT the rows are read only and OK goes to the channel
+ 
+ enum { CE_NAME, CE_NUMBER, CE_MODE, CE_CODE, CE_RATE, CE_DEST, CE_RX, CE_TX, CE_POWER, CE_RX_ONLY, CE_BW, CE_RX_TONE, CE_TX_TONE, CE_VOX,
+-       CE_BURST, CE_CC, CE_TS, CE_CONTACT, CE_LIST, CE_ID, CE_DMO, CE_BEEP, CE_ALIAS1, CE_ALIAS2, CE_TOT, CE_SCAN, CE_ECO,
++       CE_BURST, CE_CC, CE_TS, CE_CONTACT, CE_LIST, CE_ID, CE_DMO, CE_BEEP, CE_ALIAS1, CE_ALIAS2, CE_TOT, CE_SCAN, CE_ECO, CE_AES,
+        CE_ZONES, CE_GO, CE_SHARE, CE_SAVE, CE_SAVE_NEW, CE_COUNT, CE_NONE = 0xFF };
+ 
+ static channel_t ced_ch;		// what the screen shows (the working copy when editing)
+@@ -2515,6 +2521,54 @@ static ui_air_conv_t ced_air;		// a P25, NXDN or YSF channel's own settings, rea
+ static ui_air_conv_t ced_air_orig;	// as stored
+ #endif
+ #endif
++#if CONFIG_AIR_AES
++// The key selector carries only IDs. P25 and NXDN may use key ID zero.
++static int32_t ced_aes_id(void)
++{
++#if CONFIG_P25
++	if (ced_is_p25(&ced_ch))
++		return ced_air.p25.aes ? ced_air.p25.kid : -1;
++#endif
++#if CONFIG_NXDN
++	if (ced_is_nxdn(&ced_ch))
++		return ced_air.nxdn.aes ? ced_air.nxdn.kid : -1;
++#endif
++	return ced_ch.dmr_aes_kid != 0 ? ced_ch.dmr_aes_kid : -1;
++}
++
++#if CONFIG_CHANNEL_EDIT
++static int32_t ced_aes_step(int32_t id, int dir)
++{
++	if (ced_is_p25(&ced_ch))
++		return codeplug_aes_key_step(P25_ALGID_AES256, id, dir, 0, UINT16_MAX);
++#if CONFIG_NXDN
++	if (ced_is_nxdn(&ced_ch))
++		return codeplug_aes_key_step(NXDN_CIPHER_AES, id, dir, 0, NXDN_CP_KID_MAX);
++#endif
++	return codeplug_aes_key_step(DMR_AES_ALG, id, dir, 1, UINT8_MAX);
++}
++
++static void ced_aes_set(int32_t id)
++{
++#if CONFIG_P25
++	if (ced_is_p25(&ced_ch)) {
++		ced_air.p25.aes = id >= 0;
++		ced_air.p25.kid = id >= 0 ? (uint16_t)id : 0;
++		return;
++	}
++#endif
++#if CONFIG_NXDN
++	if (ced_is_nxdn(&ced_ch)) {
++		ced_air.nxdn.aes = id >= 0;
++		ced_air.nxdn.kid = id >= 0 ? (uint8_t)id : 0;
++		return;
++	}
++#endif
++	ced_ch.dmr_aes_kid = id >= 0 ? (uint8_t)id : 0;
++}
++#endif
++#endif
++
+ static uint8_t ced_rows[CE_COUNT];
+ static uint8_t ced_n;
+ 
+@@ -2554,7 +2608,7 @@ static const struct { uint8_t off, len, bit; } ced_fields[CE_ZONES] = {
+ 	[CE_NAME] = CE_FIELD(name), [CE_MODE] = CE_FIELD(mode), [CE_RX] = CE_FIELD(rx_hz), [CE_TX] = CE_FIELD(tx_hz),
+ 	[CE_POWER] = CE_FIELD(power), [CE_RX_ONLY] = CE_FIELD(rx_only), [CE_BW] = CE_FIELD(bw),
+ 	[CE_RX_TONE] = CE_FIELD(rx_tone), [CE_TX_TONE] = CE_FIELD(tx_tone), [CE_VOX] = CE_FIELD(vox),
+-	[CE_BURST] = CE_FIELD(tone_burst),
++	[CE_BURST] = CE_FIELD(tone_burst), [CE_AES] = CE_FIELD(dmr_aes_kid),
+ 	[CE_CC] = CE_FIELD(color_code), [CE_TS] = CE_FIELD(timeslot), [CE_CONTACT] = CE_FIELD(contact),
+ 	[CE_LIST] = CE_FIELD(listen_list), [CE_ID] = CE_FIELD(dmr_id), [CE_DMO] = CE_FIELD(dmo),
+ 	[CE_BEEP] = CE_FIELD(no_beep), [CE_ALIAS1] = { offsetof(channel_t, alias_tx), 1, CODEPLUG_ALIAS_TS1_TEXT },
+@@ -2569,12 +2623,14 @@ static bool ced_air_changed(uint8_t r)
+ 	const ui_air_conv_t *a = &ced_air, *b = &ced_air_orig;
+ #if CONFIG_P25
+ 	if (ced_is_p25(&ced_ch))
+-		return r == CE_CODE && (a->p25.rx_nac != b->p25.rx_nac || a->p25.tx_nac != b->p25.tx_nac);
++		return r == CE_AES ? a->p25.aes != b->p25.aes || a->p25.kid != b->p25.kid :
++		       r == CE_CODE && (a->p25.rx_nac != b->p25.rx_nac || a->p25.tx_nac != b->p25.tx_nac);
+ #endif
+ #if CONFIG_NXDN
+ 	if (ced_is_nxdn(&ced_ch))
+ 		return r == CE_CODE ? a->nxdn.rx_ran != b->nxdn.rx_ran || a->nxdn.tx_ran != b->nxdn.tx_ran :
+-		       r == CE_RATE ? a->nxdn.rate9600 != b->nxdn.rate9600 : false;
++		       r == CE_RATE ? a->nxdn.rate9600 != b->nxdn.rate9600 :
++		       r == CE_AES && (a->nxdn.aes != b->nxdn.aes || a->nxdn.kid != b->nxdn.kid);
+ #endif
+ #if CONFIG_YSF
+ 	if (ced_is_ysf(&ced_ch))
+@@ -2603,7 +2659,8 @@ static bool ced_changed(uint8_t r)
+ 	if (r >= CE_ZONES)
+ 		return false;
+ #if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
+-	if (r == CE_CODE || r == CE_RATE || r == CE_DEST)
++	if (r == CE_CODE || r == CE_RATE || r == CE_DEST ||
++	    (r == CE_AES && (ced_is_p25(&ced_ch) || ced_is_nxdn(&ced_ch))))
+ 		return ced_air_changed(r);
+ #endif
+ 	const uint8_t *a = (const uint8_t *)&ced_ch + ced_fields[r].off, *b = (const uint8_t *)&ced_orig + ced_fields[r].off;
+@@ -2921,6 +2978,9 @@ static void ced_build(void)
+ #endif
+ 	ced_n = 0;
+ 	for (uint8_t r = 0; r < CE_COUNT; r++) {
++		if (r == CE_AES && (!CONFIG_AIR_AES || into ||
++		    !(p25 || nxdn || (CONFIG_DMR_PRIVACY && dmr && ced_ch.kind == CODEPLUG_KIND_NONE))))
++			continue;
+ 		bool fm_only = r == CE_BW || r == CE_RX_TONE || r == CE_TX_TONE || r == CE_VOX || r == CE_BURST;
+ 		bool dmr_only = r >= CE_CC && r <= CE_ALIAS2;
+ 		bool tone = r == CE_RX_TONE || r == CE_TX_TONE;
+@@ -3140,7 +3200,7 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
+ 		TRN(CHAN_LABEL_DIRECT_MODE, "Direct mode"), TRN(CHAN_LABEL_TALK_PERMIT_BEEPS, "Talk permit beeps"),
+ 		TRN(CHAN_LABEL_TALKER_ALIAS_TS1, "Talker alias TS1"),
+ 		TRN(CHAN_LABEL_TALKER_ALIAS_TS2, "Talker alias TS2"), TRN(CHAN_LABEL_TX_TIMEOUT, "TX time-out"),
+-		TRN(WORD_SCAN, "Scan"), TRN(LABEL_BATTERY_SAVER, "Battery saver"), TRN(TITLE_ZONES, "Zones"),
++		TRN(WORD_SCAN, "Scan"), TRN(LABEL_BATTERY_SAVER, "Battery saver"), TRN(CHAN_LABEL_AES_KEY, "AES-256 key"), TRN(TITLE_ZONES, "Zones"),
+ 		TRN(CHAN_ROW_TUNE_TO, "Tune to this ch"), TRN(SHARE_ROW_CHANNEL_TO, GLYPH_SHARE " Share channel to..."),
+ 		TRN(ROW_SAVE, "Save"), TRN(CHAN_ROW_SAVE_AS_NEW, "Save as new channel") };
+ 	const channel_t *ch = &ced_ch;
+@@ -3227,6 +3287,21 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
+ 		sb_str(&b, ced_air.ysf.dest);
+ 		break;
+ #endif
++#endif
++#if CONFIG_AIR_AES
++	case CE_AES: {
++		int32_t id = ced_aes_id();
++		if (editing)
++			id = ced_val_or(id);
++		if (id < 0)
++			sb_str(&b, ced_is_p25(ch) || ced_is_nxdn(ch) ?
++				TR(VALUE_OFF, "Off") : TR(CHAN_VALUE_RADIO_DEFAULT, "Radio's"));
++		else if (ced_is_p25(ch))
++			sb_hex(&b, (uint32_t)id, 4);
++		else
++			sb_u32(&b, (uint32_t)id, 1);
++		break;
++	}
+ #endif
+ 	case CE_RX:
+ 		sb_freq(&b, ch->rx_hz);
+@@ -3395,7 +3470,7 @@ static bool ced_write(uint16_t num, bool as_new)
+ 	if (ced_is_p25(&ced_ch) || ced_is_nxdn(&ced_ch) || ced_is_ysf(&ced_ch)) {
+ 		if (ced_ch.kind != ced_orig.kind || ced_ch.mode != ced_orig.mode)
+ 			return ui_svc_write_channel_air_own(num, &ced_ch, ced_src, &ced_air);
+-		if (ced_air_changed(CE_CODE) || ced_air_changed(CE_RATE) || ced_air_changed(CE_DEST))
++		if (ced_air_changed(CE_CODE) || ced_air_changed(CE_RATE) || ced_air_changed(CE_DEST) || ced_air_changed(CE_AES))
+ 			return ui_svc_write_channel_air(num, &ced_ch, ced_src, &ced_air);
+ 	}
+ #endif
+@@ -3469,6 +3544,11 @@ static bool ced_typed_tone(subtone_t *t)
+ static void ced_spin(int dir)
+ {
+ 	switch (ced_edit) {
++#if CONFIG_AIR_AES
++	case CE_AES:
++		ced_val = ced_aes_step(ced_val, dir);
++		break;
++#endif
+ 	case CE_POWER: {
+ 		int32_t n = board.power_count + 1;	// the levels, then the radio's
+ 		ced_val = (ced_val + dir + n) % n;
+@@ -3621,6 +3701,11 @@ static void ced_commit(void)
+ {
+ 	channel_t *c = &ced_ch;
+ 	switch (ced_edit) {
++#if CONFIG_AIR_AES
++	case CE_AES:
++		ced_aes_set(ced_val);
++		break;
++#endif
+ 	case CE_RX:
+ 	case CE_TX: {
+ 		if (ced_len == 0)
+@@ -3772,6 +3857,14 @@ static void chinfo_select(uint16_t i, bool hold)
+ 			ced_mode_step();
+ 		}
+ 		break;
++#if CONFIG_AIR_AES
++	case CE_AES:
++		ced_edit = r;
++		ced_val = ced_aes_id();
++		if (ced_val < 0 && ced_aes_step(-1, 1) < 0)
++			ui_toast(TR(CHAN_TOAST_NO_AES_KEY, "Load AES-256 keys with the CPS"));
++		break;
++#endif
+ 	case CE_RX:
+ 	case CE_TX:
+ 	case CE_ID:
+diff --git a/site/i18n/en.json b/site/i18n/en.json
+index e35ca7e..980a66b 100644
+--- a/site/i18n/en.json
++++ b/site/i18n/en.json
+@@ -2030,7 +2030,7 @@
+  "editor.problem.key_id_range": "A key ID goes up to {max}.",
+  "editor.problem.key_duplicate": "Two keys have the same algorithm and key ID.",
+  "editor.keys.title": "AES-256 keys",
+- "editor.keys.intro": "Keys for the encrypted channels of P25 and NXDN, and for DMR AES-256 (on the radio: Settings > Privacy, key type AES-256 and the key ID). A channel names its key by key ID; both radios need the same key under the same ID. Keys are not shared with a zone and are left out of a file saved without keys.",
++ "editor.keys.intro": "Add a key for the corresponding mode and select it in the channel editor. Both radios need the same ID and key. Keys are omitted when exporting a codeplug without keys.",
+  "editor.keys.alg.p25": "P25 AES-256",
+  "editor.keys.alg.nxdn": "NXDN AES-256",
+  "editor.keys.alg.dmr": "DMR AES-256",
+diff --git a/site/i18n/es.json b/site/i18n/es.json
+index c5a8494..d5809c3 100644
+--- a/site/i18n/es.json
++++ b/site/i18n/es.json
+@@ -2030,7 +2030,7 @@
+  "editor.problem.key_id_range": "Un ID de clave llega hasta {max}.",
+  "editor.problem.key_duplicate": "Dos claves tienen el mismo algoritmo y el mismo ID.",
+  "editor.keys.title": "Claves AES-256",
+- "editor.keys.intro": "Claves de los canales cifrados de P25 y NXDN, y de AES-256 en DMR (en la radio: Ajustes › Privacidad, tipo de clave AES-256 y el ID de la clave). Un canal nombra su clave por ID; ambos radios necesitan la misma clave con el mismo ID. Las claves no se comparten con una zona y se omiten al guardar un archivo sin claves.",
++ "editor.keys.intro": "Añade una clave del modo correspondiente y selecciónala al editar el canal. Ambos radios necesitan el mismo ID y la misma clave. Las claves se omiten al exportar un codeplug sin claves.",
+  "editor.keys.alg.p25": "P25 AES-256",
+  "editor.keys.alg.nxdn": "NXDN AES-256",
+  "editor.keys.alg.dmr": "DMR AES-256",
+diff --git a/site/static/js/codeplug/channelmodes.js b/site/static/js/codeplug/channelmodes.js
+index fc7be1f..11f353b 100644
+--- a/site/static/js/codeplug/channelmodes.js
++++ b/site/static/js/codeplug/channelmodes.js
+@@ -470,7 +470,7 @@ export function validateModes(m, err, warn, { features = null, baseNames } = {})
+ 		const a = keyAlg(k.alg);
+ 		if (!a) continue;
+ 		if (!KEY_HEX.test(k.key)) err("general", null, "key", "key_bad");
+-		if (!(k.id >= 0 && k.id <= a.idMax)) err("general", null, "id", "key_id_range", { max: a.idMax });
++		if (!(Number.isInteger(k.id) && k.id >= (a.idMin ?? 0) && k.id <= a.idMax)) err("general", null, "id", "key_id_range", { max: a.idMax });
+ 		const tag = `${k.alg}:${k.id}`;
+ 		if (seen.has(tag)) err("general", null, "id", "key_duplicate");
+ 		seen.add(tag);
+@@ -495,7 +495,7 @@ export const KEY_RING_SYSTEM = 0xFF;			// "no system": the radio's own keyring
+ export const KEY_ALGS = [
+ 	{ alg: 0x84, token: "p25", idMax: 0xFFFF, hex: true },
+ 	{ alg: 3, token: "nxdn", idMax: 63, hex: false },
+-	{ alg: 0x25, token: "dmr", idMax: 255, hex: false },	// DMR AES-256, Motorola layout (Settings > Privacy, key ID 1-255)
++	{ alg: 0x25, token: "dmr", idMin: 1, idMax: 255, hex: false },	// DMR AES-256, Motorola layout
+ ];
+ export const keyAlg = (alg) => KEY_ALGS.find((a) => a.alg === alg) ?? null;
+ const hexToBytes = (s) => Uint8Array.from(s.match(/../g) ?? [], (x) => parseInt(x, 16));
+diff --git a/site/static/js/codeplug/model.js b/site/static/js/codeplug/model.js
+index 70c7b43..913a25a 100644
+--- a/site/static/js/codeplug/model.js
++++ b/site/static/js/codeplug/model.js
+@@ -49,7 +49,7 @@ export function decode(image) {
+ 	}
+ 	for (let n = 1; n <= LIMITS.channels; n++) {
+ 		if (!channelUsed(b, n)) continue;
+-		const c = decodeChannel(b.subarray(channelAddr(n), channelAddr(n) + CH_SIZE));
++		const c = decodeChannel(b.subarray(channelAddr(n), channelAddr(n) + CH_SIZE), true);
+ 		if (c) m.channels.push(linkRefs(m, { number: n, ...c }));
+ 	}
+ 	decodeModes(m, b);
+@@ -78,7 +78,7 @@ function channelNames(b) {
+ 	const out = new Map();
+ 	for (let n = 1; n <= LIMITS.channels; n++) {
+ 		if (!channelUsed(b, n)) continue;
+-		const c = decodeChannel(b.subarray(channelAddr(n), channelAddr(n) + CH_SIZE));
++		const c = decodeChannel(b.subarray(channelAddr(n), channelAddr(n) + CH_SIZE), true);
+ 		if (c) out.set(n, c.name);
+ 	}
+ 	return out;
+@@ -137,19 +137,19 @@ function same(a, b, keys) {
+ 
+ const CHANNEL_KEYS = [
+ 	"name", "rxHz", "txHz", "mode", "power", "tot", "rxTone", "txTone", "bw", "rxOnly", "allSkip", "zoneSkip", "vox",
+-	"squelch", "colorCode", "timeslot", "contact", "rxList", "aprs", "dmrId", "noBeep", "noEco", "dmo", "roam",
++	"squelch", "colorCode", "timeslot", "contact", "rxList", "aprs", "dmrId", "dmrAesKid", "noBeep", "noEco", "dmo", "roam",
+ 	"aliasTs1", "aliasTs2", "useLocation", "lat", "lon", "sfr", "sfrA", "sfrB", "toneBurst",
+ ];
+ 
+ function flatChannel(c) {
+-	const out = { ...c };
++	const out = { ...c, dmrAesKid: c.mode === "dmr" && !c.kind ? c.dmrAesKid || undefined : undefined };
+ 	for (const k of REFS) out[k] = refNumber(c[k]);
+ 	return out;
+ }
+ 
+-function putChannel(r, c) {
++function putChannel(r, c, memory = false) {
+ 	const flat = flatChannel(c);
+-	if (!same(decodeChannel(r), flat, CHANNEL_KEYS)) encodeChannel(flat, r);
++	if (!same(decodeChannel(r, memory), flat, CHANNEL_KEYS)) encodeChannel(flat, r, memory);
+ }
+ 
+ // The model written onto a copy of the image it was decoded from: the new image
+@@ -164,7 +164,7 @@ export function encode(m) {
+ 	for (const c of m.channels) {
+ 		if (!c.number) continue;
+ 		bits[(c.number - 1) >> 3] |= 1 << ((c.number - 1) & 7);
+-		putChannel(b.subarray(channelAddr(c.number), channelAddr(c.number) + CH_SIZE), c);
++		putChannel(b.subarray(channelAddr(c.number), channelAddr(c.number) + CH_SIZE), c, true);
+ 	}
+ 	for (let bank = 0; bank < 8; bank++) b.set(bits.subarray(bank * 16, bank * 16 + 16), bankBitmap(bank));
+ 	m.vfo.forEach((c, i) => c && putChannel(b.subarray(VFO[i], VFO[i] + CH_SIZE), c));
+diff --git a/site/static/js/codeplug/records.js b/site/static/js/codeplug/records.js
+index 046ebdc..96b7e10 100644
+--- a/site/static/js/codeplug/records.js
++++ b/site/static/js/codeplug/records.js
+@@ -59,7 +59,7 @@ export function blankChannel() {
+ }
+ 
+ // A record, or null if its frequencies don't decode (an erased or broken record)
+-export function decodeChannel(r) {
++export function decodeChannel(r, memory = false) {
+ 	const rxHz = getFreq(r, 0x10), txHz = getFreq(r, 0x14);
+ 	if (rxHz === null || txHz === null) return null;
+ 	const l1 = r[0x26], f1 = r[0x30], f4 = r[0x33];
+@@ -83,6 +83,7 @@ export function decodeChannel(r) {
+ 		contact: u16(r, 0x2E),
+ 		rxList: r[0x2B],
+ 		aprs: r[0x2D],
++		...(memory && r[0x18] === 1 && u16(r, 0x34) === 0x5AA5 && r[0x36] ? { dmrAesKid: r[0x36] } : {}),
+ 		dmrId: l1 & 0x80 ? (r[0x27] << 16) | (r[0x28] << 8) | r[0x29] : 0,
+ 		noBeep: (l1 & 0x40) !== 0,
+ 		noEco: (l1 & 0x20) !== 0,
+@@ -101,12 +102,19 @@ export function decodeChannel(r) {
+ }
+ 
+ // Write a channel's fields onto its stored record r (a blank one if r doesn't decode); r is changed in place
+-export function encodeChannel(c, r) {
++export function encodeChannel(c, r, memory = false) {
+ 	if (getFreq(r, 0x10) === null) r.set(blankChannel());
+ 	putName(r, 0, 16, c.name);
+ 	putFreq(r, 0x10, c.rxHz);
+ 	putFreq(r, 0x14, c.txHz);
+ 	r[0x18] = c.mode === "dmr" ? 1 : 0;
++	// Named DMR memory extension used by the DM32 firmware; the VFO uses these bytes for offset/step.
++	if (memory && !c.kind && c.mode === "dmr" && c.dmrAesKid >= 1 && c.dmrAesKid <= 255) {
++		put16(r, 0x34, 0x5AA5);
++		r[0x36] = c.dmrAesKid;
++	} else if (memory && u16(r, 0x34) === 0x5AA5) {
++		r.fill(0, 0x34, 0x37);
++	}
+ 	r[0x19] = clamp(c.power, 0, 255);
+ 	r[0x1B] = clamp(Math.ceil((c.tot || 0) / 15), 0, 255);
+ 	putTone(r, 0x20, c.rxTone);
+diff --git a/site/static/js/editor/modesview.js b/site/static/js/editor/modesview.js
+index 16eabeb..d44e62f 100644
+--- a/site/static/js/editor/modesview.js
++++ b/site/static/js/editor/modesview.js
+@@ -283,7 +283,9 @@ export function keyringPart(api, features) {
+ 	const { model: m, t, h, button } = api;
+ 	const ring = m.keyring ?? [];
+ 	const offered = offeredKinds(m, features).map((k) => k.token);
+-	const algs = KEY_ALGS.filter((a) => offered.includes(a.token.toUpperCase()));
++	const have = Array.isArray(features) ? features : String(features ?? "").split(",");
++	const algs = KEY_ALGS.filter((a) => offered.includes(a.token.toUpperCase()) ||
++		(a.token === "dmr" && (have.includes("DMR") || m.channels.some((c) => c.mode === "dmr" && !c.kind))));
+ 	if (!algs.length && !ring.length) return [];
+ 	const set = (k, patch) => api.change(t("editor.undo.edit"), () => (m.keyring = (m.keyring ?? []).map((x) => (x === k ? { ...x, ...patch } : x))));
+ 	const rows = ring.map((k, i) => {
+@@ -295,7 +297,7 @@ export function keyringPart(api, features) {
+ 		show.addEventListener("change", () => (key.type = show.checked ? "text" : "password"));
+ 		id.addEventListener("change", () => {
+ 			const n = a.hex ? parseInt(id.value, 16) : Number(id.value);
+-			if (!/^[0-9A-Fa-f]+$/.test(id.value.trim()) || !(n >= 0 && n <= a.idMax)) return void (err.textContent = t("editor.err.range", { min: 0, max: a.idMax }));
++			if (!/^[0-9A-Fa-f]+$/.test(id.value.trim()) || !(Number.isInteger(n) && n >= (a.idMin ?? 0) && n <= a.idMax)) return void (err.textContent = t("editor.err.range", { min: a.idMin ?? 0, max: a.idMax }));
+ 			err.textContent = "";
+ 			set(k, { id: n });
+ 		});
+diff --git a/site/static/js/editor/views.js b/site/static/js/editor/views.js
+index ff56a97..2345dc2 100644
+--- a/site/static/js/editor/views.js
++++ b/site/static/js/editor/views.js
+@@ -10,7 +10,7 @@ import { LIMITS, POWER_NAMES } from "../codeplug/records.js";
+ import { refNumber, listenBand } from "../codeplug/model.js";
+ import { keyValid } from "../codeplug/kv.js";
+ import { kindRow, kindName, offeredKinds } from "../codeplug/modes.js";
+-import { setKind } from "../codeplug/channelmodes.js";
++import { KEY_ALGS, KEY_HEX, setKind } from "../codeplug/channelmodes.js";
+ import { specField } from "./modefields.js";
+ 
+ // --- Parsers shared by the columns and the forms ---
+@@ -283,6 +283,16 @@ export function systemOptions(m, t, type, current) {
+ 	return out;
+ }
+ 
++// The installed IDs are selectable without rendering key material. Keep an existing
++// reference where the image was deliberately exported without keys.
++function aesOptions(m, t, alg, current, fallback) {
++	const format = (id) => alg.hex ? id.toString(16).toUpperCase().padStart(4, "0") : String(id);
++	const ids = new Set((m.keyring ?? []).filter((k) => k.alg === alg.alg && KEY_HEX.test(k.key) &&
++		Number.isInteger(k.id) && k.id >= (alg.idMin ?? 0) && k.id <= alg.idMax).map((k) => k.id));
++	if (current != null) ids.add(current);
++	return [[null, t(fallback)], ...[...ids].sort((a, b) => a - b).map((id) => [id, format(id)])];
++}
++
+ // features: the connected radio's (null: none), which says the kinds a channel may be made
+ export function channelForm(m, t, { features = null } = {}) {
+ 	const sel = (key, label, options, extra = {}) => ({ key, label: t(label), type: "select", options, ...extra });
+@@ -304,8 +314,22 @@ export function channelForm(m, t, { features = null } = {}) {
+ 		if (mod.fallback) {
+ 			kindFields.push({ ...sel(`k${k.id}.fallback`, "editor.modes.fallback", (r) => fallbackOptions(m, t, r.fallback, r)), get: (r) => r.fallback, set: (r, v) => on(r) && (r.fallback = v), show: (r) => on(r) && !r.noFallback });
+ 		}
+-		for (const spec of mod.fields()) kindFields.push(specField(spec, t, holder, `k${k.id}`));
++		const alg = KEY_ALGS.find((a) => a.token.toUpperCase() === k.token);
++		for (const spec of mod.fields()) {
++			if (alg && spec.key === "keyId") continue;
++			if (alg && spec.key === "aes") {
++				const get = (r) => on(r) && r.params?.aes ? r.params.keyId : null;
++				kindFields.push(sel(`k${k.id}.aes`, `editor.keys.alg.${alg.token}`,
++					(r) => aesOptions(m, t, alg, get(r), "editor.alias.off"), {
++						show: on, get, help: t(spec.help),
++						set: (r, id) => on(r) && (r.params = { ...r.params, aes: id != null, keyId: id ?? 0 }),
++					}));
++			} else {
++				kindFields.push(specField(spec, t, holder, `k${k.id}`));
++			}
++		}
+ 	}
++	const dmrAlg = KEY_ALGS.find((a) => a.token === "dmr");
+ 	return [
+ 		{ group: t("editor.form.basic") },
+ 		txt("name", "editor.col.name", name(LIMITS.name)(t)),
+@@ -342,6 +366,12 @@ export function channelForm(m, t, { features = null } = {}) {
+ 		dmr(sel("rxList", "editor.col.rx_list", () => refOptions(m.rxLists, t))),
+ 		dmr(txt("dmrId", "editor.col.channel_id", dmrId(t), (v) => (v ? String(v) : ""))),
+ 		dmr(chk("dmo", "editor.col.dmo")),
++		sel("dmrAesKid", "editor.keys.alg.dmr",
++			(r) => aesOptions(m, t, dmrAlg, r.dmrAesKid || null, "editor.tot.default"), {
++				show: (r) => r.mode === "dmr" && !r.kind,
++				get: (r) => r.dmrAesKid || null,
++				set: (r, id) => { if (r.mode === "dmr" && !r.kind) r.dmrAesKid = id ?? 0; },
++			}),
+ 		dmr(sel("aliasTs1", "editor.col.alias_ts1", () => aliasOptions(t))),
+ 		dmr(sel("aliasTs2", "editor.col.alias_ts2", () => aliasOptions(t))),
+ 		dmr(chk("noBeep", "editor.col.no_beep")),
+diff --git a/site/tests/channel-aes.test.mjs b/site/tests/channel-aes.test.mjs
+new file mode 100644
+index 0000000..a2076c1
+--- /dev/null
++++ b/site/tests/channel-aes.test.mjs
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: MIT
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { empty, encode, decode, newChannel } from "../static/js/codeplug/model.js";
++import { setKind } from "../static/js/codeplug/channelmodes.js";
++import { channelForm } from "../static/js/editor/views.js";
++
++test("channel AES picks matching IDs, including zero, and survives codeplug encoding", () => {
++	const model = empty();
++	const dmr = newChannel({ name: "DMR", mode: "dmr", rxHz: 433000000, txHz: 433000000 });
++	const p25 = newChannel({ name: "P25", rxHz: 433000000, txHz: 433000000 });
++	const nxdn = newChannel({ name: "NXDN", rxHz: 433000000, txHz: 433000000 });
++	setKind(model, p25, 2);
++	setKind(model, nxdn, 4);
++	model.channels.push(dmr, p25, nxdn);
++	const key = "AB".repeat(32);
++	model.keyring = [{ alg: 0x25, id: 7, key }, { alg: 0x84, id: 65535, key }, { alg: 3, id: 0, key }];
++	const fields = channelForm(model, (s) => s);
++	for (const [channel, name, id] of [[dmr, "dmrAesKid", 7], [p25, "k2.aes", 65535], [nxdn, "k4.aes", 0]]) {
++		const f = fields.find((field) => field.key === name);
++		assert.ok(f.show(channel));
++		assert.deepEqual(f.options(channel).map(([keyId]) => keyId), [null, id]);
++		f.set(channel, id);
++		assert.equal(f.get(channel), id);
++	}
++	const restored = decode(encode(model));
++	assert.equal(restored.channels[0].dmrAesKid, 7);
++	assert.equal(restored.channels[1].params.keyId, 65535);
++	assert.equal(restored.channels[2].params.aes, true);
++	assert.equal(restored.channels[2].params.keyId, 0);
++
++	model.keyring = [];
++	const field = fields.find((f) => f.key === "k2.aes");
++	assert.deepEqual(field.options(p25).map(([id]) => id), [null, 65535]);
++});
+diff --git a/tests/host/codeplugEditTest.c b/tests/host/codeplugEditTest.c
+index 6991b12..e573cc9 100644
+--- a/tests/host/codeplugEditTest.c
++++ b/tests/host/codeplugEditTest.c
+@@ -163,6 +163,25 @@ static void test_encode(void)
+ 	CHECK(r[0x2A] == 0xCF && codeplug_openfw_decode(r, &d) && d.tone_burst);
+ }
+ 
++static void test_channel_dmr_aes(void)
++{
++	fresh();
++	channel_t ch = make("DMR AES", 433000000, 433000000), back;
++	ch.mode = RADIO_MODE_DMR;
++	ch.dmr_aes_kid = 255;
++	CHECK(codeplug_set_channel(10, &ch));
++	CHECK(codeplug_init() == CODEPLUG_OPENFW);
++	CHECK(codeplug_channel(10, &back) && back.dmr_aes_kid == 255);
++	back.dmr_aes_kid = 0;
++	CHECK(codeplug_set_channel(10, &back));
++	CHECK(codeplug_channel(10, &back) && back.dmr_aes_kid == 0);
++	ch.dmr_aes_kid = 7;
++	CHECK(codeplug_set_channel(10, &ch) && codeplug_delete_channel(10));
++	ch.dmr_aes_kid = 0;
++	CHECK(codeplug_set_channel(10, &ch));
++	CHECK(codeplug_channel(10, &back) && back.dmr_aes_kid == 0);
++}
++
+ static void test_materialize(void)
+ {
+ 	fresh();
+@@ -776,6 +795,7 @@ int main(void)
+ {
+ 	test_encode();
+ 	test_materialize();
++	test_channel_dmr_aes();
+ 	test_unread();
+ 	test_zones();
+ #if CONFIG_DMR
+diff --git a/tests/host/codeplugTagTest.c b/tests/host/codeplugTagTest.c
+index 9eae4ce..f28cb93 100644
+--- a/tests/host/codeplugTagTest.c
++++ b/tests/host/codeplugTagTest.c
+@@ -467,6 +467,27 @@ static void test_records(void)
+ 	CHECK(codeplug_traffic_key(4, 0x84, 1, key, sizeof key) == -1);
+ }
+ 
++static void test_aes_selector(void)
++{
++	fresh();
++	const uint8_t p25[CODEPLUG_TRAFFIC_HDR + 32] = { CODEPLUG_SYSTEM_NONE, 0x84, 0xFF, 0xFF };
++	const uint8_t nxdn[CODEPLUG_TRAFFIC_HDR + 32] = { CODEPLUG_SYSTEM_NONE, 3, 0 };
++	const uint8_t invalid[CODEPLUG_TRAFFIC_HDR + 1] = { CODEPLUG_SYSTEM_NONE, 0x84, 2 };
++	const uint8_t system[CODEPLUG_TRAFFIC_HDR + 32] = { 4, 0x84, 1 };
++	const uint8_t dmr[CODEPLUG_TRAFFIC_HDR + 32] = { CODEPLUG_SYSTEM_NONE, 0x25, 7 };
++	CHECK(codeplug_kv_set(CODEPLUG_KEY_TRAFFIC, p25, sizeof p25));
++	CHECK(codeplug_kv_set(CODEPLUG_KEY_TRAFFIC + 1, nxdn, sizeof nxdn));
++	CHECK(codeplug_kv_set(CODEPLUG_KEY_TRAFFIC + 2, invalid, sizeof invalid));
++	CHECK(codeplug_kv_set(CODEPLUG_KEY_TRAFFIC + 3, system, sizeof system));
++	CHECK(codeplug_kv_set(CODEPLUG_KEY_TRAFFIC + 4, dmr, sizeof dmr));
++	CHECK(codeplug_aes_key_step(0x84, -1, 1, 0, UINT16_MAX) == UINT16_MAX);
++	CHECK(codeplug_aes_key_step(0x84, -1, -1, 0, UINT16_MAX) == UINT16_MAX);
++	CHECK(codeplug_aes_key_step(0x84, UINT16_MAX, 1, 0, UINT16_MAX) == -1);
++	CHECK(codeplug_aes_key_step(3, -1, 1, 0, 63) == 0);
++	CHECK(codeplug_aes_key_step(3, 0, -1, 0, 63) == -1);
++	CHECK(codeplug_aes_key_step(0x25, -1, 1, 1, UINT8_MAX) == 7);
++}
++
+ static void put_entry(uint8_t n, uint8_t sys, uint8_t cls, uint8_t group, uint8_t flags, const uint8_t *body, uint16_t len)
+ {
+ 	uint8_t v[CODEPLUG_SYS_ENTRY_HDR + 32];
+@@ -588,6 +609,7 @@ int main(void)
+ 	test_unknown_kind();
+ 	test_full_area();
+ 	test_records();
++	test_aes_selector();
+ 	test_systems();
+ 	sim_flash_free();
+ 	if (failures) {
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index a116b94..dacbcd7 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -830,6 +830,14 @@ bool codeplug_channel(uint16_t number, channel_t *out)
+ 	return true;
+ }
+ 
++#if CONFIG_AIR_AES
++int codeplug_aes_key_step(uint8_t alg, int32_t current, int dir, uint16_t min, uint16_t max)
++{
++	uint16_t id = alg == 0x84 ? 0x1234 : alg == 3 ? 0 : 7;
++	return id >= min && id <= max && (dir > 0 ? current < id : current < 0 || current > id) ? id : -1;
++}
++#endif
++
+ // Channel tags (codeplug_tag.c): no tag area here; a copy keeps its kind in sim_edits already
+ bool codeplug_tag_copy(uint16_t from, uint16_t to, const channel_t *ch)
+ {
+diff --git a/tests/host/ysfEngineTest.c b/tests/host/ysfEngineTest.c
+index 41b4f69..648c798 100644
+--- a/tests/host/ysfEngineTest.c
++++ b/tests/host/ysfEngineTest.c
+@@ -18,6 +18,9 @@
+ #include "dmr/ambe/ambeFec.h"
+ 
+ static int failures, checks;
++static FILE *capture;
++static FILE *speech;
++static bool speech_error;
+ #define CHECK(c, ...) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+ 
+ static uint32_t rng_state = 0x59534621u;
+@@ -98,6 +101,9 @@ static void step(uint8_t i)
+ 
+ 	memmove(p->q, p->q + 1, (size_t)(--p->qn) * sizeof(c));
+ 	p->sent_syms += c.nsyms;
++	if (capture && i == 0)
++		for (uint16_t j = 0; j < c.nsyms; j++)
++			fputc(air_sym_get(c.syms, j), capture);
+ 	deliver(far, c.syms, c.nsyms);
+ 	if (c.flags & AIR_TX_LAST) {
+ 		p->on = false;
+@@ -215,8 +221,20 @@ static void encode(radio_t *x, uint8_t n)
+ 	while (n-- && x->enc_made < VMAX) {
+ 		uint8_t bits[AMBE_PARAM_BITS];
+ 
+-		for (uint8_t k = 0; k < AMBE_PARAM_BITS; k++)
+-			bits[k] = (uint8_t)(rng() & 1u);
++		if (speech) {
++			uint8_t packed[(AMBE_PARAM_BITS + 7) / 8];
++			size_t nread = fread(packed, 1, sizeof packed, speech);
++
++			if (nread != sizeof packed) {
++				speech_error |= nread != 0 || ferror(speech);
++				return;
++			}
++			for (uint8_t k = 0; k < AMBE_PARAM_BITS; k++)
++				bits[k] = (uint8_t)((packed[k / 8] >> (7 - k % 8)) & 1u);
++		} else {
++			for (uint8_t k = 0; k < AMBE_PARAM_BITS; k++)
++				bits[k] = (uint8_t)(rng() & 1u);
++		}
+ 		ambeFecEncode(bits, x->enc[x->enc_made]);
+ 		x->enc_made++;
+ 	}
+@@ -580,8 +598,43 @@ static void testVW(bool narrow)
+ 	ysf_engine_end(&r[1].e);
+ }
+ 
+-int main(void)
++// Replay MSB-first packed AMBE parameters through the firmware's TX engine.
++static int capture_call(const char *mode, const char *output)
+ {
++	uint8_t dt;
++
++	if (!strcmp(mode, "vd1"))
++		dt = YSF_DT_VD_MODE1;
++	else if (!strcmp(mode, "dn"))
++		dt = YSF_DT_VD_MODE2;
++	else
++		return 1;
++	capture = fopen(output, "wb");
++	if (!capture) {
++		perror(output);
++		return 1;
++	}
++	speech = stdin;
++	// Give the file decoder some symbols to establish slicing levels before sync.
++	for (unsigned i = 0; i < 500; i++)
++		fputc(rng() & 3, capture);
++	ysf_engine_cfg_t cfg = base_cfg(dt, false);
++	begin(0, &cfg, &hooks);
++	uint16_t periods = over(160, 0, 0);
++	int written = fclose(capture);
++	ysf_engine_end(&r[0].e);
++	return failures || speech_error || written || periods == 600 || prov[0].underruns ||
++		r[0].enc_made != r[0].enc_taken;
++}
++
++int main(int argc, char **argv)
++{
++	if (argc == 4 && !strcmp(argv[1], "--capture"))
++		return capture_call(argv[2], argv[3]);
++	if (argc != 1) {
++		fprintf(stderr, "Usage: %s [--capture vd1|dn output.bin < speech.ambe]\n", argv[0]);
++		return 1;
++	}
+ 	testCall(YSF_DT_VD_MODE1, false);
+ 	testCall(YSF_DT_VD_MODE2, false);
+ 	testCall(YSF_DT_VD_MODE1, true);

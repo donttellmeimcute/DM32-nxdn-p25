@@ -57,6 +57,12 @@ El NAC/RAN de **TX** debe coincidir con el del otro equipo; Pi-Star usa NAC 293 
 
 ## Instalar
 
+**Seleccionar una clave AES-256 por canal.** Carga las claves en **Radio → Claves AES-256** del
+CPS web. Abre un canal DMR, P25 o NXDN convencional y selecciona el ID en su campo AES-256.
+También puedes elegirlo con las flechas en **Canales → Editar canal → Clave AES-256** en la DM32
+y mantener **OK** para guardar. Cada modo muestra los IDs de su llave. DMR permite **Predeterminado
+de la radio**, que usa la configuración general de privacidad. P25 y NXDN permiten **Desactivado**.
+
 1. Usa el **web flasher**: <https://donttellmeimcute.github.io/dm32-web-cps-flasher/> (Chrome o Edge de escritorio, Web Serial), o descarga la imagen `.bin` sin códec de la última [release](../../releases). El flasher sincroniza cada varias horas, no al instante: si muestra una versión anterior a la última release de GitHub, espera a que corra su sincronización o baja el `.bin` de la release.
 2. Pon la radio en modo actualización: apagada, mantén **PTT + SK1** al encenderla (LED verde).
 3. El flasher hace un respaldo, toma el códec AMBE de tu propia radio (o del archivo de firmware de fábrica que elijas) y lo instala junto al firmware.

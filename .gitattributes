@@ -1,3 +1,6 @@
 *.csv text eol=lf
 # This evidence diff deliberately preserves original upstream whitespace.
 experiments/codec/results/portability.patch -whitespace
+# Unified patches preserve upstream indentation in their context lines.
+integration/current/channel-aes-ysf.patch -whitespace
+tools/patches/dsd-fme-ysf-vd1-audio.patch -whitespace
