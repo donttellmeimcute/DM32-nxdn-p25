@@ -21,6 +21,7 @@ PATCH_DIR = ROOT / 'integration/current'
 PATCHES = (
 	'base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch', 'ysf-tx-pcm.patch',
 	'ysf-vfo-identity.patch',
+	'vfo-digital.patch',
 )
 
 
