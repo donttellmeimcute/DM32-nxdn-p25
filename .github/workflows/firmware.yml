@@ -13,6 +13,8 @@ name: Firmware
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -67,15 +69,15 @@ jobs:
         run: |
           set -eu
           T=build/current/tests/host
-          tests="voiceCipherTest dmrAesTest dmrCallTestAes p25Test p25EngineTest p25EngineTestAes p25VoiceTest
+          tests="voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
             nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest radioCoreTestYsf
-            radioCoreTestP25Nxdn codeplugEditTest codeplugTagTest settingsTest uiFlowTest"
+            radioCoreTestP25Nxdn radioCoreTestAirInterop codeplugEditTest codeplugTagTest settingsTest uiFlowTest"
           make -C "$T" -j4 $tests
           for t in $tests; do
             (cd "$T" && ./"$t")
           done
 
-      - name: Check channel AES selection in the CPS
+      - name: Check channel privacy selection in the CPS
         run: node --test build/current/site/tests/channel-aes.test.mjs
 
       - name: Check the P25 and NXDN bench tools
@@ -108,6 +110,7 @@ jobs:
           path: dist/*
 
       - name: Publish the release
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.package.outputs.version }}
@@ -136,6 +139,7 @@ jobs:
       # Optional: with a token that may run workflows in dm32-web-cps-flasher (secret FLASHER_TOKEN), the flasher
       # updates right away; without it, its Sync firmware workflow finds the release on its next scheduled check
       - name: Tell the web flasher
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.FLASHER_TOKEN }}
         run: |

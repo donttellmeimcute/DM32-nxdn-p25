@@ -1,0 +1,614 @@
+diff --git a/core/air/air_session.c b/core/air/air_session.c
+index 3c915e5..38677fb 100644
+--- a/core/air/air_session.c
++++ b/core/air/air_session.c
+@@ -26,6 +26,20 @@ static void fill(air_session_t *s)
+ 		try_finish(s);
+ 		return;
+ 	}
++	while (s->preamble_left) {
++		uint16_t n = air_session_tx_space(s);
++		uint8_t pattern[16];
++		if (n == 0)
++			return;
++		if (n > sizeof pattern * 4)
++			n = sizeof pattern * 4;
++		if (n > s->preamble_left)
++			n = s->preamble_left;
++		memset(pattern, s->preamble_byte, sizeof pattern);
++		if (!air_session_tx(s, pattern, 0, n))
++			return;
++		s->preamble_left -= n;
++	}
+ 	if (s->ops.tx_fill)
+ 		s->ops.tx_fill(s->ctx);
+ }
+@@ -127,6 +141,14 @@ bool air_session_tx_prime(air_session_t *s)
+ 	return s->air->tx_space() < s->air->tx_queue_depth;
+ }
+ 
++void air_session_tx_preamble(air_session_t *s, uint8_t dibits, uint16_t ms)
++{
++	if (s->tx == AIR_TX_IDLE && s->air) {
++		s->preamble_left = (uint16_t)(((uint32_t)s->fr.mode->profile.sym_rate * ms / 1000u) & ~3u);
++		s->preamble_byte = dibits;
++	}
++}
++
+ bool air_session_tx_go(air_session_t *s)
+ {
+ 	if (!s->air || s->tx != AIR_TX_PRIMING)
+@@ -158,8 +180,10 @@ air_tx_state_t air_session_tx_state(const air_session_t *s)
+ 
+ void air_session_tx_clear(air_session_t *s)
+ {
+-	if (s->tx == AIR_TX_DONE)
++	if (s->tx == AIR_TX_DONE) {
++		s->preamble_left = 0;
+ 		s->tx = AIR_TX_IDLE;
++	}
+ }
+ 
+ uint16_t air_session_tx_space(const air_session_t *s)
+diff --git a/core/air/air_session.h b/core/air/air_session.h
+index 35ffe3d..d3f3732 100644
+--- a/core/air/air_session.h
++++ b/core/air/air_session.h
+@@ -50,6 +50,8 @@ typedef struct {
+ 	volatile uint8_t tx;		// air_tx_state_t
+ 	volatile bool finish;		// air_session_tx_finish was called ...
+ 	volatile bool finished;		// ... and the last chunk is in the provider's queue (it may have had to wait for room)
++	uint16_t preamble_left;		// optional repeated pattern before the first protocol frame
++	uint8_t preamble_byte;
+ 	air_session_stats_t stats;
+ } air_session_t;
+ 
+@@ -68,6 +70,7 @@ void air_session_retuned(air_session_t *s);
+ // Transmit, owner's task: prime (calls tx_fill; true once a chunk is queued), switch the transmitter on
+ // (hal_radio_t.tx), go. False from go: the provider refused; the owner switches off again
+ bool air_session_tx_prime(air_session_t *s);
++void air_session_tx_preamble(air_session_t *s, uint8_t dibits, uint16_t ms);
+ bool air_session_tx_go(air_session_t *s);
+ // Stop at once, whatever is queued (owner's task). AIR_TX_DONE follows
+ void air_session_tx_abort(air_session_t *s);
+diff --git a/core/nxdn/nxdn_codeplug.c b/core/nxdn/nxdn_codeplug.c
+index f89dddf..165bf6f 100644
+--- a/core/nxdn/nxdn_codeplug.c
++++ b/core/nxdn/nxdn_codeplug.c
+@@ -57,13 +57,10 @@ uint16_t nxdn_unit_id_decode(const uint8_t *b, int len, uint32_t dmr_id)
+ 	return unit_ok(dmr_id) ? (uint16_t)dmr_id : 1u;
+ }
+ 
+-// Our unit ID: the channel's (the record's own ID), else the radio-wide NXDN one, else the DMR ID, else 1
+-static uint16_t unit_id(const channel_t *ch)
++uint16_t nxdn_radio_unit_id(void)
+ {
+ 	uint8_t b[8];
+ 
+-	if (unit_ok(ch->dmr_id))
+-		return (uint16_t)ch->dmr_id;
+ 	return nxdn_unit_id_decode(b, codeplug_mode_settings(CODEPLUG_KIND_NXDN, b, sizeof b), codeplug_dmr_id());
+ }
+ 
+@@ -105,7 +102,7 @@ bool nxdn_conv_load(uint16_t number, const channel_t *ch, nxdn_conv_cfg_t *out)
+ 	if (len < 0)
+ 		return false;
+ 	nxdn_conv_decode(b, len < cap ? len : cap, &out->conv);
+-	out->unit_id = unit_id(ch);
++	out->unit_id = unit_ok(ch->dmr_id) ? (uint16_t)ch->dmr_id : nxdn_radio_unit_id();
+ 	talk_target(ch, &out->target, &out->target_unit);
+ 	return true;
+ }
+diff --git a/core/nxdn/nxdn_codeplug.h b/core/nxdn/nxdn_codeplug.h
+index 0d7430d..599f489 100644
+--- a/core/nxdn/nxdn_codeplug.h
++++ b/core/nxdn/nxdn_codeplug.h
+@@ -41,6 +41,7 @@ void nxdn_conv_encode(const nxdn_conv_t *c, uint8_t out[NXDN_CP_CONV_LEN]);
+ // The radio-wide unit ID from the kind's record (len bytes, -1 = none): when unset or out of range the DMR ID where it
+ // fits, else 1
+ uint16_t nxdn_unit_id_decode(const uint8_t *b, int len, uint32_t dmr_id);
++uint16_t nxdn_radio_unit_id(void);
+ 
+ // What a conventional call is set up from: the channel's block, our unit ID and the talk target
+ typedef struct {
+diff --git a/core/p25/p25Voice.c b/core/p25/p25Voice.c
+index a9bba42..9228322 100644
+--- a/core/p25/p25Voice.c
++++ b/core/p25/p25Voice.c
+@@ -345,7 +345,7 @@ void p25VoiceSetMicGain(uint8_t step)
+ 	STORE(mic_gain_q8, q8[step > 10 ? 10 : step]);
+ }
+ 
+-void p25VoiceEnd(void)
++void p25VoicePause(void)
+ {
+ 	if (streaming && aud != NULL) {
+ 		aud->stop();
+@@ -354,6 +354,12 @@ void p25VoiceEnd(void)
+ 		}
+ 	}
+ 	streaming = false;
++	cb_speaker = false;
++}
++
++void p25VoiceEnd(void)
++{
++	p25VoicePause();
+ 	STORE(mem, (p25_voice_mem_t *)NULL);
+ }
+ 
+diff --git a/core/p25/p25Voice.h b/core/p25/p25Voice.h
+index 8ccc0a1..50c3739 100644
+--- a/core/p25/p25Voice.h
++++ b/core/p25/p25Voice.h
+@@ -85,6 +85,7 @@ void p25VoiceInit(const hal_audio_t *audio);
+ void p25VoiceBegin(p25_voice_mem_t *mem, uint8_t frames_per_burst);
+ // Radio task, every tick while P25 runs: starts the audio stream once a call is heard
+ void p25VoicePoll(void);
++void p25VoicePause(void);	// stop PCM before the RF provider switches clocks, keeping codec memory
+ // A transmission starts (the stream starts if it was not running; from the next block the mic is encoded) or ends.
+ // Radio task, around the engine's transmit calls
+ void p25VoiceTx(bool on);
+diff --git a/core/radio/radio_nxdn.c b/core/radio/radio_nxdn.c
+index 411d506..a0d147d 100644
+--- a/core/radio/radio_nxdn.c
++++ b/core/radio/radio_nxdn.c
+@@ -38,7 +38,7 @@ static nxdn_engine_t own_mem;
+ #endif
+ 
+ static const radio_nxdn_settings_t defaults = {
+-	.rate9600 = true, .rx_ran = NXDN_RAN_ANY, .tx_ran = 1, .rx_gid = 0, .unit_id = 1, .unit_call = false,
++	.rate9600 = true, .rx_ran = NXDN_RAN_ANY, .tx_ran = 1, .rx_gid = 0, .unit_id = 0, .unit_call = false,
+ 	.tx_dst = 1, .emergency = false,
+ };
+ static radio_nxdn_settings_t set;
+@@ -57,6 +57,8 @@ void radio_nxdn_init(void)
+ void radio_nxdn_settings(radio_nxdn_settings_t *out)
+ {
+ 	*out = set;
++	if (out->unit_id == 0)
++		out->unit_id = nxdn_radio_unit_id();
+ }
+ 
+ void radio_nxdn_set_settings(const radio_nxdn_settings_t *s)
+@@ -66,8 +68,8 @@ void radio_nxdn_set_settings(const radio_nxdn_settings_t *s)
+ 		set.rx_ran = NXDN_RAN_ANY;
+ 	if (set.tx_ran > RADIO_NXDN_RAN_MAX)
+ 		set.tx_ran = 1;
+-	if (set.unit_id == 0 || set.unit_id > RADIO_NXDN_UNIT_MAX)
+-		set.unit_id = defaults.unit_id;
++	if (set.unit_id > RADIO_NXDN_UNIT_MAX)
++		set.unit_id = 0;
+ }
+ 
+ uint32_t radio_nxdn_fit(bool rate9600)
+@@ -154,7 +156,7 @@ static void params_channel(const channel_t *ch, uint16_t number, nxdn_engine_cfg
+ 	c->rx_ran = set.rx_ran;
+ 	c->tx_ran = set.tx_ran;
+ 	c->rx_gid = set.rx_gid;
+-	c->unit_id = set.unit_id;
++	c->unit_id = set.unit_id ? set.unit_id : nxdn_radio_unit_id();
+ 	c->tx_call_type = set.unit_call ? NXDN_CALL_INDIVIDUAL : NXDN_CALL_GROUP;
+ 	c->tx_dst = set.tx_dst;
+ 	c->emergency = set.emergency;
+@@ -441,15 +443,26 @@ static bool nxdn_no_tx(void)
+ 
+ static bool nxdn_tx_prepare(void)
+ {
+-	if (eng == NULL || !nxdn_engine_tx_prepare(eng))
++	if (eng == NULL)
+ 		return false;
+-	voice_tx(true);
++	air_session_tx_preamble(&eng->session, 0x5F, 200);
++	if (!nxdn_engine_tx_prepare(eng))
++		return false;
++	ambeVoiceStop();
+ 	return true;
+ }
+ 
+ static bool nxdn_tx_go(void)
+ {
+-	return eng != NULL && nxdn_engine_tx_go(eng);
++	if (eng == NULL || !nxdn_engine_tx_go(eng))
++		return false;
++	voice_tx(true);
++	if (board.audio != NULL && !ambeVoiceStreaming()) {
++		voice_tx(false);
++		nxdn_engine_tx_abort(eng);
++		return false;
++	}
++	return true;
+ }
+ 
+ static void nxdn_tx_stop(void)
+diff --git a/core/radio/radio_p25.c b/core/radio/radio_p25.c
+index d8e081a..ca076df 100644
+--- a/core/radio/radio_p25.c
++++ b/core/radio/radio_p25.c
+@@ -181,7 +181,7 @@ static void params_channel(const channel_t *ch, uint16_t number, uint32_t own_id
+ #endif
+ 		if (cc.conv.squelch == P25_SQUELCH_SELECTIVE)
+ 			cfg->rx_tgid = cc.target_unit ? (uint16_t)P25_TGID_EVERYONE : (uint16_t)cc.target;
+-		cfg->unit_id = (set.unit_id != 0 ? set.unit_id : cc.unit_id) & 0xFFFFFFu;
++		cfg->unit_id = (ch->dmr_id == 0 && set.unit_id != 0 ? set.unit_id : cc.unit_id) & 0xFFFFFFu;
+ 		talk_lc(&cfg->tx_lc, cc.target_unit, cc.target);
+ 		cfg->talkaround = cc.talkaround;
+ 		return;
+@@ -870,16 +870,31 @@ bool radio_p25_tx_prepare(void)
+ 		trunk_tx_nac(mem);
+ 	}
+ #endif
++	if (!radio_p25_trunked())
++		air_session_tx_preamble(&mem->eng.session, 0x77, 200);
+ 	if (!p25_engine_tx_prepare(&mem->eng)) {
+ 		return false;
+ 	}
+-	voice_tx(true);
++#if CONFIG_IMBE
++	p25VoicePause();
++#endif
+ 	return true;
+ }
+ 
+ bool radio_p25_tx_go(void)
+ {
+-	return mem != NULL && p25_engine_tx_go(&mem->eng);
++	if (mem == NULL || !p25_engine_tx_go(&mem->eng))
++		return false;
++	if (!mem->eng.tx_ended) {	// a trunking signalling burst has no microphone stream
++		voice_tx(true);
++#if CONFIG_IMBE
++		if (board.audio != NULL && !p25VoiceStreaming()) {
++			radio_p25_tx_abort();
++			return false;
++		}
++#endif
++	}
++	return true;
+ }
+ 
+ void radio_p25_tx_stop(void)
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index 79f9708..664ad4b 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -485,14 +485,20 @@ static bool ambe_mode(void)
+ 
+ static bool ysf_tx_prepare(void)
+ {
+-	if (eng == NULL || !ysf_engine_tx_prepare(eng))
++	if (eng == NULL)
++		return false;
++	air_session_tx_preamble(&eng->session, 0x77, 200);
++	if (!ysf_engine_tx_prepare(eng))
+ 		return false;
+ 	if (ambe_mode()) {
+ 		// Close the RX audio stream while the modem still owns the RX PCM path.
+ 		ambeVoiceStop();
+-	} else if (eng->cfg.dt == YSF_DT_VOICE_FR) {
+-		voice_tx(true);
+ 	}
++#if CONFIG_P25 && CONFIG_IMBE
++	else if (eng->cfg.dt == YSF_DT_VOICE_FR) {
++		p25VoicePause();
++	}
++#endif
+ 	return true;
+ }
+ 
+@@ -512,6 +518,17 @@ static bool ysf_tx_go(void)
+ 		}
+ 		__atomic_store_n(&tx_ambe_ready, true, __ATOMIC_RELEASE);
+ 	}
++#if CONFIG_P25 && CONFIG_IMBE
++	else if (eng->cfg.dt == YSF_DT_VOICE_FR) {
++		voice_tx(true);
++		if (!p25VoiceStreaming()) {
++			voice_tx(false);
++			stats.tx_pcm_fails++;
++			ysf_engine_tx_abort(eng);
++			return false;
++		}
++	}
++#endif
+ 	return true;
+ }
+ 
+diff --git a/core/ysf/ysf_codeplug.c b/core/ysf/ysf_codeplug.c
+index 47be84d..b9e70c4 100644
+--- a/core/ysf/ysf_codeplug.c
++++ b/core/ysf/ysf_codeplug.c
+@@ -22,6 +22,8 @@ void ysf_callsign_pack(const char *s, uint8_t out[YSF_CALLSIGN_LEN])
+ 			else
+ 				c = s[i];
+ 		}
++		if (c >= 'a' && c <= 'z')
++			c -= 'a' - 'A';
+ 		out[i] = (uint8_t)(c >= 0x20 && c <= 0x7E ? c : ' ');
+ 	}
+ }
+@@ -100,6 +102,14 @@ void ysf_identity_load(ysf_identity_t *out)
+ 	int len = codeplug_mode_settings(CODEPLUG_KIND_YSF, b, sizeof b);
+ 
+ 	ysf_identity_decode(b, len, out);
++	// The general CPS callsign predates the per-mode settings. Use it for stored channels and the VFO.
++	if (out->src[0] == '\0') {
++		char callsign[CODEPLUG_NAME_LEN + 1];
++		codeplug_radio_name(callsign);
++		uint8_t source[YSF_CALLSIGN_LEN];
++		ysf_callsign_pack(callsign, source);
++		ysf_callsign_unpack(source, out->src);
++	}
+ }
+ 
+ bool ysf_conv_load(uint16_t number, const channel_t *ch, ysf_conv_cfg_t *out)
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 7183340..dd694e9 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -366,6 +366,14 @@ radioCoreTestP25Nxdn: $(RCP25NX) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE
+ 	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
+ 		-DCONFIG_P25=1 -DCONFIG_NXDN=1 -DCONFIG_AIR_RAW=1 -o $@ $(RCP25NX) -lm
+ 
++TESTS += radioCoreTestAirInterop
++RCINTEROP := $(sort $(RCP25NX) $(RCYSF))
++radioCoreTestAirInterop: $(RCINTEROP) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/air/*.h) \
++                         $(wildcard $(CORE)/nxdn/*.h $(CORE)/p25/*.h $(CORE)/ysf/*.h)
++	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
++		-DCONFIG_P25=1 -DCONFIG_NXDN=1 -DCONFIG_YSF=1 -DCONFIG_AIR_RAW=1 -DHAL_VOCODER_LEND_BYTES=0x4000 \
++		-o $@ $(RCINTEROP) -lm
++
+ # The same with APRS: what the data service hears goes into the station list (a DMR APRS position, docs/spec/aprs.md 8.2)
+ TESTS   += radioCoreTestAprs
+ RCAPRS  := $(RCORE) $(CORE)/aprs/aprs.c $(CORE)/aprs/aprs_ax25.c $(CORE)/aprs/aprs_dmr.c $(CORE)/aprs/aprs_host.c $(APRSLIB) \
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 2bd3182..9b4e168 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -164,16 +164,17 @@ static struct {
+ 	int starts, stops;
+ 	bool pcm;
+ 	bool feed;		// run() hands the callback a 20 ms microphone block, as a driver does (off: no blocks)
++	bool feed_signal;
+ 	audio_block_cb_t cb;
+ 	void *ctx;
+ } aud;
+-#if CONFIG_YSF
+-static bool ysf_clock_handoff, ysf_audio_start_fail;
++#if CONFIG_AIR
++static bool air_clock_handoff, air_audio_start_fail;
+ #endif
+ static bool a_start(audio_block_cb_t cb, void *ctx)
+ {
+-#if CONFIG_YSF
+-	if (ysf_audio_start_fail)
++#if CONFIG_AIR
++	if (air_audio_start_fail)
+ 		return false;
+ #endif
+ 	aud.cb = cb;
+@@ -290,6 +291,10 @@ typedef struct {
+ 	uint32_t keyed_violations;	// board.air modulated with the transmitter off (hal_air.h rule 3)
+ } fake_air_t;
+ static fake_air_t fair[2];
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++static const char *interop_dir;
++static FILE *interop_capture;
++#endif
+ static bool air_nofit;			// board.air can't carry P25
+ static uint32_t air_rng = 0x1234567;
+ 
+@@ -405,6 +410,11 @@ static void air_step1(uint8_t i)
+ 		return;
+ 	}
+ 	air_tx_chunk_t c = p->q[0];
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++	if (i == 0 && interop_capture)
++		for (uint16_t n = 0; n < c.nsyms; n++)
++			fputc(air_sym_get(c.syms, n), interop_capture);
++#endif
+ 	memmove(p->q, p->q + 1, (size_t)(--p->qn) * sizeof(c));
+ 	p->sent += c.nsyms;
+ #if CONFIG_P25_TRUNK
+@@ -448,9 +458,9 @@ static bool air_begin(uint8_t i)
+ {
+ 	if (fair[i].qn == 0 || !fair[i].open)
+ 		return false;
+-#if CONFIG_YSF
++#if CONFIG_AIR
+ 	// Model an audio clock handoff that invalidates a stream opened before the TX PHY.
+-	if (i == 0 && ysf_clock_handoff)
++	if (i == 0 && air_clock_handoff)
+ 		aud.started = false;
+ #endif
+ 	fair[i].on = true;
+@@ -700,7 +710,8 @@ bool codeplug_set_dmr_id(uint32_t id)
+ 	return true;
+ }
+ void codeplug_boot_text(char line1[CODEPLUG_NAME_LEN + 1], char line2[CODEPLUG_NAME_LEN + 1]) { line1[0] = line2[0] = 0; }
+-void codeplug_radio_name(char out[CODEPLUG_NAME_LEN + 1]) { out[0] = 0; }
++static const char *cp_radio_name = "";
++void codeplug_radio_name(char out[CODEPLUG_NAME_LEN + 1]) { strcpy(out, cp_radio_name); }
+ #if CONFIG_APRS_AFSK
+ // APRS (radioCoreTestAprs): no APRS channel in the codeplug
+ bool codeplug_aprs(uint8_t n, codeplug_aprs_t *out) { memset(out, 0, sizeof(*out)); return false; }
+@@ -1588,8 +1599,11 @@ static void run(uint32_t ms)
+ #endif
+ 		}
+ 		if (aud.feed && aud.started && aud.cb != NULL && now % 20 == 0) {
+-			static const int16_t mic[AUDIO_BLOCK_SAMPLES];
++			int16_t mic[AUDIO_BLOCK_SAMPLES] = { 0 };
+ 			int16_t spk[AUDIO_BLOCK_SAMPLES];
++			if (aud.feed_signal)
++				for (unsigned i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
++					mic[i] = (int16_t)((int)((now * 8u + i) % 64u) * 140 - 4480);
+ 			aud.cb(mic, spk, aud.ctx);
+ 		}
+ 		if (now % RADIO_TICK_MS == 0) {
+@@ -6560,12 +6574,12 @@ static void test_p25_tx(void)
+ 	s.unit_id = 777;
+ 	s.tx_nac = 0x2A0;
+ 	radio_req_p25_settings(&s);
+-	run(300);
++	run(520);
+ 	CHECK(far_heard.call.lc.src == own_dmr_id);	// this one goes on as it began
+ 	req(RREQ_PTT, 0);
+ 	run(500);
+ 	req(RREQ_PTT, 1);
+-	run(400);
++	run(620);
+ 	CHECK(far_heard.call.nac == 0x2A0 && far_heard.call.lc.lcf == P25_LCF_UNIT && far_heard.call.lc.dst == 4321 &&
+ 	      far_heard.call.lc.src == 777);
+ 	req(RREQ_PTT, 0);
+@@ -8348,6 +8362,14 @@ static void test_nxdn_mode(void)
+ 
+ // The codec's side (core/nxdn/nxdn_codeplug.c, tested in nxdnCodeplugTest): a stored channel's set-up, by number
+ static nxdn_conv_cfg_t stored_nxdn[NCH + 1];
++uint16_t nxdn_radio_unit_id(void)
++{
++	uint8_t b[2];
++	if (codeplug_kv_get(CODEPLUG_KEY_MODE_SET + CODEPLUG_KIND_NXDN, b, sizeof b) >= 2)
++		return (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
++	return 1;
++}
++
+ bool nxdn_conv_load(uint16_t number, const channel_t *ch, nxdn_conv_cfg_t *out)
+ {
+ 	if (ch->kind != CODEPLUG_KIND_NXDN || number < 1 || number > NCH)
+@@ -10425,7 +10447,7 @@ static void test_ysf_pcm_handoff(void)
+ 	      !strcmp(effective.down, "DOWN") && !strcmp(effective.up, "UP"));
+ 	aud.feed = true;
+ 	ambeVoiceResetStats();
+-	ysf_clock_handoff = true;
++	air_clock_handoff = true;
+ 	req(RREQ_PTT, 1);
+ 	run(450);
+ 	ambe_voice_stats_t voice;
+@@ -10436,21 +10458,113 @@ static void test_ysf_pcm_handoff(void)
+ 	CHECK(!hw.keyed && aud.started);
+ 
+ 	// A failed PCM restart must not leave the RF provider sending silence.
+-	ysf_audio_start_fail = true;
++	air_audio_start_fail = true;
+ 	req(RREQ_PTT, 1);
+ 	run(450);
+ 	CHECK(!hw.keyed && !fair[0].on && sm.view.tx_deny != TXDENY_NONE);
+ 	req(RREQ_PTT, 0);
+-	ysf_audio_start_fail = false;
+-	ysf_clock_handoff = false;
++	air_audio_start_fail = false;
++	air_clock_handoff = false;
+ 	run(100);
+ 	aud.feed = false;
+ 	kv_t3_clear();
+ }
+ #endif
+ 
+-int main(void)
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++static void test_air_interop(void)
++{
++	static const struct { uint8_t mode, profile; const char *capture; } cases[] = {
++		{ RADIO_MODE_P25, 0, "p25" }, { RADIO_MODE_NXDN, 0, "nxdn48" }, { RADIO_MODE_NXDN, 1, "nxdn96" },
++		{ RADIO_MODE_YSF, YSF_DT_VD_MODE2, "dn" }, { RADIO_MODE_YSF, YSF_DT_VOICE_FR, "vw" },
++	};
++	static const uint8_t nxdn_unit[] = { 0xD7, 0x11 };	// 4567, the CPS unit ID
++
++	for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
++		uint8_t mode = cases[i].mode;
++		bool imbe = mode == RADIO_MODE_P25 || (mode == RADIO_MODE_YSF && cases[i].profile == YSF_DT_VOICE_FR);
++		dmr_start(true);
++		sm.set.talk_permit = false;
++		cp_radio_name = "xe1abc";
++		kv_t3_set(CODEPLUG_KEY_MODE_SET + CODEPLUG_KIND_NXDN, nxdn_unit, sizeof nxdn_unit);
++		req(RREQ_VFO, 1);
++		if (mode == RADIO_MODE_NXDN) {
++			radio_nxdn_settings_t n;
++			radio_nxdn_settings(&n);
++			CHECK(n.unit_id == 4567);
++			n.rate9600 = cases[i].profile != 0;
++			n.unit_id = 0;	// no override, so transmit uses the ID from the CPS record
++			n.tx_dst = 123;
++			radio_req_nxdn_settings(&n);
++		} else if (mode == RADIO_MODE_P25) {
++			radio_p25_settings_t p;
++			radio_p25_settings(&p);
++			p.unit_id = 4567;
++			p.tx_dst = 123;
++			radio_req_p25_settings(&p);
++		} else {
++			radio_ysf_settings_t y;
++			radio_ysf_settings(&y);
++			y.dt = cases[i].profile;
++			radio_req_ysf_settings(&y);
++		}
++		req(RREQ_MODE, mode);
++		if (mode == RADIO_MODE_YSF) {
++			radio_ysf_settings_t y;
++			CHECK(radio_ysf_in_force(&y) && !strcmp(y.src, "XE1ABC"));
++		}
++		if (interop_dir) {
++			char path[512];
++			snprintf(path, sizeof path, "%s/%s.bin", interop_dir, cases[i].capture);
++			interop_capture = fopen(path, "wb");
++			CHECK(interop_capture != NULL);
++		}
++		aud.feed = aud.feed_signal = air_clock_handoff = true;
++		p25VoiceResetStats();
++		ambeVoiceResetStats();
++		req(RREQ_PTT, 1);
++		CHECK(fair[0].qn > 0 && fair[0].q[0].syms[0] == (mode == RADIO_MODE_NXDN ? 0x5F : 0x77));
++		run(1450);
++		CHECK(sm.view.state == RS_TX && aud.started);
++		if (imbe) {
++			p25_voice_stats_t v;
++			p25VoiceGetStats(&v);
++			CHECK(v.tx_frames > 10 && v.tx_encoded > v.tx_silent);
++		} else {
++			ambe_voice_stats_t v;
++			ambeVoiceGetStats(&v);
++			CHECK(v.tx_frames > 10);
++		}
++		req(RREQ_PTT, 0);
++		run(750);
++		CHECK(!hw.keyed && fair[0].underruns == 0);
++		if (interop_capture) {
++			fclose(interop_capture);
++			interop_capture = NULL;
++		}
++		air_audio_start_fail = true;
++		req(RREQ_PTT, 1);
++		run(100);
++		CHECK(!hw.keyed && !fair[0].on && sm.view.tx_deny != TXDENY_NONE);
++		req(RREQ_PTT, 0);
++		air_audio_start_fail = air_clock_handoff = false;
++		run(100);
++		aud.feed = aud.feed_signal = false;
++		cp_radio_name = "";
++		kv_t3_clear();
++	}
++}
++#endif
++
++int main(int argc, char **argv)
+ {
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++	if (argc == 2)
++		interop_dir = argv[1];
++#else
++	(void)argc;
++	(void)argv;
++#endif
+ 	test_tx_limit_op();
+ 	test_startup();
+ 	test_persist();
+@@ -10568,6 +10682,9 @@ int main(void)
+ 	test_volume_step_of();
+ #if CONFIG_YSF
+ 	test_ysf_pcm_handoff();
++#endif
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++	test_air_interop();
+ #endif
+ 	printf("# radioCoreTest: %d checks, %s\n", checks, failures ? "FAILED" : "PASSED");
+ 	return failures != 0;

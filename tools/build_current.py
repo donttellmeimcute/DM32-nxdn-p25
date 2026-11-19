@@ -22,6 +22,8 @@ PATCHES = (
 	'base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch', 'ysf-tx-pcm.patch',
 	'ysf-vfo-identity.patch',
 	'vfo-digital.patch',
+	'dmr-motorola-privacy.patch',
+	'digital-repeater-interop.patch',
 )
 
 
