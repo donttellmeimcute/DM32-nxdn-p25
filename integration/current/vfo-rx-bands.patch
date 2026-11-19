@@ -1,0 +1,235 @@
+diff --git a/core/settings/settings.c b/core/settings/settings.c
+index 117dfd2..2dcbf33 100644
+--- a/core/settings/settings.c
++++ b/core/settings/settings.c
+@@ -46,7 +46,7 @@ void settings_defaults(settings_t *s)
+ 	memset(s, 0, sizeof(*s));
+ 	s->squelch = SETTINGS_UNSET8;
+ #if CONFIG_RX_EXT && CONFIG_RX_EXT_ON
+-	s->cp_flags = SETTINGS_CP_RX_EXT;	// receive past the band table on from the first start (config/features.mk)
++	s->cp_flags = SETTINGS_CP_RX_EXT | SETTINGS_CP_RX_EXT_SET;
+ #endif
+ 	s->vfo_power = SETTINGS_UNSET8;
+ 	s->vfo_ts = 1;
+@@ -236,7 +236,15 @@ settings_load_t settings_init(void)
+ 	}
+ 	storage_unlock();
+ 	saved = live;
+-	dirty = false;
++#if CONFIG_RX_EXT && CONFIG_RX_EXT_ON
++	// Older records only stored the on/off bit, so a saved zero overrode
++	// this build's default. Apply it once and persist the explicit choice.
++	if (board.rx_ext_count != 0 && (live.cp_flags & SETTINGS_CP_RX_EXT_SET) == 0) {
++		live.cp_flags |= SETTINGS_CP_RX_EXT | SETTINGS_CP_RX_EXT_SET;
++		changed_ms = 0; // the settings task can save this from boot
++	}
++#endif
++	dirty = live.cp_flags != saved.cp_flags;
+ 	return (settings_load_t)stats.load;
+ }
+ 
+diff --git a/core/settings/settings.h b/core/settings/settings.h
+index 16ad729..da88c05 100644
+--- a/core/settings/settings.h
++++ b/core/settings/settings.h
+@@ -259,7 +259,8 @@ typedef struct {
+ // cp_flags: the owner kept another firmware's codeplug as the radio's own ("Use anyway", docs/spec/codeplug-native.md
+ // 2); app.c keeps it equal to codeplug_acceptance(), which a codeplug written by a CPS or TFTP drops
+ #define SETTINGS_CP_ACCEPTED		0x01u
+-#define SETTINGS_CP_RX_EXT		0x02u	// receive past the band table is on (not about the codeplug: the free bit here)
++#define SETTINGS_CP_RX_EXT		0x02u	// receive past the band table is on
++#define SETTINGS_CP_RX_EXT_SET		0x04u	// the boot default was applied or the owner changed the setting
+ #define SETTINGS_T3_STUN		0x80u	// t3_stun: a stun is kept (bits 0-6 say on which system)
+ #define SETTINGS_T3_KILLED		0x01u	// t3_kill: killed
+ 
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index d24ea0f..2a6e875 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -363,14 +363,36 @@ void ui_bands_text(char *out, size_t len, bool tx)
+ {
+ 	sbuf_t b;
+ 	sb_init(&b, out, len);
+-	for (int i = 0; i < board_band_count(); i++) {
+-		if (tx && !board.bands[i].tx)
+-			continue;	// a TX refusal lists only where it can transmit, not the receive-only ranges
++	uint8_t count = board_band_count();
++	uint32_t covered = 0;
++	for (;;) {
++		uint32_t lo = UINT32_MAX, hi = 0;
++		for (uint8_t i = 0; i < count; i++) {
++			const band_t *band = &board.bands[i];
++			if ((!tx || band->tx) && band->lo_hz > covered && band->lo_hz < lo) {
++				lo = band->lo_hz;
++				hi = band->hi_hz;
++			}
++		}
++		if (lo == UINT32_MAX)
++			break;
++		// The band table is in hardware order. Show its union in frequency
++		// order so the VFO hint fits and starts at the real lowest frequency.
++		uint32_t prev;
++		do {
++			prev = hi;
++			for (uint8_t i = 0; i < count; i++) {
++				const band_t *band = &board.bands[i];
++				if ((!tx || band->tx) && band->lo_hz <= hi && band->hi_hz > hi)
++					hi = band->hi_hz;
++			}
++		} while (hi != prev);
+ 		if (b.p != out)
+ 			sb_chr(&b, ' ');
+-		sb_u32(&b, board.bands[i].lo_hz / 1000000u, 1);
++		sb_u32(&b, lo / 1000000u, 1);
+ 		sb_chr(&b, '-');
+-		sb_u32(&b, board.bands[i].hi_hz / 1000000u, 1);
++		sb_u32(&b, hi / 1000000u, 1);
++		covered = hi;
+ 	}
+ }
+ 
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+index aeeae5c..a547386 100644
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -574,7 +574,8 @@ bool ui_svc_setting_set(uint8_t id, int32_t value)
+ #if CONFIG_RX_EXT
+ 	case UI_SET_RX_EXT:
+ 		st = settings_begin();
+-		st->cp_flags = (uint8_t)(value != 0 ? (st->cp_flags | SETTINGS_CP_RX_EXT) : (st->cp_flags & ~SETTINGS_CP_RX_EXT));
++		st->cp_flags = (uint8_t)((st->cp_flags & ~SETTINGS_CP_RX_EXT) | SETTINGS_CP_RX_EXT_SET |
++					 (value != 0 ? SETTINGS_CP_RX_EXT : 0));
+ 		settings_end(hal_millis());
+ 		board_rx_ext_set(value != 0);
+ 		radio_req_reload();	// a VFO past the table goes back in band when this goes off
+@@ -1405,7 +1406,7 @@ static void factory_reset_job(void *ctx)
+ 	(void)ctx;
+ 	settings_t *st = settings_begin();
+ 	settings_defaults(st);	// cp_flags too: "Use anyway" doesn't outlive a reset
+-	board_rx_ext_set(false);
++	board_rx_ext_set((st->cp_flags & SETTINGS_CP_RX_EXT) != 0);
+ 	settings_end(hal_millis());
+ 	codeplug_accept(false);
+ 	bool saved = settings_flush();
+diff --git a/docs/spec/hardware-dm32.md b/docs/spec/hardware-dm32.md
+index 55f91fd..0246bd5 100644
+--- a/docs/spec/hardware-dm32.md
++++ b/docs/spec/hardware-dm32.md
+@@ -1585,4 +1585,4 @@ calibration (modem-hrc7000.md 10.4).
+ 
+ ## Receive past the rated bands
+ 
+-16-65, 174-400 and 480-740 MHz: the FD6818 band table (8.3). The chip documents give no other range. Receive only, FM, off by default ([radio-features.md](radio-features.md) 6.2). Not measured on the radio.
++16-65, 174-400 and 480-740 MHz: the FD6818 band table (8.3). The chip documents give no other range. Receive only in FM, enabled by default in this fork ([radio-features.md](radio-features.md) 6.2). Not measured on the radio.
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index 23bb51d..e667ad8 100644
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -662,7 +662,7 @@ A board may list receive-only ranges past its rated bands: the last `board_t.rx_
+ 
+ | Rule | Detail |
+ |---|---|
+-| Setting | Settings > Advanced > RX past bands. Stored in `settings_t.cp_flags`; a factory reset returns it to its default, which `CONFIG_RX_EXT_ON` sets (on in this tree, off in RadioFoundry's). Hidden on a board with no range. |
++| Setting | Settings > Advanced > RX past bands. Stored in `settings_t.cp_flags`; a factory reset returns it to its default, which `CONFIG_RX_EXT_ON` sets (on in this tree, off in RadioFoundry's). Hidden on a board with no range. Older stored settings take the enabled default once when this build first loads them. The owner can turn it off after that. |
+ | Table | Everything that reads the bands uses `board_band_count()`: the VFO's tuning and wrap, the keypad entry, VFO scan, the channel editor, `rigctld` and the debug link's `bands=`. |
+ | Transmit | Never: `board_in_band(hz, true)` skips the entries, so PTT gives `TXDENY_BAND`. |
+ | Modes | FM only, as in any receive-only band: the channel editor refuses DMR there. |
+diff --git a/tests/host/settingsTest.c b/tests/host/settingsTest.c
+index 5187b8f..0060401 100644
+--- a/tests/host/settingsTest.c
++++ b/tests/host/settingsTest.c
+@@ -28,7 +28,9 @@ static const hal_flash_map_t map = {
+ 	.calibration_addr = 0x10000u, .calibration_size = 0x200u,
+ };
+ 
+-const board_t board = { .name = "test", .flash = &sim_flash, .power_count = 5 };
++static bool extended_rx_on;
++const board_t board = { .name = "test", .flash = &sim_flash, .power_count = 5,
++			.rx_ext_count = 1, .rx_ext_on = &extended_rx_on };
+ 
+ static void boot(void)
+ {
+@@ -1179,11 +1181,41 @@ static void test_write_across_sectors(void)
+ 	CHECK(sim_flash_violations() == 0);
+ }
+ 
++#if CONFIG_RX_EXT && CONFIG_RX_EXT_ON
++static void test_rx_default_upgrade(void)
++{
++	sim_flash_create(FLASH_SIZE, &map);
++	boot();
++	settings_t s;
++	settings_read(&s);
++	CHECK((s.cp_flags & (SETTINGS_CP_RX_EXT | SETTINGS_CP_RX_EXT_SET)) ==
++	      (SETTINGS_CP_RX_EXT | SETTINGS_CP_RX_EXT_SET));
++	// A pre-upgrade record where the default was off. Keep other flags.
++	settings_begin()->cp_flags = SETTINGS_CP_ACCEPTED;
++	settings_end(0);
++	CHECK(settings_flush());
++	boot();
++	settings_read(&s);
++	CHECK(s.cp_flags == (SETTINGS_CP_ACCEPTED | SETTINGS_CP_RX_EXT | SETTINGS_CP_RX_EXT_SET));
++	CHECK(settings_flush());
++	// A deliberate Off on this version survives all later boots.
++	settings_begin()->cp_flags &= (uint8_t)~SETTINGS_CP_RX_EXT;
++	settings_end(0);
++	CHECK(settings_flush());
++	boot();
++	settings_read(&s);
++	CHECK(s.cp_flags == (SETTINGS_CP_ACCEPTED | SETTINGS_CP_RX_EXT_SET));
++}
++#endif
++
+ int main(void)
+ {
+ 	test_journal_basic();
+ 	test_journal_cuts();
+ 	test_settings_basic();
++#if CONFIG_RX_EXT && CONFIG_RX_EXT_ON
++	test_rx_default_upgrade();
++#endif
+ 	test_settings_wear();
+ 	test_settings_cuts();
+ 	test_settings_versions();
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index dacbcd7..1b3a93b 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -409,6 +409,11 @@ static hal_power_t power = { .battery_pct = p_battery };
+ static const band_t bands[] = { { 136000000, 174000000, true }, { 400000000, 480000000, true },
+ 				{ 108000000, 136000000, false } };
+ // "rxonly": a radio whose transmitter isn't written yet, every band receive only
++static const band_t extended_bands[] = {
++	{ 136000000, 174000000, true }, { 400000000, 480000000, true },
++	{ 108000000, 136000000, false }, { 65000000, 108000000, false },
++	{ 16000000, 65000000, false }, { 174000000, 400000000, false }, { 480000000, 740000000, false },
++};
+ static const band_t rx_only_bands[] = { { 136000000, 174000000, false }, { 400000000, 480000000, false } };
+ static const char *const power_names[] = { "50mW", "250mW", "500mW", "750mW", "1W", "2W", "3W", "4W", "5W" };
+ 
+@@ -3286,6 +3291,11 @@ static bool run_token(char *t, char *err, size_t len)
+ 		sim_foreign = true;
+ 		return true;
+ 	}
++	if (strcmp(t, "extended-bands") == 0) {
++		board.bands = extended_bands;
++		board.band_count = sizeof extended_bands / sizeof extended_bands[0];
++		return true;
++	}
+ 	if (strcmp(t, "rxonly") == 0) {	// no band may transmit
+ 		board.bands = rx_only_bands;
+ 		board.band_count = sizeof rx_only_bands / sizeof rx_only_bands[0];
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index f764aab..8977669 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -565,6 +565,9 @@ static const flow_t flows[] = {
+ 	{ "C go to it from the list", "ok 5 down", "ctx", "screen=home pos=4", 1, false },
+ #endif
+ 	{ "12 into the VFO", "", "ok 4 up ok", "vfo=1 screen=home", 4, false },
++	{ "12 VFO keypad accepts 50 MHz", "extended-bands ok 4 up ok", "0 5 0 0 0 0 ok",
++	  "freq=50000000 vfo=1", 7, false },
++	{ "12 VFO hint shows extended RX coverage", "extended-bands ok 4 up ok", "8", "toast=Bands:_16-740", 1, false },
+ 	{ "12 446.000 in the VFO", "ok 4 up ok", "4 4 6 0 0 0 ok", "freq=446000000", 7, false },
+ 	{ "13 lock", "", "long:quick", "locked=1", 1, false },
+ 	{ "13 unlock", "long:quick", "long:quick", "locked=0", 1, false },
