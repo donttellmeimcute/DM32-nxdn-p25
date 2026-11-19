@@ -13564,6 +13564,7 @@ index acb48753..1bfabe71 100644
  nxdnunit - 3E8 3E8
 
 diff --git a/config/features.mk b/config/features.mk
+index 72712c7..bf7352f 100644
 --- a/config/features.mk
 +++ b/config/features.mk
 @@ -310,9 +310,9 @@ CONFIG_P25 ?= $(CONFIG_DMR)
@@ -13580,6 +13581,7 @@ diff --git a/config/features.mk b/config/features.mk
  # Derived, never set by hand (a command line or a board's config.mk that sets one stops the build): AIR the air
  # interface, on with any air-framed mode (P25, NXDN, YSF); IMBE the full-rate voice decoder and MBE the MBE core, with P25
 diff --git a/core/codeplug/codeplug_modes.h b/core/codeplug/codeplug_modes.h
+index 7f80d0d..05e5d85 100644
 --- a/core/codeplug/codeplug_modes.h
 +++ b/core/codeplug/codeplug_modes.h
 @@ -32,13 +32,23 @@ bool radio_nxdn_fits(void);
@@ -13620,6 +13622,7 @@ diff --git a/core/codeplug/codeplug_modes.h b/core/codeplug/codeplug_modes.h
  
  #define CODEPLUG_KIND_ENUM(id, token, name, built)	CODEPLUG_KIND_##token = id,
 diff --git a/core/config.h b/core/config.h
+index 53344b8..0d38f09 100644
 --- a/core/config.h
 +++ b/core/config.h
 @@ -355,7 +355,7 @@
@@ -13632,6 +13635,7 @@ diff --git a/core/config.h b/core/config.h
  // The GPS status screen: the satellites (NMEA GSV / GSA) on a sky plot and signal bars, the fix's quality, the grid
  // locator (core/position/nmea_sky.c, core/ui/ui_gps.c). Needs GPS
 diff --git a/core/debuglink/debuglink.c b/core/debuglink/debuglink.c
+index 43bb0a1..9c7e469 100644
 --- a/core/debuglink/debuglink.c
 +++ b/core/debuglink/debuglink.c
 @@ -128,7 +128,7 @@ static bool summary_line(uint8_t i, char *buf, uint8_t len)
@@ -13652,6 +13656,7 @@ diff --git a/core/debuglink/debuglink.c b/core/debuglink/debuglink.c
  	dlog("debuglink: counters reset");
  	out[0] = DL_ST_OK;
 diff --git a/core/debuglink/debuglink.h b/core/debuglink/debuglink.h
+index e6b4764..b6cb504 100644
 --- a/core/debuglink/debuglink.h
 +++ b/core/debuglink/debuglink.h
 @@ -58,6 +58,7 @@ enum {
@@ -13699,6 +13704,7 @@ diff --git a/core/debuglink/debuglink.h b/core/debuglink/debuglink.h
  // VERSION's codec= (hal_vocoder_id; the name the host tests use)
  static inline const char *debuglink_codec_id(const hal_vocoder_t *v)
 diff --git a/core/debuglink/debuglink_view.c b/core/debuglink/debuglink_view.c
+index 528e7d9..d46dd74 100644
 --- a/core/debuglink/debuglink_view.c
 +++ b/core/debuglink/debuglink_view.c
 @@ -62,7 +62,7 @@ static const char *state_key(uint8_t s)
@@ -13730,6 +13736,7 @@ diff --git a/core/debuglink/debuglink_view.c b/core/debuglink/debuglink_view.c
  #if CONFIG_NET_USRP
  		usrp_net_view(t);
 diff --git a/core/debuglink/debuglink_view_radio.c b/core/debuglink/debuglink_view_radio.c
+index 2e1548d..d506780 100644
 --- a/core/debuglink/debuglink_view_radio.c
 +++ b/core/debuglink/debuglink_view_radio.c
 @@ -35,6 +35,10 @@
@@ -13793,6 +13800,7 @@ diff --git a/core/debuglink/debuglink_view_radio.c b/core/debuglink/debuglink_vi
  	case DL_OP_VFO_SFR:
 diff --git a/core/debuglink/debuglink_view_ysf.c b/core/debuglink/debuglink_view_ysf.c
 new file mode 100644
+index 0000000..e5ed7b9
 --- /dev/null
 +++ b/core/debuglink/debuglink_view_ysf.c
 @@ -0,0 +1,57 @@
@@ -13854,6 +13862,7 @@ new file mode 100644
 +#endif
 +}
 diff --git a/core/hostlink/build_info.c b/core/hostlink/build_info.c
+index 8cff7b2..c514f29 100644
 --- a/core/hostlink/build_info.c
 +++ b/core/hostlink/build_info.c
 @@ -4,12 +4,16 @@
@@ -13920,6 +13929,7 @@ diff --git a/core/hostlink/build_info.c b/core/hostlink/build_info.c
  
  const char *build_features_now(void)
 diff --git a/core/radio/radio.h b/core/radio/radio.h
+index b2e4eed..ff6126a 100644
 --- a/core/radio/radio.h
 +++ b/core/radio/radio.h
 @@ -11,6 +11,7 @@
@@ -13978,6 +13988,7 @@ diff --git a/core/radio/radio.h b/core/radio/radio.h
  void radio_req_reply_cancel(void);		// BACK on Home: end the DMR reply window
  // Talk to someone else for now (until the channel changes or radio_req_dmr_target_clear): a typed ID or talkgroup,
 diff --git a/core/radio/radio_air.h b/core/radio/radio_air.h
+index c3aa8ab..f6dcded 100644
 --- a/core/radio/radio_air.h
 +++ b/core/radio/radio_air.h
 @@ -1,8 +1,8 @@
@@ -13993,6 +14004,7 @@ diff --git a/core/radio/radio_air.h b/core/radio/radio_air.h
  #define RADIO_AIR_H
  
 diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 7374d4e..52fdcdd 100644
 --- a/core/radio/radio_sm.c
 +++ b/core/radio/radio_sm.c
 @@ -33,7 +33,7 @@
@@ -14415,6 +14427,7 @@ diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
  	case RREQ_AIR_BENCH:
  		if ((req->arg & 0xFF) != 0) {
 diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index 9f43303..c295f9e 100644
 --- a/core/radio/radio_sm.h
 +++ b/core/radio/radio_sm.h
 @@ -87,9 +87,9 @@
@@ -14438,6 +14451,7 @@ diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
  } radio_req_type_t;
  
 diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
+index 968d8a8..5776a56 100644
 --- a/core/radio/radio_task.c
 +++ b/core/radio/radio_task.c
 @@ -63,6 +63,9 @@ static radio_p25_settings_t pending_p25;	// radio_req_p25_settings -> the radio
@@ -14496,9 +14510,10 @@ diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
  // The air interface bench's way to the radio (debuglink_air_core_t), from the debug link task. Enter and keying wait
 diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
 new file mode 100644
+index 0000000..c3f7da6
 --- /dev/null
 +++ b/core/radio/radio_ysf.c
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,441 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// Copyright (c) 2026 lyra XE1POC
 +// YSF conventional on a channel, the radio core's side (radio_ysf.h)
@@ -14880,6 +14895,12 @@ new file mode 100644
 +{
 +	if (eng == NULL || !ysf_engine_tx_prepare(eng))
 +		return false;
++	// DMR restarts the voice stream for every call; YSF runs it since the channel was selected, so a beep or a
++	// stream takeover can leave it stale or dead (no callback, the speaker route on, the mic flat) and every over
++	// goes out silent. Restart it here, so each over starts with a live callback and a fresh mic route;
++	// voice_tx(true) starts it again below, through source_begin's ensure_streaming.
++	ambeVoiceStop();
++	ambeVoiceStart();
 +	voice_tx(true);
 +	return true;
 +}
@@ -14936,6 +14957,7 @@ new file mode 100644
 +#endif	// CONFIG_YSF
 diff --git a/core/radio/radio_ysf.h b/core/radio/radio_ysf.h
 new file mode 100644
+index 0000000..171e907
 --- /dev/null
 +++ b/core/radio/radio_ysf.h
 @@ -0,0 +1,106 @@
@@ -15046,6 +15068,7 @@ new file mode 100644
 +
 +#endif
 diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+index f7c03d2..dbd1b61 100644
 --- a/core/ui/lang/es.po
 +++ b/core/ui/lang/es.po
 @@ -147,16 +147,6 @@ msgctxt "ALERT_BANNER_ANSWERED"
@@ -15126,6 +15149,7 @@ diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
  msgctxt "VALUE_3_MIN"
  msgid "3 min"
 diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+index e7898c7..09e7a67 100644
 --- a/core/ui/lang/fr.po
 +++ b/core/ui/lang/fr.po
 @@ -147,16 +147,6 @@ msgctxt "ALERT_BANNER_ANSWERED"
@@ -15206,6 +15230,7 @@ diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
  msgctxt "VALUE_3_MIN"
  msgid "3 min"
 diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+index 7b874a5..adbd73a 100644
 --- a/core/ui/lang/it.po
 +++ b/core/ui/lang/it.po
 @@ -147,16 +147,6 @@ msgctxt "ALERT_BANNER_ANSWERED"
@@ -15286,6 +15311,7 @@ diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
  msgctxt "VALUE_3_MIN"
  msgid "3 min"
 diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+index a2ff149..8e94399 100644
 --- a/core/ui/lang/zh.po
 +++ b/core/ui/lang/zh.po
 @@ -149,16 +149,6 @@ msgctxt "ALERT_BANNER_ANSWERED"
@@ -15366,6 +15392,7 @@ diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
  msgctxt "VALUE_3_MIN"
  msgid "3 min"
 diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index de165db..86e479f 100644
 --- a/core/ui/ui_app.c
 +++ b/core/ui/ui_app.c
 @@ -890,10 +890,11 @@ static void entry_commit(void)
@@ -15418,6 +15445,7 @@ diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
  	// key is the squelch break (#19)
  #if CONFIG_DMR
 diff --git a/core/ui/ui_dual.c b/core/ui/ui_dual.c
+index 879e44a..795932f 100644
 --- a/core/ui/ui_dual.c
 +++ b/core/ui/ui_dual.c
 @@ -176,8 +176,9 @@ static uint8_t shown_mode(const channel_t *c)
@@ -15442,6 +15470,7 @@ diff --git a/core/ui/ui_dual.c b/core/ui/ui_dual.c
  	sbuf_t b;
  	sb_init(&b, p->detail, sizeof p->detail);
 diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index dd483a4..5f3c1c8 100644
 --- a/core/ui/ui_menus.c
 +++ b/core/ui/ui_menus.c
 @@ -1301,6 +1301,12 @@ static bool ced_is_nxdn(const channel_t *ch)
@@ -15909,6 +15938,7 @@ diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
  #endif
  	case CE_TS: c->timeslot = c->timeslot == 2 ? 1 : 2; break;
 diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index 2777e92..d24ea0f 100644
 --- a/core/ui/ui_screens.c
 +++ b/core/ui/ui_screens.c
 @@ -1243,6 +1243,11 @@ static void draw_talk(const radio_view_t *v, bool label_first)
@@ -15958,6 +15988,7 @@ diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
  		return;
  	}
 diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+index 6eb337d..6fa0667 100644
 --- a/core/ui/ui_svc.h
 +++ b/core/ui/ui_svc.h
 @@ -22,6 +22,9 @@
@@ -16011,6 +16042,7 @@ diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
  bool ui_svc_write_channel_air_own(uint16_t number, const channel_t *ch, uint16_t from, const ui_air_conv_t *conv);
  #endif
 diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+index 5649533..d056deb 100644
 --- a/core/ui/ui_svc_radio.c
 +++ b/core/ui/ui_svc_radio.c
 @@ -30,6 +30,9 @@
@@ -16043,6 +16075,7 @@ diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
  	       0;
  }
 diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+index 1d4ffcb..aeeae5c 100644
 --- a/core/ui/ui_svc_storage.c
 +++ b/core/ui/ui_svc_storage.c
 @@ -54,6 +54,10 @@
@@ -16175,6 +16208,7 @@ diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
  	return write_channel_post(number, ch, from, conv, false);
 diff --git a/core/ysf/ysf_codeplug.c b/core/ysf/ysf_codeplug.c
 new file mode 100644
+index 0000000..fc5c3eb
 --- /dev/null
 +++ b/core/ysf/ysf_codeplug.c
 @@ -0,0 +1,135 @@
@@ -16315,6 +16349,7 @@ new file mode 100644
 +#endif	// CONFIG_YSF
 diff --git a/core/ysf/ysf_codeplug.h b/core/ysf/ysf_codeplug.h
 new file mode 100644
+index 0000000..02f5835
 --- /dev/null
 +++ b/core/ysf/ysf_codeplug.h
 @@ -0,0 +1,67 @@
@@ -16386,6 +16421,7 @@ new file mode 100644
 +
 +#endif
 diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
+index 0dc9f53..32c144e 100644
 --- a/core/ysf/ysf_engine.c
 +++ b/core/ysf/ysf_engine.c
 @@ -299,11 +299,11 @@ static void tx_voice_cb(void *ctx, unsigned frame_no, unsigned block, uint8_t *v
@@ -16427,7 +16463,31 @@ diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
  			view_begin(e);
  			e->view.tx_filler++;
  			view_end(e);
-@@ -404,9 +404,9 @@ static bool build_next(ysf_engine_t *e)
+@@ -390,23 +390,30 @@ static void pack_dibits(const uint8_t *frame, uint8_t *packed)
+ // 0..7, repeated while PTT is held), 9 terminator. False when the frame
+ // waits for voice. After the key, a communication frame is still built while
+ // voice the encoder already made waits in the ring: the tail of the over is
+-// sent, not dropped, and the terminator follows once the ring is empty.
++// sent, not dropped, and the terminator follows once the ring is empty. The
++// tail is at most the ring (10 blocks in sq, 5 staged: 3 frames), so past the
++// bound below the voice source is still feeding, and waiting for it would
++// hold the transmitter on until the radio is switched off: the terminator is
++// forced and the rest of the ring is dropped. A normal over drains in at most
++// 3 frames, so the bound never fires there.
++#define YSF_TX_STOP_MAX_FRAMES	10u	// communication frames built after the key, at most
+ static bool build_next(ysf_engine_t *e)
+ {
+ 	unsigned seq;
+ 
+ 	if (e->frame_no == 0)
+ 		seq = 0;	// header
+-	else if (e->tx_stop && !e->tx_ended && e->sq_n == 0 && e->stage_n == 0)
+-		seq = 9;	// terminator: no voice left to drain
++	else if (e->tx_stop && !e->tx_ended &&
++		 ((e->sq_n == 0 && e->stage_n == 0) || e->stop_frames >= YSF_TX_STOP_MAX_FRAMES))
++		seq = 9;	// terminator: no voice left to drain, or the drain is stuck
+ 	else
+ 		seq = e->frame_no;	// 1..8, communication
  	if (seq >= 1 && seq <= 8 &&
  	    (e->cfg.dt == YSF_DT_VD_MODE1 || e->cfg.dt == YSF_DT_VD_MODE2) && !stage_voice(e))
  		return false;
@@ -16439,7 +16499,16 @@ diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
  	e->dib_pos = 0;
  	if (seq == 0) {
  		e->frame_no = 1;
-@@ -440,7 +440,7 @@ static void tx_fill(void *ctx)
+@@ -415,6 +422,8 @@ static bool build_next(ysf_engine_t *e)
+ 		e->tx_ended = true;
+ 	} else {
+ 		e->frame_no = e->frame_no >= 8 ? 1 : e->frame_no + 1;
++		if (e->tx_stop && e->stop_frames < 255)
++			e->stop_frames++;
+ 	}
+ 	return true;
+ }
+@@ -440,7 +449,7 @@ static void tx_fill(void *ctx)
  		n = (uint16_t)(YSF_FRAME_DIBITS - e->dib_pos);
  		if (n > space)
  			n = space;
@@ -16448,7 +16517,7 @@ diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
  			return;
  		e->dib_pos += n;
  	}
-@@ -485,7 +485,7 @@ bool ysf_engine_begin(ysf_engine_t *e, const hal_air_t *air, const ysf_engine_cf
+@@ -485,7 +494,7 @@ bool ysf_engine_begin(ysf_engine_t *e, const hal_air_t *air, const ysf_engine_cf
  	e->txcfg.cycles = 1;
  	refresh_txcfg(e);
  	ysf_rx_init(&e->rx, &sink, e);
@@ -16457,7 +16526,16 @@ diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
  				&ops, e);
  }
  
+@@ -521,6 +530,7 @@ bool ysf_engine_tx_prepare(ysf_engine_t *e)
+ 		e->tx_started = false;
+ 		e->tx_stop = false;
+ 		e->tx_ended = false;
++		e->stop_frames = 0;
+ 		e->stage_n = 0;	// a new over: no staged frame, no queued blocks
+ 		e->sq_head = 0;
+ 		e->sq_n = 0;
 diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
+index ffc044a..43219d4 100644
 --- a/core/ysf/ysf_engine.h
 +++ b/core/ysf/ysf_engine.h
 @@ -103,8 +103,23 @@ typedef struct {
@@ -16486,7 +16564,7 @@ diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
  	uint16_t dib_pos;	// next dibit to queue from dibits[]
  	unsigned frame_no;	// next sequence frame to build (0 header, 1..8 CC, 9 terminator)
  	bool tx_started;	// the header is queued
-@@ -114,14 +129,10 @@ typedef struct {
+@@ -114,14 +129,11 @@ typedef struct {
  	bool played;		// the call in hand passes the squelch
  	volatile bool recheck;	// ysf_engine_set changed what passes it
  	volatile uint8_t seq;	// odd while the provider's task writes view
@@ -16495,6 +16573,7 @@ diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
 -	uint8_t sq[10][9];	// voice blocks from the encoder, waiting for a frame
  	uint8_t sq_head;	// next block to take from sq
  	uint8_t sq_n;		// blocks held in sq
++	uint8_t stop_frames;	// communication frames built since tx_stop: the terminator is forced past the bound
  	ysf_engine_view_t view;
 -	uint8_t frame[YSF_FRAME_BYTES];	// the framer's frame buffer ...
 -	int8_t soft[YSF_FRAME_DIBITS];	// ... and its soft values
@@ -16502,6 +16581,7 @@ diff --git a/core/ysf/ysf_engine.h b/core/ysf/ysf_engine.h
  
  // The mode for a deviation
 diff --git a/docs/feature-matrix.md b/docs/feature-matrix.md
+index ac78fe7..8d499e9 100644
 --- a/docs/feature-matrix.md
 +++ b/docs/feature-matrix.md
 @@ -49,11 +49,10 @@ is `tools/bringup.py list --radio <id>`.
@@ -16593,6 +16673,7 @@ diff --git a/docs/feature-matrix.md b/docs/feature-matrix.md
  | Talker alias receive and send | `DMR_TALKER_ALIAS` | 984 | 1,300 |  |
  | ETSI GPS Info in the embedded LC | `DMR_GPS` | 2,208 | 2,152 |  |
 diff --git a/docs/spec/channel-modes.md b/docs/spec/channel-modes.md
+index 62d9ea9..ddb92af 100644
 --- a/docs/spec/channel-modes.md
 +++ b/docs/spec/channel-modes.md
 @@ -152,6 +152,7 @@ Ids are only appended and never reused. A kind and a system type that belong tog
@@ -16604,6 +16685,7 @@ diff --git a/docs/spec/channel-modes.md b/docs/spec/channel-modes.md
  | System type | Name | Short | Built when | Spec |
  |---|---|---|---|---|
 diff --git a/docs/spec/debuglink.md b/docs/spec/debuglink.md
+index 5211dbf..5bc3283 100644
 --- a/docs/spec/debuglink.md
 +++ b/docs/spec/debuglink.md
 @@ -413,7 +413,7 @@ At most one per 20 ms (busy otherwise; the radio core's queue holds 16).
@@ -16624,6 +16706,7 @@ diff --git a/docs/spec/debuglink.md b/docs/spec/debuglink.md
  Op 23 (`DL_OP_TONE_BURST`) now gives the error beep when refused on a DMR channel, in hotspot mode or without
  `tx_tone`, instead of silently doing nothing.
 diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index f83df99..23bb51d 100644
 --- a/docs/spec/radio-features.md
 +++ b/docs/spec/radio-features.md
 @@ -37,7 +37,7 @@ quick changes therefore never reads back a value from before its own last change
@@ -16692,6 +16775,7 @@ diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
  | TOT warning | 1000 Hz 100 ms twice | 3.2, unless Settings > Sound > TOT warning tone is off (settings area key 0x0004) |
 diff --git a/docs/spec/ysf-codeplug.md b/docs/spec/ysf-codeplug.md
 new file mode 100644
+index 0000000..1ee15db
 --- /dev/null
 +++ b/docs/spec/ysf-codeplug.md
 @@ -0,0 +1,103 @@
@@ -16799,9 +16883,26 @@ new file mode 100644
 +A zone share carries a YSF channel's tag as it is ([zone-share.md](zone-share.md) 4.2): the block is 13 octets,
 +inside the share's limit of 64.
 diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
+index 04cc73e..3da26e2 100644
 --- a/docs/spec/ysf.md
 +++ b/docs/spec/ysf.md
-@@ -165,12 +165,18 @@ any call starts; a DG-ID change mid-call ends the old call.
+@@ -154,7 +154,14 @@ provider's queue holds more than its lead (60 ms plus one chunk); once the
+ queue runs short, silence goes instead. After the key, a communication
+ frame is still built while voice the encoder already made waits in the
+ ring, so the tail of the over is sent, not dropped, and the terminator
+-follows once the ring is empty.
++follows once the ring is empty. The tail is at most the ring (10 blocks in
++sq, 5 staged: 3 frames), so past 10 communication frames after the key the
++terminator is forced and the rest of the ring is dropped: a voice source
++that never stops cannot hold the transmitter on. The voice stream is
++restarted at every transmission (the DMR call does the same), so each over
++starts with a live audio callback and a fresh microphone route: the stream
++otherwise runs since the channel was selected, and a beep or a stream
++takeover can leave it stale or dead and every over goes out silent.
+ 
+ ## 6. DG-ID squelch
+ 
+@@ -165,12 +172,18 @@ any call starts; a DG-ID change mid-call ends the old call.
  
  ## 7. Not written
  
@@ -16825,6 +16926,7 @@ diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
 +radio-wide identity record (source, downlink and uplink call signs). The
 +web editor's `mode_ysf.js` is still to be written against that format.
 diff --git a/docs/spec/zone-share.md b/docs/spec/zone-share.md
+index 9606eba..334e556 100644
 --- a/docs/spec/zone-share.md
 +++ b/docs/spec/zone-share.md
 @@ -106,8 +106,8 @@ codeplug is sent: no scan lists, no RX group lists, no privacy keys.
@@ -16839,6 +16941,7 @@ diff --git a/docs/spec/zone-share.md b/docs/spec/zone-share.md
  octet. Kinds' and system types' bytes are opaque here: their mode modules read them.
  
 diff --git a/docs/user/04-programming.md b/docs/user/04-programming.md
+index 7479184..27b42b4 100644
 --- a/docs/user/04-programming.md
 +++ b/docs/user/04-programming.md
 @@ -126,7 +126,7 @@ DMR channel, and comes back from one as that. Keep a codeplug file for them.
@@ -16867,6 +16970,7 @@ diff --git a/docs/user/04-programming.md b/docs/user/04-programming.md
  
  | Field | Meaning |
 diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index 06f7a3f..b41c77d 100644
 --- a/docs/user/07-channels-zones-vfo.md
 +++ b/docs/user/07-channels-zones-vfo.md
 @@ -288,8 +288,8 @@ In the VFO, **\***, **5** (**\***, **6** in the DMR VFO) is **TX freq** (the spl
@@ -16929,6 +17033,7 @@ diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vf
  
  Press **OK**, **4**, then **OK** on the VFO row again ("Back to channels"). Or pick a zone or channel. A **VFO/MR** key
 diff --git a/hal/hal_radio.h b/hal/hal_radio.h
+index f995c94..0403e5e 100644
 --- a/hal/hal_radio.h
 +++ b/hal/hal_radio.h
 @@ -8,9 +8,10 @@
@@ -16946,6 +17051,7 @@ diff --git a/hal/hal_radio.h b/hal/hal_radio.h
  
  typedef enum { TONE_NONE, TONE_CTCSS, TONE_DCS, TONE_DCS_INV } tone_type_t;
 diff --git a/site/i18n/en.json b/site/i18n/en.json
+index bf3eebd..e35ca7e 100644
 --- a/site/i18n/en.json
 +++ b/site/i18n/en.json
 @@ -2241,5 +2241,25 @@
@@ -16976,6 +17082,7 @@ diff --git a/site/i18n/en.json b/site/i18n/en.json
 + "editor.problem.ysf_dest_chars": "Use up to 10 printable ASCII characters."
  }
 diff --git a/site/i18n/es.json b/site/i18n/es.json
+index de5d9e0..c5a8494 100644
 --- a/site/i18n/es.json
 +++ b/site/i18n/es.json
 @@ -2241,5 +2241,25 @@
@@ -17006,6 +17113,7 @@ diff --git a/site/i18n/es.json b/site/i18n/es.json
 + "editor.problem.ysf_dest_chars": "Usa hasta 10 caracteres ASCII imprimibles."
  }
 diff --git a/site/i18n/it.json b/site/i18n/it.json
+index 4c6ae92..fc85eb8 100644
 --- a/site/i18n/it.json
 +++ b/site/i18n/it.json
 @@ -2241,5 +2241,25 @@
@@ -17036,6 +17144,7 @@ diff --git a/site/i18n/it.json b/site/i18n/it.json
 + "ysf_dest_chars": "Usa fino a 10 caratteri ASCII stampabili."
  }
 diff --git a/site/i18n/zh.json b/site/i18n/zh.json
+index c31b6b6..6c8382f 100644
 --- a/site/i18n/zh.json
 +++ b/site/i18n/zh.json
 @@ -2241,5 +2241,25 @@
@@ -17067,6 +17176,7 @@ diff --git a/site/i18n/zh.json b/site/i18n/zh.json
  }
 diff --git a/site/static/js/codeplug/mode_ysf.js b/site/static/js/codeplug/mode_ysf.js
 new file mode 100644
+index 0000000..deefb72
 --- /dev/null
 +++ b/site/static/js/codeplug/mode_ysf.js
 @@ -0,0 +1,108 @@
@@ -17179,6 +17289,7 @@ new file mode 100644
 +	},
 +};
 diff --git a/site/static/js/codeplug/modes.js b/site/static/js/codeplug/modes.js
+index deed9d4..1cca71e 100644
 --- a/site/static/js/codeplug/modes.js
 +++ b/site/static/js/codeplug/modes.js
 @@ -11,6 +11,7 @@
@@ -17198,6 +17309,7 @@ diff --git a/site/static/js/codeplug/modes.js b/site/static/js/codeplug/modes.js
  
  export const SYSTEM_TYPES = [
 diff --git a/site/tests/modes.test.mjs b/site/tests/modes.test.mjs
+index 1e8dfb6..2b1b944 100644
 --- a/site/tests/modes.test.mjs
 +++ b/site/tests/modes.test.mjs
 @@ -449,6 +449,78 @@ test("vectors: NXDN conventional block, unit ID record", () => {
@@ -17280,6 +17392,7 @@ diff --git a/site/tests/modes.test.mjs b/site/tests/modes.test.mjs
  function nxdnSample() {
  	const m = empty();
 diff --git a/tests/hil/features.toml b/tests/hil/features.toml
+index f85ed71..7aec6fa 100644
 --- a/tests/hil/features.toml
 +++ b/tests/hil/features.toml
 @@ -99,6 +99,12 @@ spec = "docs/spec/nxdn.md"
@@ -17296,6 +17409,7 @@ diff --git a/tests/hil/features.toml b/tests/hil/features.toml
  [feature.air_aes]
  switch = "AIR_AES"
 diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 602e461..8aa3b65 100644
 --- a/tests/host/Makefile
 +++ b/tests/host/Makefile
 @@ -343,6 +343,19 @@ radioCoreTestNxdn: $(RCNXDN) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dm
@@ -17355,6 +17469,7 @@ diff --git a/tests/host/Makefile b/tests/host/Makefile
  # rename, delete, a new channel added in one step, the limits
  ZEDIT   := $(CORE)/codeplug/zone_edit.c $(CORE)/codeplug/zone_shift.c $(CORE)/codeplug/zone_settle.c $(CPEDIT) \
 diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 616cfb0..c570ffd 100644
 --- a/tests/host/radioCoreTest.c
 +++ b/tests/host/radioCoreTest.c
 @@ -2018,7 +2018,7 @@ static void test_vfo_dmr(void)
@@ -17399,6 +17514,7 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  void radio_req_scan_dual(uint16_t pos) { (void)pos; }
  void radio_req_zone_pos(uint16_t pos) { req(RREQ_ZONE_POS, pos); }
 diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 7b99303..a116b94 100644
 --- a/tests/host/sim/ui_sim.c
 +++ b/tests/host/sim/ui_sim.c
 @@ -3053,14 +3053,15 @@ static bool run_token(char *t, char *err, size_t len)
@@ -17436,6 +17552,7 @@ diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
  			snprintf(err, len, "no room for %s", t);
 diff --git a/tests/host/ysfCodeplugTest.c b/tests/host/ysfCodeplugTest.c
 new file mode 100644
+index 0000000..a91d9cf
 --- /dev/null
 +++ b/tests/host/ysfCodeplugTest.c
 @@ -0,0 +1,306 @@
@@ -17745,7 +17862,70 @@ new file mode 100644
 +	printf("ysfCodeplugTest: all passed\n");
 +	return 0;
 +}
+diff --git a/tests/host/ysfEngineTest.c b/tests/host/ysfEngineTest.c
+index 961f93b..c401b59 100644
+--- a/tests/host/ysfEngineTest.c
++++ b/tests/host/ysfEngineTest.c
+@@ -159,6 +159,7 @@ typedef struct {
+ 	uint16_t nvoice;
+ 	uint8_t enc[VMAX][9];
+ 	uint16_t enc_made, enc_taken;
++	bool stuck;		// the encoder never stops: h_tx_voice keeps returning blocks after the key
+ 	uint8_t data[16][20];
+ 	uint8_t data_len[16];
+ 	uint16_t ndata;
+@@ -189,6 +190,10 @@ static bool h_tx_voice(uint8_t vch[9], void *ctx)
+ {
+ 	radio_t *x = ctx;
+ 
++	if (x->stuck) {
++		memcpy(vch, silence, 9);	// the encoder never stops: blocks keep coming after the key
++		return true;
++	}
+ 	if (x->enc_taken == x->enc_made)
+ 		return false;
+ 	memcpy(vch, x->enc[x->enc_taken++], 9);
+@@ -351,6 +356,38 @@ static void testCall(uint8_t dt, bool narrow)
+ 	CHECK(r[1].starts == 1 && r[1].ends == 1 && check_order(&r[1], &r[0], &first) == 0,
+ 	      "%s: stall: starts %u ends %u", name, r[1].starts, r[1].ends);
+ 
++	// The encoder never stops after the key: the terminator is forced past the bound, so the over still ends
++	// (without it the transmitter would stay on until the radio is switched off)
++	r[1].starts = r[1].ends = 0;
++	r[1].nvoice = 0;
++	r[1].ndata = 0;
++	r[0].enc_made = r[0].enc_taken = 0;
++	r[0].stuck = false;
++	CHECK(ysf_engine_tx_prepare(&r[0].e), "prime");
++	prov[0].keyed = true;
++	CHECK(ysf_engine_tx_go(&r[0].e), "go");
++	for (n = 0; n < 600; n++) {
++		if (n == 100) {
++			ysf_engine_tx_stop(&r[0].e);
++			r[0].stuck = true;	// the voice source keeps feeding after the key
++		}
++		if (n < 100)
++			encode(&r[0], (uint8_t)(1 + (n & 1)));
++		steps(1);
++		if (ysf_engine_tx_state(&r[0].e) == AIR_TX_DONE) {
++			prov[0].keyed = false;
++			ysf_engine_tx_clear(&r[0].e);
++			break;
++		}
++	}
++	steps(20);
++	CHECK(n > 100 && n < 170 && prov[0].underruns == 0,
++	      "%s: stuck encoder: the over ended %u periods after 100, underruns %u", name, n,
++	      prov[0].underruns);
++	CHECK(r[1].starts == 1 && r[1].ends == 1 && check_order(&r[1], &r[0], &first) == 0,
++	      "%s: stuck encoder: starts %u ends %u", name, r[1].starts, r[1].ends);
++	r[0].stuck = false;
++
+ 	// Late entry: radio 1 opens its session 1 s into the over. Its voice starts at a frame's end, in order (the
+ 	// queue's lead of about 90 ms puts the frame on air at 990 ms a few blocks back)
+ 	ysf_engine_end(&r[1].e);
 diff --git a/tests/vectors/channel-modes.txt b/tests/vectors/channel-modes.txt
+index 1bfabe7..055a4cf 100644
 --- a/tests/vectors/channel-modes.txt
 +++ b/tests/vectors/channel-modes.txt
 @@ -1,6 +1,6 @@
@@ -17788,6 +17968,7 @@ diff --git a/tests/vectors/channel-modes.txt b/tests/vectors/channel-modes.txt
 +ysfident 202020202020202020202020202020202020202020202020202020202020 - - -
 +ysfident 584531415253202020205845314152532020202020202020202020202020 XE1ARS XE1ARS -
 diff --git a/tools/rfoundry_debug.py b/tools/rfoundry_debug.py
+index 9af0ef8..7535380 100644
 --- a/tools/rfoundry_debug.py
 +++ b/tools/rfoundry_debug.py
 @@ -15,12 +15,15 @@
