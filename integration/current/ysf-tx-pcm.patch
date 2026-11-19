@@ -1,0 +1,226 @@
+diff --git a/core/debuglink/debuglink_view_ysf.c b/core/debuglink/debuglink_view_ysf.c
+index e5ed7b9..a997729 100644
+--- a/core/debuglink/debuglink_view_ysf.c
++++ b/core/debuglink/debuglink_view_ysf.c
+@@ -42,7 +42,8 @@ void debuglink_view_ysf(const radio_view_t *v, dl_text_t *t)
+ 		(unsigned)c.tx_filler);
+ 	dl_text(t, "ysf.rx_rejects=%u\nysf.frames=%u\nysf.voice=%u\nysf.rx_chunks=%u\n",
+ 		(unsigned)c.rx_rejects, (unsigned)c.frames, (unsigned)c.voice, (unsigned)c.rx_chunks);
+-	dl_text(t, "ysf.tx_underruns=%u\nysf.tx_syms=%u\n", (unsigned)c.tx_underruns, (unsigned)c.tx_syms);
++	dl_text(t, "ysf.tx_underruns=%u\nysf.tx_syms=%u\nysf.tx_pcm_fails=%u\n",
++		(unsigned)c.tx_underruns, (unsigned)c.tx_syms, (unsigned)c.tx_pcm_fails);
+ #else
+ 	(void)v;
+ 	dl_text(t, "ysf.built=0\n");
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index 3c9ad56..c9620f0 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -34,6 +34,7 @@ static const radio_ysf_settings_t defaults = {
+ };
+ static radio_ysf_settings_t set;
+ static ysf_engine_t *eng;		// while running
++static bool tx_ambe_ready;		// radio task publishes it to the provider task
+ static radio_ysf_stats_t stats;
+ static uint32_t rx_calls_base, tx_calls_base, filler_base, rejects_base, frames_base, voice_base;
+ static air_session_stats_t air_base;
+@@ -186,7 +187,7 @@ static bool v_tx(uint8_t vch[9], void *ctx)
+ 	const dmr_voice_source_t *s = ambeVoiceSource();
+ 
+ 	(void)ctx;
+-	return s->next(vch, s->ctx);
++	return __atomic_load_n(&tx_ambe_ready, __ATOMIC_ACQUIRE) && s->next(vch, s->ctx);
+ }
+ 
+ static const ysf_engine_hooks_t voice_hooks = { .rx_start = v_start, .rx_voice = v_voice, .rx_end = v_end,
+@@ -337,6 +338,7 @@ void radio_ysf_end(void)
+ 	if (eng == NULL)
+ 		return;
+ 	ysf_engine_end(eng);	// the provider closed: no hook runs after this
++	__atomic_store_n(&tx_ambe_ready, false, __ATOMIC_RELEASE);
+ 	voice_end(eng->cfg.dt == YSF_DT_VOICE_FR);
+ 	eng = NULL;
+ }
+@@ -477,25 +479,41 @@ static bool ysf_no_tx(void)
+ 	return eng != NULL && (eng->session.fit & AIR_FIT_TX) == 0;
+ }
+ 
++static bool ambe_mode(void)
++{
++	return eng->cfg.dt == YSF_DT_VD_MODE1 || eng->cfg.dt == YSF_DT_VD_MODE2;
++}
++
+ static bool ysf_tx_prepare(void)
+ {
+ 	if (eng == NULL || !ysf_engine_tx_prepare(eng))
+ 		return false;
+-	// DMR restarts the voice stream for every call; YSF runs it since the channel was selected, so a beep or a
+-	// stream takeover can leave it stale or dead (no callback, the speaker route on, the mic flat) and every over
+-	// goes out silent. Restart it here, so each over starts with a live callback and a fresh mic route;
+-	// voice_tx(true) starts it again below, through source_begin's ensure_streaming.
+-	if (eng->cfg.dt != YSF_DT_VOICE_FR) {
++	if (ambe_mode()) {
++		// Close the RX audio stream while the modem still owns the RX PCM path.
+ 		ambeVoiceStop();
+-		ambeVoiceStart();
++	} else if (eng->cfg.dt == YSF_DT_VOICE_FR) {
++		voice_tx(true);
+ 	}
+-	voice_tx(true);
+ 	return true;
+ }
+ 
+ static bool ysf_tx_go(void)
+ {
+-	return eng != NULL && ysf_engine_tx_go(eng);
++	if (eng == NULL || !ysf_engine_tx_go(eng))
++		return false;
++	if (ambe_mode()) {
++		// The provider has switched from RX to the TX PHY. Start microphone
++		// PCM now so its buffer, interrupt and encoder belong to this call.
++		voice_tx(true);
++		if (!ambeVoiceStreaming()) {
++			voice_tx(false);
++			stats.tx_pcm_fails++;
++			ysf_engine_tx_abort(eng);
++			return false;
++		}
++		__atomic_store_n(&tx_ambe_ready, true, __ATOMIC_RELEASE);
++	}
++	return true;
+ }
+ 
+ static void ysf_tx_stop(void)
+@@ -509,6 +527,7 @@ static void ysf_tx_stop(void)
+ static void ysf_tx_abort(void)
+ {
+ 	if (eng != NULL) {
++		__atomic_store_n(&tx_ambe_ready, false, __ATOMIC_RELEASE);
+ 		voice_tx(false);
+ 		ysf_engine_tx_abort(eng);
+ 	}
+@@ -522,8 +541,14 @@ static uint8_t ysf_tx_state(void)
+ static void ysf_tx_clear(void)
+ {
+ 	if (eng != NULL) {
++		__atomic_store_n(&tx_ambe_ready, false, __ATOMIC_RELEASE);
+ 		voice_tx(false);
+ 		ysf_engine_tx_clear(eng);
++		if (ambe_mode()) {
++			// The radio is back in RX. Re-arm PCM for the next incoming call.
++			ambeVoiceStop();
++			ambeVoiceStart();
++		}
+ 	}
+ }
+ 
+diff --git a/core/radio/radio_ysf.h b/core/radio/radio_ysf.h
+index 171e907..a7e6477 100644
+--- a/core/radio/radio_ysf.h
++++ b/core/radio/radio_ysf.h
+@@ -56,6 +56,7 @@ typedef struct {
+ 	uint32_t rx_calls, tx_calls, tx_filler, rx_rejects;	// the engine's
+ 	uint32_t frames, voice;		// the frames decoded and the voice blocks played
+ 	uint32_t rx_chunks, tx_underruns, tx_syms;	// the session's
++	uint32_t tx_pcm_fails;	// PCM stream could not start after entering the TX PHY
+ 	uint32_t begins, begin_fails;	// engine starts, and the ones the provider refused (no provider, no fit, no memory)
+ } radio_ysf_stats_t;
+ 
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index c570ffd..1f2c0bc 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -167,7 +167,21 @@ static struct {
+ 	audio_block_cb_t cb;
+ 	void *ctx;
+ } aud;
+-static bool a_start(audio_block_cb_t cb, void *ctx) { aud.cb = cb; aud.ctx = ctx; aud.started = true; aud.starts++; return true; }
++#if CONFIG_YSF
++static bool ysf_clock_handoff, ysf_audio_start_fail;
++#endif
++static bool a_start(audio_block_cb_t cb, void *ctx)
++{
++#if CONFIG_YSF
++	if (ysf_audio_start_fail)
++		return false;
++#endif
++	aud.cb = cb;
++	aud.ctx = ctx;
++	aud.started = true;
++	aud.starts++;
++	return true;
++}
+ static void a_stop(void) { aud.started = false; aud.stops++; }
+ static void a_pcm(bool on) { aud.pcm = on; }
+ static const hal_audio_t fake_audio = { .start = a_start, .stop = a_stop, .speaker_pcm = a_pcm };
+@@ -430,7 +444,20 @@ static bool air_open(uint8_t i, air_event_cb_t cb, void *ctx)
+ 	return true;
+ }
+ static void air_close(uint8_t i) { fair[i].open = fair[i].on = false; fair[i].cb = NULL; fair[i].qn = 0; fair[i].closes++; }
+-static bool air_begin(uint8_t i) { if (fair[i].qn == 0 || !fair[i].open) return false; fair[i].on = true; fair[i].started = false; fair[i].begins++; return true; }
++static bool air_begin(uint8_t i)
++{
++	if (fair[i].qn == 0 || !fair[i].open)
++		return false;
++#if CONFIG_YSF
++	// Model an audio clock handoff that invalidates a stream opened before the TX PHY.
++	if (i == 0 && ysf_clock_handoff)
++		aud.started = false;
++#endif
++	fair[i].on = true;
++	fair[i].started = false;
++	fair[i].begins++;
++	return true;
++}
+ static bool air_queue(uint8_t i, const air_tx_chunk_t *c)
+ {
+ 	if (fair[i].qn == AIR_DEPTH) {
+@@ -10312,6 +10339,38 @@ static void test_t3_stun(void)
+ }
+ #endif
+ 
++#if CONFIG_YSF
++static void test_ysf_pcm_handoff(void)
++{
++	dmr_start(true);
++	sm.set.talk_permit = false;
++	CHECK(debuglink_radio_feature_op(DL_OP_DMR_FIELDS, (const uint8_t[]){ RADIO_MODE_YSF, 0xFF, 0 }, 3) == DL_ST_OK);
++	CHECK(radio_ysf_running());
++	aud.feed = true;
++	ambeVoiceResetStats();
++	ysf_clock_handoff = true;
++	req(RREQ_PTT, 1);
++	run(450);
++	ambe_voice_stats_t voice;
++	ambeVoiceGetStats(&voice);
++	CHECK(sm.view.state == RS_TX && aud.started && voice.tx_frames >= 10);
++	req(RREQ_PTT, 0);
++	run(500);
++	CHECK(!hw.keyed && aud.started);
++
++	// A failed PCM restart must not leave the RF provider sending silence.
++	ysf_audio_start_fail = true;
++	req(RREQ_PTT, 1);
++	run(450);
++	CHECK(!hw.keyed && !fair[0].on && sm.view.tx_deny != TXDENY_NONE);
++	req(RREQ_PTT, 0);
++	ysf_audio_start_fail = false;
++	ysf_clock_handoff = false;
++	run(100);
++	aud.feed = false;
++}
++#endif
++
+ int main(void)
+ {
+ 	test_tx_limit_op();
+@@ -10426,6 +10485,9 @@ int main(void)
+ 	test_dmr_data_glue();	// (last: the data service's state carries over)
+ 	test_factory_reset();
+ 	test_volume_step_of();
++#if CONFIG_YSF
++	test_ysf_pcm_handoff();
++#endif
+ 	printf("# radioCoreTest: %d checks, %s\n", checks, failures ? "FAILED" : "PASSED");
+ 	return failures != 0;
+ }

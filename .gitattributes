@@ -5,3 +5,4 @@ experiments/codec/results/portability.patch -whitespace
 integration/current/channel-aes-ysf.patch -whitespace
 tools/patches/dsd-fme-ysf-vd1-audio.patch -whitespace
 integration/current/vfo-rx-bands.patch -whitespace
+integration/current/ysf-tx-pcm.patch -whitespace

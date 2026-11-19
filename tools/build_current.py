@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PIN = 'e89121e97a314f0ddd0475f848713ba10710d7db'
 UPSTREAM = 'https://github.com/RadioFoundry/RadioFoundry.git'
 PATCH_DIR = ROOT / 'integration/current'
-PATCHES = ('base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch')
+PATCHES = ('base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch', 'ysf-tx-pcm.patch')
 
 
 def run(*args, cwd=None):
