@@ -24,6 +24,7 @@ PATCHES = (
 	'vfo-digital.patch',
 	'dmr-motorola-privacy.patch',
 	'digital-repeater-interop.patch',
+	'ysf-dn-narrow.patch',
 )
 
 

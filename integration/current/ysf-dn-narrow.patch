@@ -1,0 +1,105 @@
+diff --git a/core/ysf/ysf_codeplug.c b/core/ysf/ysf_codeplug.c
+index b9e70c4..66cc3d9 100644
+--- a/core/ysf/ysf_codeplug.c
++++ b/core/ysf/ysf_codeplug.c
+@@ -48,7 +48,9 @@ void ysf_conv_decode(const uint8_t *b, int len, ysf_conv_t *out)
+ 	uint8_t tx = len >= 3 ? b[2] : 0u;
+ 
+ 	out->dt = (uint8_t)(f & YSF_CP_DT_MASK);
+-	out->narrow = (f & YSF_CP_NARROW) != 0;
++	// A zeroed block is the default: V/D mode 1, which is a narrow mode (Yaesu 4.2.1: the V/D modes and DN
++	// are narrow, 1350 Hz; only Voice FR (VW) is wide, 2700 Hz). A stored Wide bit is still honored.
++	out->narrow = (f & YSF_CP_NARROW) != 0 || f == 0;
+ 	if (rx > YSF_CP_DGID_MAX)
+ 		rx = 0;			// any DG-ID
+ 	out->rx_dgid = rx;
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index 664ad4b..2f8f561 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -29,7 +29,7 @@ static ysf_engine_t own_mem;
+ #endif
+ 
+ static const radio_ysf_settings_t defaults = {
+-	.dt = YSF_DT_VD_MODE1, .narrow = false, .rx_dgid = 0, .tx_dgid = 0,
++	.dt = YSF_DT_VD_MODE1, .narrow = true, .rx_dgid = 0, .tx_dgid = 0,
+ 	.dest = YSF_CP_DEST_ALL, .src = "", .down = "", .up = "",
+ };
+ static radio_ysf_settings_t set;
+diff --git a/docs/spec/ysf-codeplug.md b/docs/spec/ysf-codeplug.md
+index 197214f..6797e58 100644
+--- a/docs/spec/ysf-codeplug.md
++++ b/docs/spec/ysf-codeplug.md
+@@ -40,7 +40,7 @@ The tag ([channel-modes.md](channel-modes.md) 2): no system, flag bit 0 transmit
+ | 2 | 1 | TX DG-ID: bit 7 set = bits 6-0 hold it (0 to 127); clear = the RX DG-ID |
+ | 3 | 10 | Destination call sign (Dest), 10 ASCII, space padded; all spaces (or all zero) reads as `ALL` |
+ 
+-A zeroed block, or none, is V/D mode 1, Wide deviation, any DG-ID received and DG-ID 0 (none) sent, destination
++A zeroed block, or none, is V/D mode 1, Narrow deviation, any DG-ID received and DG-ID 0 (none) sent, destination
+ `ALL`; with the tag's flag bit 0 clear, receive only. A block shorter than 13 octets reads with its missing fields
+ at their defaults (a short destination reads with the missing characters as spaces). Both deviations use 12.5 kHz
+ channel settings ([ysf.md](ysf.md) 1).
+@@ -72,7 +72,10 @@ DT is what the channel transmits, and the voice path it expects: V/D mode 1 and
+ AMBE+2 parameter bits per 20 ms block), Data FR carries data, Voice FR carries full-rate voice, which this build
+ receives and sends with the voice blocks zero ([ysf.md](ysf.md) 4). Reception takes any DT: a frame's own DT
+ decides its voice path. Dev is the deviation of the channel, Wide (2700 Hz) or Narrow (1350 Hz), for transmit and
+-receive alike. A new DT or a new deviation is a new session: the engine starts over.
++receive alike. A new DT or a new deviation is a new session: the engine starts over. The standard pairs data type
++and deviation (Yaesu 4.2.1): V/D mode 1, Data FR and DN (V/D mode 2) are narrow (1350 Hz); only Voice FR (VW) is
++wide (2700 Hz). A zeroed block reads as Narrow, the deviation of its V/D mode 1 data type; a stored deviation is
++honored as written, and the editor defaults a new channel to the deviation of its data type.
+ 
+ ### 2.3 Call signs
+ 
+diff --git a/tests/vectors/channel-modes.txt b/tests/vectors/channel-modes.txt
+index 055a4cf..01aa4a3 100644
+--- a/tests/vectors/channel-modes.txt
++++ b/tests/vectors/channel-modes.txt
+@@ -120,16 +120,16 @@ nxdnunit 30 3E8 3E8
+ 
+ #
+ # ysfconv <block> <data type> <narrow 0|1> <RX DG-ID> <TX DG-ID> <destination>: decoding a YSF channel's block
+-ysfconv - 0 0 0 0 ALL
+-ysfconv 00000020202020202020202020 0 0 0 0 ALL
++ysfconv - 0 1 0 0 ALL
++ysfconv 00000020202020202020202020 0 1 0 0 ALL
+ ysfconv 010000414C4C20202020202020 1 0 0 0 ALL
+ ysfconv 067F8558453141525320202020 2 1 7F 5 XE1ARS
+ ysfconv 030A0043512020202020202020 3 0 A A CQ
+-ysfconv 00FF00414C4C20202020202020 0 0 0 0 ALL
++ysfconv 00FF00414C4C20202020202020 0 1 0 0 ALL
+ ysfconv 02 2 0 0 0 ALL
+-ysfconv 000A80584531 0 0 A 0 XE1
++ysfconv 000A80584531 0 1 A 0 XE1
+ ysfconv 0400FF414C4C20202020202020 0 1 0 7F ALL
+-ysfconv 00000000FF2020202020202020 0 0 0 0 ALL
++ysfconv 00000000FF2020202020202020 0 1 0 0 ALL
+ #
+ # ysfenc <data type> <narrow> <RX DG-ID> <TX DG-ID> <destination> <block>: encoding
+ ysfenc 0 0 0 0 ALL 000000414C4C20202020202020
+diff --git a/tests/host/ysfCodeplugTest.c b/tests/host/ysfCodeplugTest.c
+index a91d9cf..18d04e4 100644
+--- a/tests/host/ysfCodeplugTest.c
++++ b/tests/host/ysfCodeplugTest.c
+@@ -179,7 +179,7 @@ static void test_conv_load(void)
+ 	t.flags = 0;
+ 	CHECK(codeplug_tag_write(11, "Zeroed", &t, NULL, 0));
+ 	CHECK(codeplug_channel(11, &c) && c.kind == CODEPLUG_KIND_YSF && c.rx_only);
+-	CHECK(ysf_conv_load(11, &c, &cfg) && cfg.conv.dt == YSF_DT_VD_MODE1 && !cfg.conv.narrow &&
++	CHECK(ysf_conv_load(11, &c, &cfg) && cfg.conv.dt == YSF_DT_VD_MODE1 && cfg.conv.narrow &&
+ 	      cfg.conv.rx_dgid == 0 && cfg.conv.tx_dgid == 0 && strcmp(cfg.conv.dest, YSF_CP_DEST_ALL) == 0);
+ 	// A longer block from a newer writer: the fields known read as usual
+ 	uint8_t longer[16] = { 0x06, 0x7F, 0x85, 'X', 'E', '1', 'A', 'R', 'S', ' ', ' ', ' ', ' ', 1, 2, 3 };
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index d323a37..4f9cc50 100644
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -404,7 +404,7 @@ is YSF (C4FM) conventional voice and data, Wide or Narrow deviation, through the
+ Host tested only: it has not been tried on air against a real YSF radio yet.
+ 
+ - It hears voice calls on every DG-ID, to every destination. Data calls are dropped for now.
+-- PTT sends a voice call to ALL with DG-ID 0 in V/D-1, Wide deviation, from your source call sign (blank until set).
++- PTT sends a voice call to ALL with DG-ID 0 in V/D-1, Narrow deviation, from your source call sign (blank until set).
+ - Home shows "YSF", what PTT calls ("ALL") and the DG-ID and data type ("DG 0 V/D-1"). During a call it shows who
+   calls and where, or why the call isn't played. FM's tone and width tiles say "FM only: this is YSF".
+ - The data type, the DG-IDs, the deviation and the call signs can be changed only from a computer for now
