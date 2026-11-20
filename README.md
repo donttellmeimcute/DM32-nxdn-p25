@@ -125,6 +125,14 @@ DMR AES-256 group calls were verified over the air in both directions with stock
 
 GPL-3.0-or-later, RadioFoundry code MIT.
 
+**MDC-1200 ID on FM channels:** an FM channel can send its 4-digit hex unit ID when a transmission starts,
+ends or both, and can decode the IDs it receives (shown under the signal meter, then as the last ID heard). The settings
+are per channel (ID type, Send ID, Own ID, Decode IDs on the radio; the web CPS and CSV carry the same fields). It is
+three patches on top of the others, `integration/current/mdc1200-ptt-id.patch`, `mdc1200-decode.patch` and
+`mdc1200-editor.patch` (firmware only for the first two; the third changes only `site/`), and off unless built with
+`CONFIG_MDC1200=y`. `tools/build_current.py` builds it in by default; `python3 tools/build_current.py --no-mdc1200` leaves it
+out. Tested on a DM-32UV against Motorola and Kenwood radios.
+
 **Support:** want firmware for another radio? Gift one from my wishlist and I can port it:
 <https://throne.com/lyraarsgoetia> · Support development on Ko-fi: <https://ko-fi.com/lyraarsgoetia>
 Donations support development time. The firmware is free (GPL-3.0-or-later): supporting does not buy the firmware, early access, or the AMBE codec, which is not distributed here and still comes from your own radio.

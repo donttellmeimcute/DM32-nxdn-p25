@@ -77,6 +77,17 @@ already includes the RTOS heap. The composer reuses the message-view scratch buf
 is 8 bytes. The build has zero compiler warnings, and the static stack check passes (least free: idle task, 136
 bytes). No on-radio heap measurement or over-the-air message test was performed for this change.
 
+With the MDC-1200 PTT ID and decoding (`integration/current/mdc1200-*.patch`, on upstream fa76000) the image
+built by `tools/build_current.py` uses **720,972 bytes of flash** and **205,672 of 211,456 bytes of static RAM** (5,784
+bytes unallocated). The same build with `--no-mdc1200` uses 718,404 bytes of flash and 205,616 bytes of RAM, so the
+feature costs 2,568 bytes of flash and 56 bytes of RAM (the record fields and editor rows stay in either way). The
+feature is off in the patches themselves (`CONFIG_MDC1200` defaults to `n`), but `tools/build_current.py` builds it in
+unless given `--no-mdc1200`, so the images built from this repository, the CI's included, carry it. The burst's tones use
+the idle APRS transmit buffer, and the decoder's state and sample buffer are the idle APRS demodulator's; static
+assertions check their size and alignment. While the decoder runs, the board's 2 KB receive audio ring comes from the
+RTOS heap, as on the APRS frequency. The build's stack check passes. Its processor load (about 7,200 14-tap
+correlations a second) is not measured on the radio.
+
 The figures and feature comparisons below are the earlier November 13 snapshot, before the added tones, theme,
 APRS, and message editor.
 

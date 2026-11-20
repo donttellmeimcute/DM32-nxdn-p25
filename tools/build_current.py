@@ -26,6 +26,10 @@ PATCHES = (
 	'digital-repeater-interop.patch',
 	'ysf-dn-narrow.patch',
 	'unified-tx-splash.patch',
+	# MDC-1200 ID on FM channels (the firmware, then the web editor); off unless CONFIG_MDC1200=y
+	'mdc1200-ptt-id.patch',
+	'mdc1200-decode.patch',
+	'mdc1200-editor.patch',
 )
 
 
@@ -60,6 +64,7 @@ def main():
 	ap.add_argument('--tree', type=Path, default=ROOT / 'build/current')
 	ap.add_argument('--cross', default=os.environ.get('CROSS', str(ROOT / 'toolchain/bin/csky-elf-')))
 	ap.add_argument('--jobs', type=int, default=min(os.cpu_count() or 2, 8))
+	ap.add_argument('--no-mdc1200', action='store_true', help='build with CONFIG_MDC1200=n (MDC-1200 ID on FM channels)')
 	args = ap.parse_args()
 	tree = args.tree.resolve()
 	prepare(tree)
@@ -67,7 +72,8 @@ def main():
 	version = out('git', 'rev-parse', '--short=8', 'HEAD', cwd=ROOT)
 	git_time = out('git', 'log', '-1', '--format=%ct', 'HEAD', cwd=ROOT)
 	run('make', '-j%d' % args.jobs, 'BOARD=dm32', 'CROSS=' + args.cross, 'BUILD=build/dm32', 'GITVERSION=' + version,
-	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'all', 'stack-check', cwd=tree)
+	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'CONFIG_MDC1200=' + ('n' if args.no_mdc1200 else 'y'),
+	    'all', 'stack-check', cwd=tree)
 
 
 if __name__ == '__main__':
