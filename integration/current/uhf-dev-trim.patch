@@ -1,0 +1,38 @@
+diff --git a/drivers/cal/baofeng/baofeng_cal.c b/drivers/cal/baofeng/baofeng_cal.c
+index 9deadd4..5515a7a 100644
+--- a/drivers/cal/baofeng/baofeng_cal.c
++++ b/drivers/cal/baofeng/baofeng_cal.c
+@@ -209,6 +209,13 @@ uint16_t bf_cal_modcal(uint32_t hz)
+ 	if (b > 0xFFu) {
+ 		b = 0xFFu;
+ 	}
++	// UHF TX deviation trim, UHF only: a Pluto capture at 435 MHz on 2026-11-20 (YSF DN Narrow, 273 ms,
++	// 284 symbol centers, quality 65%) measured outer 1508 Hz against the 1350 Hz nominal (1.117x), and UHF
++	// reads high in every mode, so the error sits in the shared UHF calibration (K_UHF), not in any one
++	// mode's scaling -- VHF measures clean with the same ratios. 1350/1508 = 0.895 = 179/200.
++	if (hz > 299999990u) {
++		b = (b * 179u + 100u) / 200u;
++	}
+ 	return (uint16_t)(b << 8 | b);
+ }
+ 
+diff --git a/tests/host/baofengCalTest.c b/tests/host/baofengCalTest.c
+index d546144..505c604 100644
+--- a/tests/host/baofengCalTest.c
++++ b/tests/host/baofengCalTest.c
+@@ -105,8 +105,13 @@ static void test_values(void)
+ 	bf_cal_power_points_t p;
+ 	CHECK(bf_cal_valid());
+ 	CHECK(bf_cal_tx_center() == 0x85);
+-	CHECK(bf_cal_modcal(435000000u) == 0x4D4D);		// 33479 / 435 = 76.96 -> 77
+-	CHECK(bf_cal_modcal(145000000u) == 0x6B6B);		// 15480 / 145 = 106.8 -> 107
++	CHECK(bf_cal_modcal(435000000u) == 0x4545);		// 33479 / 435 = 76.96 -> 77, UHF trim x179/200 -> 69
++	CHECK(bf_cal_modcal(145000000u) == 0x6B6B);		// 15480 / 145 = 106.8 -> 107, VHF untrimmed
++	// The trim is a factor on the UHF branch only: 400/470 MHz scale the same way, VHF is untouched
++	CHECK(bf_cal_modcal(400000000u) == 0x4B4B);		// 33479 / 400 = 83.7 -> 84, x179/200 -> 75
++	CHECK(bf_cal_modcal(470000000u) == 0x4040);		// 33479 / 470 = 71.2 -> 71, x179/200 -> 64
++	CHECK(bf_cal_modcal(299999990u) == 0x3434);		// just below the split: VHF branch, untrimmed
++	CHECK(bf_cal_modcal(300000000u) == 0x6464);		// just above it: UHF branch, trimmed
+ 	CHECK(bf_cal_power(435000000u, &p) && p.low == 192 && p.mid == 832 && p.high == 1632 && p.very_low == 172);
+ 	CHECK(bf_cal_power(426250000u, &p) && p.low == 184);	// halfway between points 1 and 2
+ 	CHECK(bf_cal_power(470000000u, &p) && p.low == 224);	// the last point

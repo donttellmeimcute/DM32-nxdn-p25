@@ -31,6 +31,8 @@ PATCHES = (
 	'mdc1200-ptt-id.patch',
 	'mdc1200-decode.patch',
 	'mdc1200-editor.patch',
+	# UHF TX deviation trim x179/200 in bf_cal_modcal, UHF branch only (measured 2026-11-20, Pluto 435 MHz)
+	'uhf-dev-trim.patch',
 )
 
 
