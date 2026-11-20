@@ -1,0 +1,974 @@
+diff --git a/core/aprs/aprs.h b/core/aprs/aprs.h
+index 2c775a5..5e17540 100644
+--- a/core/aprs/aprs.h
++++ b/core/aprs/aprs.h
+@@ -177,6 +177,15 @@ bool aprs_rf_take(aprs_rf_job_t *job, uint32_t now_ms);
+ // The tone buffer of an RF job, lent while no job has it (the radio is not on an APRS transmission: aprs_rf_take
+ // fills it, and the job's end frees it): a few bytes of tones for another signaling burst, without their own RAM
+ uint8_t *aprs_rf_scratch(void);
++#if CONFIG_APRS_RX
++// The same for receive, for a decoder of another signaling on an FM channel APRS doesn't listen on: the board has one
++// receive audio path (hal_afsk_t rx) and APRS comes first.
++// APRS receive is set to listen on this RX frequency (listening now or about to): the audio path is its own
++bool aprs_rx_claims(uint32_t rx_hz);
++// The demodulator's memory (*size bytes) and its sample buffer (*n samples), lent while APRS doesn't listen
++void *aprs_rx_scratch(size_t *size);
++int16_t *aprs_rx_samples(uint16_t *n);
++#endif
+ #endif
+ // It went out, or not: a busy channel, or a failure (aprs_rf_result_t)
+ void aprs_rf_done(aprs_rf_result_t r, uint32_t now_ms);
+diff --git a/core/aprs/aprs_ax25.c b/core/aprs/aprs_ax25.c
+index b4e95b6..74a90a5 100644
+--- a/core/aprs/aprs_ax25.c
++++ b/core/aprs/aprs_ax25.c
+@@ -920,6 +920,25 @@ void aprs_rx_stats(aprs_rx_stats_t *out)
+ }
+ #endif
+ 
++#if CONFIG_MDC1200 && CONFIG_APRS_RX
++bool aprs_rx_claims(uint32_t rx_hz)
++{
++	return aprs_s.rx_running || (aprs_s.cfg.rx_on && rx_hz != 0 && rx_hz == aprs_cfg_freq(&aprs_s.cfg));
++}
++
++void *aprs_rx_scratch(size_t *size)
++{
++	*size = sizeof(aprs_s.demod);
++	return &aprs_s.demod;
++}
++
++int16_t *aprs_rx_samples(uint16_t *n)
++{
++	*n = (uint16_t)(sizeof(aprs_s.rxbuf) / sizeof(aprs_s.rxbuf[0]));
++	return aprs_s.rxbuf;
++}
++#endif
++
+ bool aprs_rx_listening(void)
+ {
+ #if CONFIG_APRS_RX
+diff --git a/core/codeplug/codeplug.h b/core/codeplug/codeplug.h
+index e6b5808..54c32a1 100644
+--- a/core/codeplug/codeplug.h
++++ b/core/codeplug/codeplug.h
+@@ -73,7 +73,7 @@ enum { CP_DMR_PRIV_DEFAULT, CP_DMR_PRIV_AES, CP_DMR_PRIV_BASIC, CP_DMR_PRIV_ENHA
+ // channel_t.ani_opts
+ #define CODEPLUG_ANI_PRE	0x01u	// send the ID when the transmission starts
+ #define CODEPLUG_ANI_POST	0x02u	// send it when PTT is released
+-#define CODEPLUG_ANI_DECODE	0x04u	// decode the IDs received on the channel (stored; not used yet)
++#define CODEPLUG_ANI_DECODE	0x04u	// decode the IDs received on the channel and show the caller's
+ 
+ #define VFO_DIG_NXDN_MASK	0x03u	// 0 default, 1 NXDN48, 2 NXDN96
+ #define VFO_DIG_YSF_MASK		0x0Cu	// 0 default, 1 YSF Wide, 2 YSF Narrow (shifted by 2)
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+index 0ce7823..af20c8c 100644
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -369,6 +369,15 @@ typedef struct {
+ } radio_t3_view_t;
+ #endif
+ 
++#if CONFIG_MDC1200
++// An FM channel that decodes MDC-1200 IDs (radio-features.md 3.8): the IDs heard on it
++typedef struct {
++	uint16_t source;		// the ID heard in this reception (0 = none)
++	uint16_t last_source;	// the last one heard on the channel
++	uint32_t last_ms;	// hal_millis() when it was heard, 0 = none yet
++} radio_mdc_view_t;
++#endif
++
+ #define RADIO_LED_GREEN		0x01u	// radio_view_t.leds
+ #define RADIO_LED_RED		0x02u
+ 
+@@ -466,6 +475,9 @@ typedef struct {
+ #if CONFIG_YSF
+ 	radio_ysf_view_t ysf;	// YSF conventional (docs/spec/ysf.md 8): the same
+ #endif
++#if CONFIG_MDC1200
++	radio_mdc_view_t mdc;
++#endif
+ #if CONFIG_DMR_TRUNK
+ 	radio_t3_brief_t t3;
+ #endif
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index fdf6ded..816b5a3 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -678,6 +678,11 @@ static void end_reception(radio_sm_t *sm, uint32_t now_ms)
+ 	if (sm->view.state == RS_RX) {
+ 		sm->view.state = RS_IDLE;
+ 		sm->view.last_rx_ms = now_ms != 0 ? now_ms : 1;
++#if RADIO_MDC_RX
++		if (sm->view.ch.mode == RADIO_MODE_FM) {
++			sm->view.mdc.source = 0;	// the MDC-1200 ID was this reception's; last_source keeps it
++		}
++#endif
+ 	}
+ 	sm->close_count = 0;
+ }
+@@ -878,6 +883,11 @@ static void set_channel(radio_sm_t *sm, uint16_t pos, const channel_t *ch)
+ 	sm->view.vfo = false;
+ 	sm->view.zone_pos = pos;
+ 	sm->view.channel_number = sm->zone.channels[pos];
++#if RADIO_MDC_RX
++	// Another channel: the MDC-1200 IDs heard were the last one's
++	sm->view.mdc.source = sm->view.mdc.last_source = 0;
++	sm->view.mdc.last_ms = 0;
++#endif
+ 	load_channel(sm, ch);
+ #if CONFIG_DMR_TRUNK
+ 	if (kept) {
+@@ -950,6 +960,10 @@ static void enter_vfo(radio_sm_t *sm, uint32_t now_ms)
+ #endif
+ 	sm->view.ch = sm->vfo_ch;
+ 	sm->view.vfo = true;
++#if RADIO_MDC_RX
++	sm->view.mdc.source = sm->view.mdc.last_source = 0;	// as set_channel
++	sm->view.mdc.last_ms = 0;
++#endif
+ 	sm->view.channel_number = 0;
+ 	clear_temporary(sm);
+ 	apply_tot(sm);
+@@ -5694,6 +5708,73 @@ static void mdc_poll(radio_sm_t *sm, uint32_t now_ms)
+ }
+ #endif
+ 
++#if RADIO_MDC_RX
++// --- MDC-1200 IDs received (radio-features.md 3.8): on an FM channel set to decode them, the board's receive audio
++// (hal_afsk_t rx, the path APRS listens on) runs through the decoder all the time the channel is received, squelch
++// open or not, and an ID heard shows as the last caller. The decoder's state and the sample buffer are the idle APRS
++// demodulator's: APRS has the audio path on its own frequency, and this gives way to it (aprs_rx_claims) ---
++
++_Static_assert(sizeof(mdc1200_dec_t) <= sizeof(afsk_demod_t), "the decoder fits the APRS demodulator's memory");
++_Static_assert(_Alignof(mdc1200_dec_t) <= _Alignof(afsk_demod_t), "the decoder is aligned as the APRS demodulator's memory");
++
++static bool mdc_rx_wanted(const radio_sm_t *sm)
++{
++	const channel_t *ch = &sm->view.ch;
++	const hal_afsk_t *h = board.afsk;
++	if (ch->mode != RADIO_MODE_FM || ch->ani_type != CODEPLUG_ANI_MDC1200 || !(ch->ani_opts & CODEPLUG_ANI_DECODE) ||
++	    sm->view.state == RS_TX || sm->view.state == RS_TX_DENIED || sm->ptt || sm->hotspot || sm->view.am ||
++	    sm->view.bcast || sm->aprs_phase != APRS_RF_OFF || h == NULL || h->rx_start == NULL || h->rx_read == NULL ||
++	    h->rx_rate_hz != MDC1200_DEC_RATE) {
++		return false;
++	}
++#if CONFIG_SCAN
++	if (scan_on(&sm->scan)) {
++		return false;	// the receiver hops: no burst would be whole
++	}
++#endif
++	return !aprs_rx_claims(ch->rx_hz);
++}
++
++static void mdc_rx_stop(radio_sm_t *sm)
++{
++	if (sm->mdc_rx) {
++		if (board.afsk->rx_stop != NULL) {
++			board.afsk->rx_stop();
++		}
++		sm->mdc_rx = false;
++	}
++}
++
++// Every poll, before APRS: it starts and stops with the channel, and what the board heard goes through the decoder
++static void mdc_rx_service(radio_sm_t *sm, uint32_t now_ms)
++{
++	if (!mdc_rx_wanted(sm)) {
++		mdc_rx_stop(sm);
++		return;
++	}
++	size_t size;
++	mdc1200_dec_t *dec = aprs_rx_scratch(&size);
++	if (!sm->mdc_rx) {
++		mdc1200_dec_init(dec);
++		sm->mdc_rx = board.afsk->rx_start();
++		if (!sm->mdc_rx) {
++			return;		// no memory for the audio now: the next poll tries again
++		}
++	}
++	uint16_t max, n;
++	int16_t *buf = aprs_rx_samples(&max);
++	while ((n = board.afsk->rx_read(buf, max)) != 0) {
++		mdc1200_packet_t p;
++		if (mdc1200_dec(dec, buf, n, &p) != 0) {
++			// Any burst names its sender: a PTT ID at either end of a transmission, or another message
++			sm->view.mdc.source = sm->view.mdc.last_source = p.unit;
++			sm->view.mdc.last_ms = now_ms != 0 ? now_ms : 1;
++			changed(sm);
++		}
++	}
++}
++#endif
++
+ // Back to receive after an FM transmission (PTT released, roger beep done, burst released)
+ // keyed: DMR per-burst keying is still armed (dmr_follow releases it), so no tx_off here
+ static void fm_tx_end(radio_sm_t *sm, bool keyed, uint32_t now_ms)
+@@ -6434,6 +6515,9 @@ static void ptt_down(radio_sm_t *sm, uint32_t now_ms)
+ 		deny(sm, TXDENY_MODE);
+ 		return;
+ 	}
++#endif
++#if RADIO_MDC_RX
++	mdc_rx_stop(sm);		// the receive audio path goes back before the transmitter takes the modem
+ #endif
+ 	sm->view.state = RS_TX;		// speaker off, red LED on, before keying
+ 	sm->view.tx_auto = false;
+@@ -8696,6 +8780,11 @@ static bool save_allowed(const radio_sm_t *sm, uint32_t now_ms)
+ 		return false;	// a sleeping receiver misses packets
+ 	}
+ #endif
++#if RADIO_MDC_RX
++	if (sm->mdc_rx) {
++		return false;	// ... and the ID at the start of a transmission
++	}
++#endif
+ #if CONFIG_SCAN
+ 	if (scan_on(&sm->scan)) {
+ 		return false;
+@@ -8889,6 +8978,9 @@ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms)
+ #endif
+ #if CONFIG_NET_USRP
+ 	host_audio_watch(sm, now_ms);
++#endif
++#if RADIO_MDC_RX
++	mdc_rx_service(sm, now_ms);	// before APRS: it lets go of the receive audio first where APRS listens
+ #endif
+ 	// Soft off: the receiver is asleep and nothing may transmit (an APRS beacon included). Battery monitoring and
+ 	// the beeps above already ran; the rest of the poll (squelch, scan, time-out) has nothing to do while asleep
+@@ -9098,6 +9190,13 @@ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms)
+ 		if (opens) {
+ 			sm->view.state = RS_RX;
+ 			sm->close_count = 0;
++#if RADIO_MDC_RX
++			// A new reception: an MDC-1200 ID heard a moment before the squelch opened is its start burst, an older
++			// one (heard with the squelch closed) is not this caller's
++			if (sm->view.ch.mode == RADIO_MODE_FM && now_ms - sm->view.mdc.last_ms > RADIO_MDC_RX_LEAD_MS) {
++				sm->view.mdc.source = 0;
++			}
++#endif
+ 			changed(sm);
+ 		}
+ 	} else if (holds) {
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index e202ca8..89568ac 100644
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -24,6 +24,9 @@
+ #endif
+ 
+ #define RADIO_SM_CW		(CONFIG_HOTSPOT || CONFIG_SFR_CWID)	// the CW keyer (radio_sm.c)
++// MDC-1200 IDs decoded from an FM channel's receive audio (radio-features.md 3.8): the board's AFSK receive path
++#define RADIO_MDC_RX		(CONFIG_MDC1200 && CONFIG_APRS_RX)
++#define RADIO_MDC_RX_LEAD_MS	1000u	// an ID heard this long before the squelch opened belongs to that reception
+ #define RADIO_POLL_MS		25	// status poll and squelch period
+ #define RADIO_RETUNE_SETTLE_MS	400	// RREQ_RETUNE: tune once the reference trim has held this long
+ #define RADIO_TICK_MS		10	// DMR call stack poll (radio_sm_tick)
+@@ -375,6 +378,7 @@ typedef struct {
+ #if CONFIG_MDC1200
+ 	uint32_t mdc_ms;		// the MDC-1200 burst on the air started
+ 	uint8_t mdc_phase;		// the channel's MDC-1200 ID (radio_sm.c MDC_*), 0 = none on its way
++	bool mdc_rx;			// the MDC-1200 decoder has the board's receive audio (RADIO_MDC_RX)
+ #endif
+ #if CONFIG_DTMF
+ 	bool dtmf_held;			// the key of the digit sounding (view.dtmf) is still down
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+index f51d59a..d028a68 100644
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -2117,6 +2117,16 @@ msgctxt "WORD_TONE_BURST"
+ msgid "Tone burst"
+ msgstr "Ráfaga de tono"
+ 
++#: core/ui/ui_menus.c
++msgctxt "CHAN_LABEL_DECODE_IDS"
++msgid "Decode IDs"
++msgstr "Decodificar ID"
++
++#: core/ui/ui_menus.c
++msgctxt "ACTIVITY_BODY_LAST_ID"
++msgid "Last ID "
++msgstr "Último ID "
++
+ #: core/ui/ui_menus.c
+ msgctxt "CHAN_LABEL_ID_TYPE"
+ msgid "ID type"
+diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+index eea5fc7..222f7bb 100644
+--- a/core/ui/lang/fr.po
++++ b/core/ui/lang/fr.po
+@@ -2117,6 +2117,16 @@ msgctxt "WORD_TONE_BURST"
+ msgid "Tone burst"
+ msgstr "Tonalité d'appel"
+ 
++#: core/ui/ui_menus.c
++msgctxt "CHAN_LABEL_DECODE_IDS"
++msgid "Decode IDs"
++msgstr "Décoder les ID"
++
++#: core/ui/ui_menus.c
++msgctxt "ACTIVITY_BODY_LAST_ID"
++msgid "Last ID "
++msgstr "Dernier ID "
++
+ #: core/ui/ui_menus.c
+ msgctxt "CHAN_LABEL_ID_TYPE"
+ msgid "ID type"
+diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+index 3b1ca7e..c07946b 100644
+--- a/core/ui/lang/it.po
++++ b/core/ui/lang/it.po
+@@ -2117,6 +2117,16 @@ msgctxt "WORD_TONE_BURST"
+ msgid "Tone burst"
+ msgstr "Tono di apertura"
+ 
++#: core/ui/ui_menus.c
++msgctxt "CHAN_LABEL_DECODE_IDS"
++msgid "Decode IDs"
++msgstr "Decodifica ID"
++
++#: core/ui/ui_menus.c
++msgctxt "ACTIVITY_BODY_LAST_ID"
++msgid "Last ID "
++msgstr "Ultimo ID "
++
+ #: core/ui/ui_menus.c
+ msgctxt "CHAN_LABEL_ID_TYPE"
+ msgid "ID type"
+diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+index f478821..f72981c 100644
+--- a/core/ui/lang/zh.po
++++ b/core/ui/lang/zh.po
+@@ -2119,6 +2119,16 @@ msgctxt "WORD_TONE_BURST"
+ msgid "Tone burst"
+ msgstr "突发音"
+ 
++#: core/ui/ui_menus.c
++msgctxt "CHAN_LABEL_DECODE_IDS"
++msgid "Decode IDs"
++msgstr "解码 ID"
++
++#: core/ui/ui_menus.c
++msgctxt "ACTIVITY_BODY_LAST_ID"
++msgid "Last ID "
++msgstr "最近 ID "
++
+ #: core/ui/ui_menus.c
+ msgctxt "CHAN_LABEL_ID_TYPE"
+ msgid "ID type"
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index 3b5986f..e340922 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -2508,7 +2508,7 @@ static const ui_scr_def_t chlist_screen = {
+ 
+ enum { CE_NAME, CE_NUMBER, CE_MODE, CE_CODE, CE_RATE, CE_DEST, CE_RX, CE_TX, CE_POWER, CE_RX_ONLY, CE_BW, CE_RX_TONE, CE_TX_TONE, CE_VOX,
+        CE_BURST,
+-       CE_ANI, CE_ANI_SEND, CE_ANI_ID,	// an FM channel's signaling ID (MDC-1200): its type, when it is sent, the ID
++       CE_ANI, CE_ANI_SEND, CE_ANI_ID, CE_ANI_DECODE,	// an FM channel's signaling ID (MDC-1200): its type, when it is sent, the ID, decode
+        CE_CC, CE_TS, CE_CONTACT, CE_LIST, CE_ID, CE_DMO, CE_BEEP, CE_ALIAS1, CE_ALIAS2, CE_TOT, CE_SCAN, CE_ECO,
+        CE_DMR_PRIVACY, CE_DMR_KEY, CE_AES,
+        CE_ZONES, CE_GO, CE_SHARE, CE_SAVE, CE_SAVE_NEW, CE_COUNT, CE_NONE = 0xFF };
+@@ -2611,7 +2611,9 @@ static const struct { uint8_t off, len, bit; } ced_fields[CE_ZONES] = {
+ 	[CE_POWER] = CE_FIELD(power), [CE_RX_ONLY] = CE_FIELD(rx_only), [CE_BW] = CE_FIELD(bw),
+ 	[CE_RX_TONE] = CE_FIELD(rx_tone), [CE_TX_TONE] = CE_FIELD(tx_tone), [CE_VOX] = CE_FIELD(vox),
+ 	[CE_BURST] = CE_FIELD(tone_burst),
+-	[CE_ANI] = CE_FIELD(ani_type), [CE_ANI_SEND] = CE_FIELD(ani_opts), [CE_ANI_ID] = CE_FIELD(ani_id),
++	[CE_ANI] = CE_FIELD(ani_type), [CE_ANI_ID] = CE_FIELD(ani_id),
++	[CE_ANI_SEND] = { offsetof(channel_t, ani_opts), 1, CODEPLUG_ANI_PRE | CODEPLUG_ANI_POST },
++	[CE_ANI_DECODE] = { offsetof(channel_t, ani_opts), 1, CODEPLUG_ANI_DECODE },
+ 	[CE_DMR_PRIVACY] = CE_FIELD(dmr_privacy), [CE_DMR_KEY] = CE_FIELD(dmr_privacy_key),
+ 	[CE_CC] = CE_FIELD(color_code), [CE_TS] = CE_FIELD(timeslot), [CE_CONTACT] = CE_FIELD(contact),
+ 	[CE_LIST] = CE_FIELD(listen_list), [CE_ID] = CE_FIELD(dmr_id), [CE_DMO] = CE_FIELD(dmo),
+@@ -3012,7 +3014,7 @@ static void ced_build(void)
+ 				 (am && (tone || r == CE_VOX || r == CE_BURST || r == CE_TX || r == CE_RX_ONLY || r == CE_POWER ||
+ 					 r == CE_TOT))))
+ 			continue;
+-		if (r >= CE_ANI && r <= CE_ANI_ID &&
++		if (r >= CE_ANI && r <= CE_ANI_DECODE &&
+ 		    (!CONFIG_MDC1200 || ced_ch.mode != RADIO_MODE_FM || ced_ch.kind != CODEPLUG_KIND_NONE ||
+ 		     (r != CE_ANI && ced_ch.ani_type == CODEPLUG_ANI_NONE)))
+ 			continue;
+@@ -3228,6 +3230,7 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
+ 		TRN(CHAN_LABEL_RX_TONE, "RX CTCSS/DCS"), TRN(CHAN_LABEL_TX_TONE, "TX CTCSS/DCS"), TRX(WORD_VOX, "VOX"),
+ 		TRN(WORD_TONE_BURST, "Tone burst"),
+ 		TRN(CHAN_LABEL_ID_TYPE, "ID type"), TRN(CHAN_LABEL_SEND_ID, "Send ID"), TRN(CHAN_LABEL_OWN_ID, "Own ID"),
++		TRN(CHAN_LABEL_DECODE_IDS, "Decode IDs"),
+ 		TRN(CHAN_LABEL_COLOR_CODE, "Color code"),
+ 		TRN(LABEL_TIMESLOT, "Timeslot"), TRN(CHAN_LABEL_TX_CONTACT, "TX contact"),
+ 		TRN(CHAN_LABEL_RX_GROUP_LIST, "RX group list"), TRN(CHAN_LABEL_OWN_ID, "Own ID"),
+@@ -3424,6 +3427,9 @@ static void chinfo_item(uint16_t i, ui_item_t *it)
+ 		for (int s = 12; s >= 0; s -= 4)
+ 			sb_chr(&b, "0123456789ABCDEF"[(ch->ani_id >> s) & 0xFu]);
+ 		break;
++	case CE_ANI_DECODE:
++		sb_onoff(&b, (ch->ani_opts & CODEPLUG_ANI_DECODE) != 0);
++		break;
+ 	case CE_CC:
+ 		sb_u32(&b, editing ? (uint32_t)ced_val_or(ch->color_code) : ch->color_code, 1);
+ 		break;
+@@ -4041,6 +4047,7 @@ static void chinfo_select(uint16_t i, bool hold)
+ 		c->ani_type = c->ani_type == CODEPLUG_ANI_NONE ? CODEPLUG_ANI_MDC1200 : CODEPLUG_ANI_NONE;
+ 		ced_build();
+ 		break;
++	case CE_ANI_DECODE: c->ani_opts ^= CODEPLUG_ANI_DECODE; break;
+ 	case CE_ANI_SEND: {	// off, at the start, at the end, both; the decode option stays
+ 		uint8_t when = (uint8_t)((c->ani_opts + 1u) & (CODEPLUG_ANI_PRE | CODEPLUG_ANI_POST));
+ 		c->ani_opts = (uint8_t)((c->ani_opts & ~(CODEPLUG_ANI_PRE | CODEPLUG_ANI_POST)) | when);
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index 9e99a22..063de0f 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -2170,6 +2170,22 @@ static void air_call_line(const air_call_t *c, const font_t *f, int y)
+ }
+ #endif
+ 
++#if CONFIG_MDC1200
++// An FM channel that decodes MDC-1200 IDs (radio-features.md 3.8): the view's mdc fields hold the IDs heard
++static bool mdc_channel(const radio_view_t *v)
++{
++	return CONFIG_MDC1200 && v->ch.mode == RADIO_MODE_FM && v->ch.ani_type == CODEPLUG_ANI_MDC1200 &&
++	       (v->ch.ani_opts & CODEPLUG_ANI_DECODE) != 0;
++}
++
++// An MDC-1200 unit ID as it is written: 4 hex digits
++static void sb_mdc_id(sbuf_t *b, uint32_t id)
++{
++	for (int sh = 12; sh >= 0; sh -= 4)
++		sb_chr(b, "0123456789ABCDEF"[(id >> sh) & 0xFu]);
++}
++#endif
++
+ static void draw_activity(const radio_view_t *v, const ui_state_t *s)
+ {
+ 	const ui_layout_t *L = &ui_layout;
+@@ -2208,6 +2224,16 @@ static void draw_activity(const radio_view_t *v, const ui_state_t *s)
+ 			air_call_line(&ac, sm, y2);
+ 			break;
+ 		}
++#endif
++#if CONFIG_MDC1200
++		if (mdc_channel(v) && v->mdc.source != 0) {
++			// The caller's MDC-1200 ID, once its burst is heard
++			sb_init(&b, buf, sizeof buf);
++			sb_str(&b, "ID ");
++			sb_mdc_id(&b, v->mdc.source);
++			gfx_text(sm, 0, y2, buf, ui_col.rx);
++			break;
++		}
+ #endif
+ 		gfx_text(sm, 0, y2, v->monitor ? TR(ACTIVITY_STATE_SQUELCH_OPEN, "Squelch open") :
+ 			TR(STATE_RECEIVING, "Receiving"), ui_col.rx);
+@@ -2275,6 +2301,18 @@ static void draw_activity(const radio_view_t *v, const ui_state_t *s)
+ 			draw_last_heard(v, s, y);	// hear all shows as "All" in the chips and in the hint
+ 			break;
+ 		}
++#endif
++#if CONFIG_MDC1200
++		if (mdc_channel(v) && v->mdc.last_ms != 0) {
++			sb_str(&b, TR(ACTIVITY_BODY_LAST_ID, "Last ID "));
++			sb_mdc_id(&b, v->mdc.last_source);	// "Last ID 0644 2s ago"
++			sb_chr(&b, ' ');
++			sb_age(&b, s->now_ms - v->mdc.last_ms);
++			y += (L->activity_h - sm->h) / 2;
++			gfx_text_fit(sm, buf, gfx_width(), fit, sizeof fit);
++			gfx_text(sm, 0, y, fit, ui_col.dim);
++			break;
++		}
+ #endif
+ 		if (v->last_rx_ms) {
+ 			sb_str(&b, TR(ACTIVITY_BODY_LAST, "Last activity "));
+diff --git a/docs/spec/open-firmware-cps.md b/docs/spec/open-firmware-cps.md
+index cad7cfb..e5c6ddd 100644
+--- a/docs/spec/open-firmware-cps.md
++++ b/docs/spec/open-firmware-cps.md
+@@ -493,7 +493,7 @@ are the ID the channel identifies itself with on air (`radio-features.md` 3.8):
+ | Offset | Bits | Field |
+ | --- | --- | --- |
+ | 0x27 | 7 | 1: a signaling ID (no DMR ID reaches 0x800000) |
+-| 0x27 | 6 | Decode the IDs received on the channel (stored; not used yet) |
++| 0x27 | 6 | Decode the IDs received on the channel and show the caller's |
+ | 0x27 | 5 | Send the ID when PTT is released |
+ | 0x27 | 4 | Send the ID when the transmission starts |
+ | 0x27 | 3-0 | ID type: 0 none, 1 MDC-1200. A type the firmware doesn't know reads as none |
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index a4acc7e..bcc7941 100644
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -371,9 +371,10 @@ None of them needs a correction in the driver. The HIL test (`test_fm_tx_dtmf`)
+ ### 3.8 MDC-1200 PTT ID (CONFIG_MDC1200; multi-mode derivative)
+ 
+ An FM channel can identify itself with an MDC-1200 data burst when a transmission starts, when PTT is released, or
+-both. The channel holds the settings (`open-firmware-cps.md` 7.3.3.2): the ID type (none, MDC-1200), when it is sent,
+-and the 16-bit unit ID. There is no radio-wide ID: a channel with no ID sends nothing. Received bursts are not
+-decoded yet; the channel's decode option is stored for it.
++both, and can decode the bursts it receives to show who is calling. The channel holds the settings
++(`open-firmware-cps.md` 7.3.3.2): the ID type (none, MDC-1200), when it is sent, the 16-bit unit ID, and whether
++received IDs are decoded. There is no radio-wide ID: a channel with no ID sends nothing. Sending and decoding are
++separate: a channel can do either, both or neither.
+ 
+ The burst (`core/mdc/mdc1200.c`):
+ 
+@@ -405,6 +406,39 @@ the switch needs `CONFIG_APRS`. The microphone is muted while a burst plays; the
+ With APRS built, the burst's 26 bytes of tones use the APRS transmit buffer: PTT has ended any APRS transmission, and
+ none starts during one of ours. Untested on air: the pretimes and the 12.5 kHz level are first values.
+ 
++#### Decoding (CONFIG_MDC1200 with CONFIG_APRS_RX)
++
++On a channel set to decode, the board's receive audio (`hal_afsk_t` rx: 8 kHz, not squelched, the path APRS receive
++uses) runs through `mdc1200_dec` every poll while the channel is received.
++
++| Step | How |
++| --- | --- |
++| Bits | The tones are phase continuous, so the wave ends each bit rising or falling as the bit is 1 or 0. The bit's 7 samples are correlated with a 1200 Hz and an 1800 Hz sine ending at the bit's end; the sign of the stronger is the bit. A 250 Hz high pass comes first (hum, sub-audio tones) |
++| Timing | No clock recovery: 6 bit timings a sixth of a bit apart run side by side, each with its own sync search. Holds for a baud rate within 0.1 % |
++| Sync | The last 40 bits against the sync word, 3 bits may differ; all but 3 differing is the word inverted (an inverting audio path), and the data is inverted back |
++| Data | 112 bits de-interleaved; each data bit is in four parity checks, and one with three or more failing is flipped (majority decoding); then the CRC must match. A failed CRC gives nothing |
++| Result | The unit ID of any packet (a PTT ID at either end of a transmission, or another message type); the other timings drop the same burst |
++
++| Rule | Value |
++| --- | --- |
++| Runs | FM channel with decode on, receiving (not transmitting, PTT up), no scan or dual watch, no hotspot, not AM or broadcast receive |
++| APRS | On the frequency APRS receive listens on, the audio path is APRS's and nothing is decoded |
++| Squelch | Decoded with the squelch closed too (another group's tone, a weak signal) |
++| Battery saver | Off while the decoder runs: a sleeping receiver would miss the burst at the start |
++| Speaker | The channel's audio plays through the modem's codec while the decoder runs, as on the APRS frequency (the board's `hal_afsk_t` rx route) |
++| Memory | The decoder's 180 bytes and the sample buffer are the idle APRS demodulator's (`aprs_rx_scratch`); the board's audio ring comes from the heap while it runs |
++
++What the screen shows uses the view's digital voice fields (`radio_view_t.dv`), as a P25 channel does: `source` is the
++ID heard in the reception in progress, `last_source` and `last_ms` the last one heard on the channel.
++
++| When | Home screen |
++| --- | --- |
++| Receiving, an ID heard in this reception (or up to 1 s before the squelch opened) | `ID 0644` under the meter |
++| Idle, an ID heard on this channel | `Last ID 0644 2s ago` |
++| Channel change | The last ID is forgotten |
++
++The ID is 4 hex digits. There are no names for IDs yet. Untested on a radio.
++
+ ## 4. Beeps (CONFIG_BEEP)
+ 
+ | Beep | Sound | When |
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+index 3837fdd..7e7d314 100644
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -44,6 +44,7 @@ static struct {
+ 	bool keyed;
+ 	uint16_t tone_hz;	// the TX tone in force (0 = the microphone)
+ 	uint8_t noise_on_aprs;	// noise reading on 144.390 (low = a carrier)
++	uint8_t noise_on_ch;	// ... and on the channel (0: none there, the squelch stays closed)
+ 	// AFSK
+ 	uint8_t tones[600];
+ 	uint16_t nbits;
+@@ -93,7 +94,7 @@ static void r_tx_off(void)
+ }
+ static void r_status(radio_status_t *st)
+ {
+-	st->noise = hw.rx_hz == APRS_HZ ? hw.noise_on_aprs : 120;
++	st->noise = hw.rx_hz == APRS_HZ ? hw.noise_on_aprs : hw.noise_on_ch != 0 ? hw.noise_on_ch : 120;
+ 	st->rssi_dbm = -120;
+ 	st->carrier = false;
+ 	st->tone_ok = true;
+@@ -2071,12 +2072,139 @@ static void test_mdc_ptt_id(void)
+ 	CHECK(wait_start(3, 20000) && hw.space == 2200 && nframes == 1 && strncmp(frames[0], "N0TST-7>", 8) == 0);
+ 	wait_idle();
+ }
++
++#if CONFIG_APRS_RX
++// An MDC-1200 burst as the board's receive audio, after what is queued: silence, the burst, silence
++static int16_t mdc_audio[8000];
++static void mdc_hear(uint8_t arg, uint16_t id)
++{
++	uint8_t tones[MDC1200_BURST_BYTES];
++	uint16_t nbits = mdc1200_tones(MDC1200_OP_PTT_ID, arg, id, tones);
++	afsk_mod_t m;
++	afsk_mod_init(&m, 8000);
++	memset(mdc_audio, 0, sizeof(mdc_audio));
++	size_t k = afsk_mod_fsk(&m, tones, nbits, 6000, MDC1200_MARK_HZ, MDC1200_SPACE_HZ, mdc_audio + 400, 4000);
++	brx.s = mdc_audio;
++	brx.pos = 0;
++	brx.n = k + 800;
++}
++
++static void test_mdc_decode(void)
++{
++	hal_afsk_t saved = fake_afsk;
++	fake_afsk.rx_rate_hz = 8000;
++	fake_afsk.rx_start = b_rx_start;
++	fake_afsk.rx_read = b_rx_read;
++	fake_afsk.rx_stop = b_rx_stop;
++
++	// A channel that doesn't decode: the receive audio path is left alone
++	memset(&brx, 0, sizeof(brx));
++	mdc_channel(CODEPLUG_ANI_PRE, 0x1A2B);
++	run(200);
++	CHECK(brx.starts == 0 && !sm.mdc_rx);
++
++	// Set to decode: the path runs while the channel is received, the squelch closed. A burst heard is the last ID
++	mdc_channel(CODEPLUG_ANI_DECODE, 0);
++	run(100);
++	CHECK(brx.starts == 1 && sm.mdc_rx && !aprs_rx_listening() && sm.view.mdc.last_ms == 0);
++	mdc_hear(MDC1200_ARG_PTT_POST, 0x0644);
++	run(400);
++	CHECK(sm.view.mdc.last_source == 0x0644 && sm.view.mdc.last_ms != 0 && sm.view.state == RS_IDLE);
++	uint32_t heard = sm.view.mdc.last_ms;
++	run(3000);
++	CHECK(sm.view.mdc.last_source == 0x0644 && sm.view.mdc.last_ms == heard);	// it stays, with its time
++
++	// A reception: the squelch opens, the ID at its start is this caller's; when it ends, only the last ID stays
++	hw.noise_on_ch = 10;
++	run(100);
++	CHECK(sm.view.state == RS_RX && sm.view.mdc.source == 0);	// the ID of 3 s ago is not this one's
++	mdc_hear(MDC1200_ARG_PTT_PRE, 0xBEEF);
++	run(400);
++	CHECK(sm.view.state == RS_RX && sm.view.mdc.source == 0xBEEF && sm.view.mdc.last_source == 0xBEEF);
++	hw.noise_on_ch = 0;
++	run(1000);
++	CHECK(sm.view.state == RS_IDLE && sm.view.mdc.source == 0 && sm.view.mdc.last_source == 0xBEEF);
++	// A burst just before the squelch opens (a slow tone squelch) still names the reception
++	mdc_hear(MDC1200_ARG_PTT_PRE, 0x0001);
++	run(300);
++	CHECK(sm.view.state == RS_IDLE && sm.view.mdc.source == 0x0001);
++	hw.noise_on_ch = 10;
++	run(100);
++	CHECK(sm.view.state == RS_RX && sm.view.mdc.source == 0x0001);
++	hw.noise_on_ch = 0;
++	run(1000);
++
++	// Transmitting: the path is given back before keying, and taken again after
++	int stops = brx.stops, starts = brx.starts;
++	req(RREQ_PTT, 1);
++	CHECK(sm.view.state == RS_TX && brx.stops == stops + 1 && !sm.mdc_rx);
++	run(500);
++	CHECK(brx.starts == starts);
++	req(RREQ_PTT, 0);
++	run(100);
++	CHECK(sm.view.state == RS_IDLE && brx.starts == starts + 1 && sm.mdc_rx);
++	CHECK(sm.view.mdc.last_source == 0x0001);	// the same channel: the last ID is still there
++
++	// Our own ID on a channel that sends and decodes: both work in turn
++	mdc_channel(CODEPLUG_ANI_PRE | CODEPLUG_ANI_DECODE, 0x1A2B);
++	run(100);
++	CHECK(sm.mdc_rx && sm.view.mdc.last_ms == 0);	// another channel load: no last ID
++	req(RREQ_PTT, 1);
++	run(400);
++	CHECK(hw.starts == 1 && mdc_sent(MDC1200_ARG_PTT_PRE, 0x1A2B) && !sm.mdc_rx);
++	req(RREQ_PTT, 0);
++	run(100);
++	mdc_hear(MDC1200_ARG_PTT_PRE, 0x7777);
++	run(400);
++	CHECK(sm.mdc_rx && sm.view.mdc.last_source == 0x7777);
++
++	// The board can't start the path now (no memory for the audio): tried again every poll
++	mdc_channel(CODEPLUG_ANI_DECODE, 0);
++	fake_afsk.rx_start = NULL;
++	run(100);
++	CHECK(!sm.mdc_rx);
++
++	// APRS listens on this frequency: the audio is APRS's, the decoder stays out
++	fake_afsk.rx_start = b_rx_start;
++	memset(&brx, 0, sizeof(brx));
++	mdc_channel(CODEPLUG_ANI_DECODE, 0);
++	run(100);
++	CHECK(sm.mdc_rx && brx.starts == 1);
++	chan.rx_hz = chan.tx_hz = APRS_HZ;
++	radio_sm_init(&sm, now);
++	strcpy(cp_name, "N0TST");
++	configure(60, false);
++	run(200);
++	CHECK(aprs_rx_listening() && !sm.mdc_rx);
++	// APRS receive off: the decoder takes the path
++	aprs_cfg_t c;
++	aprs_get_cfg(&c);
++	c.rx_on = false;
++	c.tx_on = false;
++	aprs_set_cfg(&c, now);
++	run(200);
++	CHECK(!aprs_rx_listening() && sm.mdc_rx);
++	mdc_hear(MDC1200_ARG_PTT_PRE, 0x0644);
++	run(400);
++	CHECK(sm.view.mdc.last_source == 0x0644);
++	// ... and gives it back the moment APRS receive is on again, before APRS starts
++	int before = brx.stops;
++	c.rx_on = true;
++	aprs_set_cfg(&c, now);
++	run(RADIO_POLL_MS);
++	CHECK(!sm.mdc_rx && brx.stops == before + 1 && aprs_rx_listening());
++	fake_afsk = saved;
++}
++#endif
+ #endif
+ 
+ int main(void)
+ {
+ #if CONFIG_MDC1200
+ 	test_mdc_ptt_id();
++#if CONFIG_APRS_RX
++	test_mdc_decode();
++#endif
+ #endif
+ 	test_defaults();
+ 	test_beacon_on_air();
+diff --git a/tests/host/mdc1200Test.c b/tests/host/mdc1200Test.c
+index f158560..921cc85 100644
+--- a/tests/host/mdc1200Test.c
++++ b/tests/host/mdc1200Test.c
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ /*
+  * Host tests for the MDC-1200 burst encoder (core/mdc, docs/spec/radio-features.md 3.8): the CRC, the frame against
+- * a decoder written here from the format's rules (de-interleave, parity, CRC), the tone sequence, and the tones as
+- * audio through the 1200 baud modulator. The frame of op 01, argument 80, unit 1234 was also decoded by an
++ * a decoder written here from the format's rules (de-interleave, parity, CRC), the tone sequence, the tones as
++ * audio through the 1200 baud modulator, and the receive decoder on that audio as a radio hears it (any sample
++ * timing, either polarity, de-emphasized, weak, noisy, with bit errors). The frame of op 01, argument 80, unit 1234 was also decoded by an
+  * independent MDC-1200 decoder from its audio at 8 kHz.
+  *
+  *   make -C tests/host
+@@ -160,12 +161,192 @@ static void test_audio(void)
+ 	CHECK(a == b && a != 0 && memcmp(bell, same, a * sizeof(int16_t)) == 0);
+ }
+ 
++// --- The receive decoder ---
++
++// The tones of a frame as it is (mdc1200_tones makes its own frame; this one takes a damaged one)
++static void frame_tones(const uint8_t *f, uint8_t *t)
++{
++	unsigned last = 1;
++	memset(t, 0, MDC1200_BURST_BYTES);
++	for (unsigned n = 0; n < MDC1200_BURST_BITS; n++) {
++		unsigned bit = (f[n / 8u] >> (7u - n % 8u)) & 1u;
++		if (bit == last) {
++			t[n / 8u] |= (uint8_t)(1u << (n % 8u));
++		}
++		last = bit;
++	}
++}
++
++static uint32_t lcg = 1;
++static double noise(void)	// about a unit normal: 12 uniform numbers
++{
++	double g = 0;
++	for (int j = 0; j < 12; j++) {
++		lcg = lcg * 1103515245u + 12345u;
++		g += (double)((lcg >> 8) & 0xFFFFu) / 65536.0 - 0.5;
++	}
++	return g;
++}
++
++// What a receiver hears of the tones: made at 48 kHz and taken every 6th sample from offset (so a bit's end falls
++// anywhere between samples), scaled, inverted, de-emphasized (750 us), with noise of sigma, between two silences.
++// Returns the samples written to out
++static size_t heard(const uint8_t *tones, int offset, double gain, bool invert, bool deemph, double sigma, int16_t *out)
++{
++	static int16_t hi[9000];
++	afsk_mod_t m;
++	afsk_mod_init(&m, 48000);
++	size_t n = afsk_mod_fsk(&m, tones, MDC1200_BURST_BITS, 20000, MDC1200_MARK_HZ, MDC1200_SPACE_HZ, hi, 9000);
++	size_t k = 0;
++	double y = 0, a = 1.0 / (1.0 + 8000.0 * 750e-6);
++	for (int i = 0; i < 400; i++) {
++		out[k++] = 0;
++	}
++	for (size_t i = (size_t)offset; i < n; i += 6) {
++		double x = hi[i] * gain * (invert ? -1.0 : 1.0);
++		if (deemph) {
++			y += a * (x * 6.0 - y);	// the gain makes up for the level the filter takes at these tones
++			x = y;
++		}
++		out[k++] = (int16_t)x;
++	}
++	for (int i = 0; i < 400; i++) {
++		out[k++] = 0;
++	}
++	for (size_t i = 0; i < k && sigma > 0; i++) {
++		double v = out[i] + noise() * sigma;
++		out[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
++	}
++	return k;
++}
++
++// One burst through a fresh decoder: 1 when exactly that packet came out, 0 when nothing did, -1 for anything else
++static int hear(uint8_t arg, uint16_t unit, int offset, double gain, bool invert, bool deemph, double sigma)
++{
++	static int16_t pcm[2400];
++	uint8_t t[MDC1200_BURST_BYTES];
++	mdc1200_tones(MDC1200_OP_PTT_ID, arg, unit, t);
++	size_t n = heard(t, offset, gain, invert, deemph, sigma, pcm);
++	mdc1200_dec_t d;
++	mdc1200_packet_t p = { 0, 0, 0 };
++	mdc1200_dec_init(&d);
++	unsigned found = mdc1200_dec(&d, pcm, n, &p);
++	if (found == 0) {
++		return 0;
++	}
++	return found == 1 && p.op == MDC1200_OP_PTT_ID && p.arg == arg && p.unit == unit ? 1 : -1;
++}
++
++static void test_decode(void)
++{
++	static const uint16_t ids[] = { 0x0001, 0x0644, 0x1234, 0x8000, 0xA5A5, 0xBEEF, 0xFFFF };
++	// Every sample timing, both polarities, flat and de-emphasized
++	int ok = 0, total = 0;
++	for (unsigned i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
++		for (int off = 0; off < 6; off++) {
++			for (int k = 0; k < 4; k++) {
++				total++;
++				ok += hear(i & 1u ? MDC1200_ARG_PTT_PRE : MDC1200_ARG_PTT_POST, ids[i], off, 0.5, k & 1, k & 2, 0) == 1;
++			}
++		}
++	}
++	CHECK(ok == total);
++	// From a whisper to full scale
++	for (double gain = 0.002; gain < 1.7; gain *= 5) {
++		for (int off = 0; off < 6; off++) {
++			CHECK(hear(MDC1200_ARG_PTT_PRE, 0x0644, off, gain, false, true, 0) == 1);
++		}
++	}
++	// Noise at 40 % of the tones' peak: every burst still, and never another packet
++	lcg = 1;
++	ok = total = 0;
++	for (int run = 0; run < 60; run++) {
++		int r = hear(MDC1200_ARG_PTT_PRE, 0x0644, run % 6, 0.5, false, true, 4000);
++		CHECK(r >= 0);
++		total++;
++		ok += r == 1;
++	}
++	CHECK(ok == total);
++	// Noise as strong as the tones: some are lost, none is wrong
++	ok = 0;
++	for (int run = 0; run < 60; run++) {
++		int r = hear(MDC1200_ARG_PTT_PRE, 0x0644, run % 6, 0.5, false, true, 10000);
++		CHECK(r >= 0);
++		ok += r == 1;
++	}
++	CHECK(ok < 60);
++
++	// Bits wrong in the air: the parity corrects two anywhere, and a burst (the interleave spreads it); more than it
++	// can correct gives nothing, never another unit
++	static int16_t pcm[2400];
++	uint8_t f[MDC1200_BURST_BYTES], t[MDC1200_BURST_BYTES];
++	static const struct { uint8_t at[6]; uint8_t n; bool decodes; } hits[] = {
++		{ { 0 }, 1, true }, { { 111 }, 1, true }, { { 5, 70 }, 2, true }, { { 40, 41, 42 }, 3, true },
++		{ { 16, 17, 18, 19, 20 }, 5, true }, { { 0, 16, 32, 48, 64, 80 }, 6, false },
++	};
++	for (unsigned h = 0; h < sizeof(hits) / sizeof(hits[0]); h++) {
++		mdc1200_frame(MDC1200_OP_PTT_ID, MDC1200_ARG_PTT_PRE, 0x0644, f);
++		for (unsigned k = 0; k < hits[h].n; k++) {
++			f[DATA_AT + hits[h].at[k] / 8u] ^= (uint8_t)(0x80u >> (hits[h].at[k] % 8u));
++		}
++		frame_tones(f, t);
++		mdc1200_dec_t d;
++		mdc1200_packet_t p = { 0, 0, 0 };
++		mdc1200_dec_init(&d);
++		unsigned found = mdc1200_dec(&d, pcm, heard(t, 2, 0.5, false, true, 0, pcm), &p);
++		CHECK(found == (hits[h].decodes ? 1u : 0u) && (found == 0 || p.unit == 0x0644));
++	}
++	// A few sync bits wrong: still found
++	mdc1200_frame(MDC1200_OP_PTT_ID, MDC1200_ARG_PTT_PRE, 0x0644, f);
++	f[8] ^= 0x10;
++	f[10] ^= 0x01;
++	frame_tones(f, t);
++	mdc1200_dec_t d;
++	mdc1200_packet_t p = { 0, 0, 0 };
++	mdc1200_dec_init(&d);
++	CHECK(mdc1200_dec(&d, pcm, heard(t, 4, 0.5, false, true, 0, pcm), &p) == 1 && p.unit == 0x0644);
++
++	// The start and the end burst of one transmission, fed in a radio's 25 ms pieces: two packets, in order
++	mdc1200_dec_init(&d);
++	unsigned found = 0;
++	uint16_t units[2] = { 0, 0 };
++	uint8_t args[2] = { 0xFF, 0xFF };
++	for (int b = 0; b < 2; b++) {
++		mdc1200_tones(MDC1200_OP_PTT_ID, b == 0 ? MDC1200_ARG_PTT_PRE : MDC1200_ARG_PTT_POST, 0xBEEF, t);
++		size_t n = heard(t, 1 + b, 0.3, false, true, 500, pcm);
++		for (size_t at = 0; at < n; at += 200) {
++			if (mdc1200_dec(&d, pcm + at, n - at < 200 ? n - at : 200, &p) != 0 && found < 2) {
++				units[found] = p.unit;
++				args[found++] = p.arg;
++			}
++		}
++	}
++	CHECK(found == 2 && units[0] == 0xBEEF && units[1] == 0xBEEF && d.bursts == 2);
++	CHECK(args[0] == MDC1200_ARG_PTT_PRE && args[1] == MDC1200_ARG_PTT_POST);
++
++	// Ten minutes of an open squelch's noise at full scale, and of silence: nothing
++	mdc1200_dec_init(&d);
++	lcg = 7;
++	found = 0;
++	for (int block = 0; block < 600 * 40; block++) {
++		for (int i = 0; i < 200; i++) {
++			double v = noise() * 9000;
++			pcm[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
++		}
++		found += mdc1200_dec(&d, pcm, 200, &p);
++	}
++	memset(pcm, 0, sizeof(pcm));
++	found += mdc1200_dec(&d, pcm, 2400, &p);
++	CHECK(found == 0);
++}
++
+ int main(void)
+ {
+ 	test_crc();
+ 	test_frame();
+ 	test_tones();
+ 	test_audio();
++	test_decode();
+ 	printf("# mdc1200Test: %d checks, %s\n", checks, failures ? "FAILED" : "PASSED");
+ 	return failures ? 1 : 0;
+ }
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 5a3fc8b..ba2c067 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2908,6 +2908,31 @@ static bool run_token(char *t, char *err, size_t len)
+ 		advance(200);
+ 		return true;
+ 	}
++#if CONFIG_MDC1200
++	// an FM channel that decodes MDC-1200 IDs: idle (unit 0644 heard 2 s ago), rx (its ID heard in this reception),
++	// quiet (nothing heard yet)
++	if (strcmp(t, "mdc") == 0 && arg != NULL) {
++		view.ch.mode = RADIO_MODE_FM;
++		strcpy(view.ch.name, "Dispatch");
++		view.ch.rx_hz = view.ch.tx_hz = 155475000;
++		view.ch.ani_type = CODEPLUG_ANI_MDC1200;
++		view.ch.ani_opts = CODEPLUG_ANI_DECODE;
++		memset(&view.mdc, 0, sizeof(view.mdc));
++		view.state = RS_IDLE;
++		if (strcmp(arg, "quiet") != 0) {
++			view.mdc.last_source = 0x0644;
++			view.mdc.last_ms = now_ms > 2500 ? now_ms - 2500 : 1;
++		}
++		if (strcmp(arg, "rx") == 0) {
++			view.state = RS_RX;
++			view.rssi_dbm = -82;
++			view.mdc.source = 0x0644;
++		}
++		ui_dirty();
++		advance(TICK_MS);
++		return true;
++	}
++#endif
+ 	if (strcmp(t, "pttup") == 0) {
+ 		input_event_t ev = { ACT_PTT, GESTURE_UP, 0 };
+ 		ui_app_key(&ev);
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 24817ff..d422776 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -523,6 +523,12 @@ static const flow_t flows[] = {
+ 	{ "E MDC ID, sent at start and end, saved", CE_FM_ID " ok down ok ok ok down", "ok 1 2 3 4 ok long:ok",
+ 	  "toast=Saved_channel shows=1234 shows=Start_and_end writes=1", 7, true },
+ 	{ "E a DMR channel has no FM ID rows", "ok 5 ok", "", "hides=ID_type hides=Send_ID", 0, false },
++	{ "E FM decode IDs: off, then on", CE_FM_ID " ok down down down", "ok", "shows=Decode_IDs shows=On", 1, false },
++	// The ID heard on an FM channel that decodes MDC-1200, as a P25 channel's last caller
++	{ "1 MDC-1200: the last ID heard and how long ago", "mdc:idle", "", "shows=Last_ID_0644 shows=s_ago", 0, false },
++	// (under the meter where the activity area has two lines; the smallest displays show the meter alone)
++	{ "1 MDC-1200: receiving, the last ID line gives way", "mdc:rx", "", "shows=-82_dBm hides=Last_ID", 0, false },
++	{ "1 MDC-1200: nothing heard yet", "mdc:quiet", "", "hides=Last_ID hides=0644", 0, false },
+ #endif
+ 	{ "E time-out in steps of 15", "ok 5 ok down down down down down down down down down down down down down down down "
+ 	  "down", "ok 7 ok", "toast=Not_changed", 3, false },

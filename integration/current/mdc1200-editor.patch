@@ -1,0 +1,384 @@
+diff --git a/site/i18n/en.json b/site/i18n/en.json
+index d164608..0a0b44a 100644
+--- a/site/i18n/en.json
++++ b/site/i18n/en.json
+@@ -1610,6 +1610,16 @@
+  "editor.col.squelch": "Squelch",
+  "editor.col.vox": "VOX Allowed",
+  "editor.col.tone_burst": "1750 Hz Tone Burst",
++ "editor.col.ani_type": "ID type",
++ "editor.col.ani_send": "Send ID",
++ "editor.col.ani_id": "MDC-1200 ID",
++ "editor.col.ani_decode": "Decode received IDs",
++ "editor.ani.none": "None",
++ "editor.ani.send_off": "Off",
++ "editor.ani.send_start": "At start",
++ "editor.ani.send_end": "At end",
++ "editor.ani.send_both": "Start and end",
++ "editor.err.mdc_id": "MDC-1200 ID: hex 0001-FFFF, or blank for none",
+  "editor.col.channel_id": "Channel DMR ID",
+  "editor.col.dmo": "Force Direct Mode",
+  "editor.col.alias_ts1": "Talker Alias TS1",
+diff --git a/site/i18n/es.json b/site/i18n/es.json
+index 3f51133..0bd898e 100644
+--- a/site/i18n/es.json
++++ b/site/i18n/es.json
+@@ -1610,6 +1610,16 @@
+  "editor.col.squelch": "Squelch",
+  "editor.col.vox": "VOX permitido",
+  "editor.col.tone_burst": "Ráfaga de tono 1750 Hz",
++ "editor.col.ani_type": "Tipo de ID",
++ "editor.col.ani_send": "Enviar ID",
++ "editor.col.ani_id": "ID MDC-1200",
++ "editor.col.ani_decode": "Decodificar los ID recibidos",
++ "editor.ani.none": "Ninguno",
++ "editor.ani.send_off": "No",
++ "editor.ani.send_start": "Al inicio",
++ "editor.ani.send_end": "Al final",
++ "editor.ani.send_both": "Inicio y final",
++ "editor.err.mdc_id": "ID MDC-1200: hex 0001-FFFF, o vacío para ninguno",
+  "editor.col.channel_id": "ID DMR del canal",
+  "editor.col.dmo": "Forzar modo directo",
+  "editor.col.alias_ts1": "Alias de hablante TS1",
+diff --git a/site/i18n/it.json b/site/i18n/it.json
+index 0b97621..606386f 100644
+--- a/site/i18n/it.json
++++ b/site/i18n/it.json
+@@ -1610,6 +1610,16 @@
+  "editor.col.squelch": "Squelch",
+  "editor.col.vox": "VOX consentito",
+  "editor.col.tone_burst": "Tono di apertura 1750 Hz",
++ "editor.col.ani_type": "Tipo di ID",
++ "editor.col.ani_send": "Invia ID",
++ "editor.col.ani_id": "ID MDC-1200",
++ "editor.col.ani_decode": "Decodifica gli ID ricevuti",
++ "editor.ani.none": "Nessuno",
++ "editor.ani.send_off": "No",
++ "editor.ani.send_start": "All'inizio",
++ "editor.ani.send_end": "Alla fine",
++ "editor.ani.send_both": "Inizio e fine",
++ "editor.err.mdc_id": "ID MDC-1200: esadecimale 0001-FFFF, o vuoto per nessuno",
+  "editor.col.channel_id": "ID DMR del canale",
+  "editor.col.dmo": "Forza modo diretto",
+  "editor.col.alias_ts1": "Alias parlante TS1",
+diff --git a/site/i18n/zh.json b/site/i18n/zh.json
+index 6afc0f4..2dcb55b 100644
+--- a/site/i18n/zh.json
++++ b/site/i18n/zh.json
+@@ -1610,6 +1610,16 @@
+  "editor.col.squelch": "静噪",
+  "editor.col.vox": "允许 VOX",
+  "editor.col.tone_burst": "1750 Hz 突发音",
++ "editor.col.ani_type": "ID 类型",
++ "editor.col.ani_send": "发送 ID",
++ "editor.col.ani_id": "MDC-1200 ID",
++ "editor.col.ani_decode": "解码收到的 ID",
++ "editor.ani.none": "无",
++ "editor.ani.send_off": "关",
++ "editor.ani.send_start": "开始时",
++ "editor.ani.send_end": "结束时",
++ "editor.ani.send_both": "开始和结束",
++ "editor.err.mdc_id": "MDC-1200 ID：十六进制 0001-FFFF，留空表示无",
+  "editor.col.channel_id": "信道 DMR ID",
+  "editor.col.dmo": "强制直通模式",
+  "editor.col.alias_ts1": "主叫别名 TS1",
+diff --git a/site/static/js/codeplug/channelmodes.js b/site/static/js/codeplug/channelmodes.js
+index 7975f79..2ed099b 100644
+--- a/site/static/js/codeplug/channelmodes.js
++++ b/site/static/js/codeplug/channelmodes.js
+@@ -18,7 +18,7 @@
+ 
+ import { decodeArea, getValue, setValue, deleteValue, dedupe, putArea, KV_ADDR, KV_SIZE, KV_HDR, KEYS } from "./kv.js";
+ import { getName, putName } from "./fields.js";
+-import { redactDmrBasicKeys } from "./records.js";
++import { redactDmrBasicKeys, aniByte } from "./records.js";
+ import { KINDS, kindRow, typeRow, radioRuns } from "./modes.js";
+ import { u16, u32, put16, put32, sameBytes, sameValue, nameCheck } from "./modebytes.js";
+ 
+@@ -142,6 +142,11 @@ export function decodeModes(m, b) {
+ 			baseOwn: (t.flags & TAG.baseOwn) !== 0, fallback: null, params: mod ? mod.decode(t.params) : null, tagRaw: raw,
+ 		});
+ 		for (const [k, bit] of Object.entries(mod?.flags ?? {})) c[k] = (t.flags & bit) !== 0;
++		if (c.aniType) {
++			// not a signaling ID: this kind's unit ID, which reads as one
++			c.dmrId = ((aniByte(c) << 16) | c.aniId) >>> 0;
++			Object.assign(c, { aniType: 0, aniSend: 0, aniDecode: false, aniId: 0 });
++		}
+ 	}
+ 	// fallbacks name channels: resolved once every channel has its kind
+ 	for (const c of m.channels) {
+diff --git a/site/static/js/codeplug/csv.js b/site/static/js/codeplug/csv.js
+index ba070ab..654dd6b 100644
+--- a/site/static/js/codeplug/csv.js
++++ b/site/static/js/codeplug/csv.js
+@@ -89,6 +89,25 @@ const asBool = (s) => {
+ 	throw new Bad("bad_bool");
+ };
+ const yesNo = (v) => (v ? "Yes" : "No");
++// An FM channel's signaling ID (open-firmware-cps.md 7.3.3.2): its type, when it is sent, and the MDC-1200 unit ID in hex
++const hasAni = (r) => r.mode === "fm" && !r.kind && !!r.aniType;
++const ANI_TYPE_WORDS = { none: 0, off: 0, "mdc-1200": 1, mdc1200: 1, mdc: 1 };
++const ANI_SEND_WORDS = { off: 0, none: 0, start: 1, pre: 1, end: 2, post: 2, both: 3 };
++const ANI_SEND_TEXT = ["Off", "Start", "End", "Both"];
++const asWordOf = (words) => (s) => {
++	if (s.trim() === "") return 0;	// a channel without the ID: its cells are blank
++	const n = words[s.trim().toLowerCase()];
++	if (n === undefined) throw new Bad("bad_value", { value: s.trim(), allowed: Object.keys(words).join(", ") });
++	return n;
++};
++const asMdcId = (s) => {
++	s = s.trim();
++	if (s === "") return 0;
++	if (!/^(0x)?[0-9a-f]+$/i.test(s)) throw new Bad("bad_value", { value: s, allowed: "0001-FFFF" });
++	const n = parseInt(s.replace(/^0x/i, ""), 16);
++	if (n > 0xFFFF) throw new Bad("range", { min: 0, max: "FFFF" });
++	return n;
++};
+ 
+ const asInt = (lo, hi, blank) => (s) => {
+ 	s = s.trim();
+@@ -331,6 +350,10 @@ export const TABLES = {
+ 			c("SFR", "sfr", asBool, (r) => yesNo(r.sfr)),
+ 			c("SFR A", "sfrA", asInt(0, 255, 0)),
+ 			c("SFR B", "sfrB", asInt(0, 255, 0)),
++			c("ID Type", "aniType", asWordOf(ANI_TYPE_WORDS), (r) => (hasAni(r) ? "MDC-1200" : ""), ["Signaling", "PTT ID Type"]),
++			c("Send ID", "aniSend", asWordOf(ANI_SEND_WORDS), (r) => (hasAni(r) ? ANI_SEND_TEXT[r.aniSend & 3] : ""), ["PTT ID"]),
++			c("MDC ID", "aniId", asMdcId, (r) => (hasAni(r) ? r.aniId.toString(16).toUpperCase().padStart(4, "0") : ""), ["MDC-1200 ID", "MDC1200 ID"]),
++			c("Decode ID", "aniDecode", asBool, (r) => (hasAni(r) ? yesNo(r.aniDecode) : ""), ["Decode IDs", "MDC Decode"]),
+ 		],
+ 		create: () => newChannel(),
+ 		required: ["name", "rxHz"],
+diff --git a/site/static/js/codeplug/model.js b/site/static/js/codeplug/model.js
+index 4dce52c..523ed97 100644
+--- a/site/static/js/codeplug/model.js
++++ b/site/static/js/codeplug/model.js
+@@ -139,6 +139,7 @@ const CHANNEL_KEYS = [
+ 	"name", "rxHz", "txHz", "mode", "power", "tot", "rxTone", "txTone", "bw", "rxOnly", "allSkip", "zoneSkip", "vox",
+ 	"squelch", "colorCode", "timeslot", "contact", "rxList", "aprs", "dmrId", "dmrPrivacy", "dmrPrivacyKey", "noBeep", "noEco", "dmo", "roam",
+ 	"aliasTs1", "aliasTs2", "useLocation", "lat", "lon", "sfr", "sfrA", "sfrB", "toneBurst",
++	"aniType", "aniSend", "aniDecode", "aniId",
+ ];
+ 
+ function flatChannel(c) {
+@@ -260,7 +261,7 @@ export function newChannel(fields = {}) {
+ 		txTone: "", bw: 12.5, rxOnly: false, allSkip: false, zoneSkip: false, vox: false, squelch: 0, colorCode: 1,
+ 		timeslot: 1, contact: null, rxList: null, aprs: null, dmrId: 0, noBeep: false, noEco: false, dmo: false,
+ 		roam: false, aliasTs1: 0, aliasTs2: 0, useLocation: false, lat: 0, lon: 0, sfr: false, sfrA: 0, sfrB: 0,
+-		toneBurst: false, kind: 0, ...fields,
++		toneBurst: false, aniType: 0, aniSend: 0, aniDecode: false, aniId: 0, kind: 0, ...fields,
+ 	};
+ }
+ 
+diff --git a/site/static/js/codeplug/records.js b/site/static/js/codeplug/records.js
+index 6f757fe..1e2bd27 100644
+--- a/site/static/js/codeplug/records.js
++++ b/site/static/js/codeplug/records.js
+@@ -60,12 +60,24 @@ export function blankChannel() {
+ 	return r;
+ }
+ 
++// An FM channel's signaling ID (open-firmware-cps.md 7.3.3.2), in the per-channel DMR ID bytes: byte 0x27 has bit 7
++// set (a kind's unit ID can too: channelmodes.js gives it back), whether received IDs are decoded in bit 6, when the
++// ID is sent in bits 5-4, the type in bits 3-0
++export const ANI_NONE = 0, ANI_MDC1200 = 1;
++export const ANI_SEND_OFF = 0, ANI_SEND_START = 1, ANI_SEND_END = 2, ANI_SEND_BOTH = 3;
++const ANI_TYPES = 2;
++// The byte 0x27 as the signaling ID of a channel (and its first two bytes with the ID, back to the number they were)
++export const aniByte = (c) => 0x80 | (c.aniDecode ? 0x40 : 0) | ((c.aniSend & 0x03) << 4) | (c.aniType & 0x0F);
++
+ // A record, or null if its frequencies don't decode (an erased or broken record)
+ export function decodeChannel(r, memory = false) {
+ 	const rxHz = getFreq(r, 0x10), txHz = getFreq(r, 0x14);
+ 	if (rxHz === null || txHz === null) return null;
+ 	const l1 = r[0x26], f1 = r[0x30], f4 = r[0x33];
+ 	const hasLoc = (l1 & 0x08) !== 0;
++	// FM: the ID bytes may hold the signaling ID; a type this version doesn't know reads as none, the bytes unchanged
++	const ani = r[0x18] !== 1 && (l1 & 0x80) && (r[0x27] & 0x80) && (r[0x27] & 0x0F) !== ANI_NONE && (r[0x27] & 0x0F) < ANI_TYPES ? r[0x27] : 0;
++	const aniType = ani & 0x0F;
+ 	return {
+ 		name: getName(r, 0, 16),
+ 		rxHz, txHz,
+@@ -87,7 +99,11 @@ export function decodeChannel(r, memory = false) {
+ 		aprs: r[0x2D],
+ 		...(memory && r[0x18] === 1 && dmrPrivacy(r) ?
+ 			{ dmrPrivacy: dmrPrivacy(r), dmrPrivacyKey: r[0x36] } : {}),
+-		dmrId: l1 & 0x80 ? (r[0x27] << 16) | (r[0x28] << 8) | r[0x29] : 0,
++		dmrId: (l1 & 0x80) && !ani ? (r[0x27] << 16) | (r[0x28] << 8) | r[0x29] : 0,
++		aniType,
++		aniSend: aniType ? (ani >> 4) & 0x03 : ANI_SEND_OFF,
++		aniDecode: aniType ? (ani & 0x40) !== 0 : false,
++		aniId: aniType ? (r[0x28] << 8) | r[0x29] : 0,
+ 		noBeep: (l1 & 0x40) !== 0,
+ 		noEco: (l1 & 0x20) !== 0,
+ 		dmo: (l1 & 0x04) !== 0,
+@@ -142,6 +158,12 @@ export function encodeChannel(c, r, memory = false) {
+ 		r[0x28] = 0x16;
+ 		r[0x29] = 0x00;
+ 	}
++	if (c.mode === "fm" && !c.kind && c.aniType) {
++		r[0x26] |= 0x80;
++		r[0x27] = aniByte(c);
++		r[0x28] = (c.aniId >> 8) & 0xFF;
++		r[0x29] = c.aniId & 0xFF;
++	}
+ 	r[0x30] = (r[0x30] & ~0x0F) | (c.aliasTs1 & 3) | ((c.aliasTs2 & 3) << 2);
+ 	// Location bytes only when they change, so a record whose location bytes hold something else keeps them
+ 	const old = { lat: getCoord(r[0x1D], r[0x1C], r[0x1A]), lon: getCoord(r[0x24], r[0x1F], r[0x1E]) };
+diff --git a/site/static/js/editor/views.js b/site/static/js/editor/views.js
+index d77c7c0..ab8173b 100644
+--- a/site/static/js/editor/views.js
++++ b/site/static/js/editor/views.js
+@@ -102,6 +102,19 @@ const tone = (t) => (r, k, v) => {
+ 	r[k] = s;
+ };
+ 
++// An FM channel's MDC-1200 unit ID: 4 hex digits, blank for none
++const mdcId = (t) => (r, k, v) => {
++	const s = String(v ?? "").trim();
++	if (s === "") {
++		r[k] = 0;
++		return;
++	}
++	if (!/^(0x)?[0-9a-f]{1,4}$/i.test(s)) return t("editor.err.mdc_id");
++	r[k] = parseInt(s.replace(/^0x/i, ""), 16);
++};
++const mdcIdText = (v) => (v ? v.toString(16).toUpperCase().padStart(4, "0") : "");
++const aniOn = (r) => r.mode === "fm" && !r.kind && !!r.aniType;
++
+ const dmrId = (t) => (r, k, v) => {
+ 	const s = String(v ?? "").trim();
+ 	if (s === "" || s === "0") {
+@@ -363,6 +376,12 @@ export function channelForm(m, t, { features = null } = {}) {
+ 		fm(sel("squelch", "editor.col.squelch", () => [[0, t("editor.squelch.default")], ...[...Array(21).keys()].map((n) => [n + 1, String(n + 1)])])),
+ 		fm(chk("vox", "editor.col.vox")),
+ 		fm(chk("toneBurst", "editor.col.tone_burst")),
++		// the signaling ID the channel sends (MDC-1200 PTT ID); when and which ID once a type is chosen
++		fm(sel("aniType", "editor.col.ani_type", () => [[0, t("editor.ani.none")], [1, "MDC-1200"]])),
++		{ ...sel("aniSend", "editor.col.ani_send", () => [[0, t("editor.ani.send_off")], [1, t("editor.ani.send_start")],
++			[2, t("editor.ani.send_end")], [3, t("editor.ani.send_both")]]), show: aniOn },
++		{ ...txt("aniId", "editor.col.ani_id", mdcId(t), mdcIdText), show: aniOn },
++		{ ...chk("aniDecode", "editor.col.ani_decode"), show: aniOn },
+ 		dmr({ group: t("editor.form.digital") }),
+ 		dmr(sel("colorCode", "editor.col.cc", () => [...Array(16).keys()].map((n) => [n, String(n)]))),
+ 		dmr(sel("timeslot", "editor.col.ts", () => [[1, "1"], [2, "2"]])),
+diff --git a/site/tests/csv.test.mjs b/site/tests/csv.test.mjs
+index 0f6a137..bc902cb 100644
+--- a/site/tests/csv.test.mjs
++++ b/site/tests/csv.test.mjs
+@@ -167,3 +167,87 @@ test("unknown headers are listed, and a file of no table is refused", () => {
+ 	assert.equal(detect("Foo,Bar\n1,2\n"), null);
+ 	assert.throws(() => importTable(m, "Foo,Bar\n1,2\n"), { code: "not_a_table" });
+ });
++
++// An FM channel's signaling ID (open-firmware-cps.md 7.3.3.2; the multi-mode derivative)
++test("FM signaling ID: record layout, CSV round trip, the other modes keep their own ID", async () => {
++	const { encodeChannel, decodeChannel, blankChannel } = await import("../static/js/codeplug/records.js");
++	// none: the bytes a channel without its own ID has
++	const plain = encodeChannel(newChannel({ name: "FM" }), blankChannel());
++	assert.deepEqual([plain[0x26] & 0x80, plain[0x27], plain[0x28], plain[0x29]], [0, 0x00, 0x16, 0x00]);
++	assert.deepEqual([decodeChannel(plain).aniType, decodeChannel(plain).aniId], [0, 0]);
++	// MDC-1200, ID 1A2B, sent at the start and the end
++	const mdc = newChannel({ name: "Dispatch", rxHz: 155475000, txHz: 155475000, aniType: 1, aniSend: 3, aniId: 0x1A2B });
++	const r = encodeChannel(mdc, blankChannel());
++	assert.deepEqual([r[0x26] & 0x80, r[0x27], r[0x28], r[0x29]], [0x80, 0xB1, 0x1A, 0x2B]);
++	const back = decodeChannel(r);
++	assert.deepEqual([back.aniType, back.aniSend, back.aniDecode, back.aniId, back.dmrId], [1, 3, false, 0x1A2B, 0]);
++	// the decode option is kept as it is
++	r[0x27] = 0xD1;
++	const dec = decodeChannel(r);
++	assert.deepEqual([dec.aniSend, dec.aniDecode], [1, true]);
++	assert.equal(encodeChannel(dec, r)[0x27], 0xD1);
++	// a type this version doesn't know reads as none, and its bytes stay as they are (saved again, they are written back);
++	// a DMR ID left on an FM channel is not a signaling ID and stays
++	r[0x27] = 0x97;
++	assert.deepEqual([decodeChannel(r).aniType, decodeChannel(r).dmrId], [0, 0x971A2B]);
++	assert.deepEqual([...encodeChannel(decodeChannel(r), r).slice(0x27, 0x2A)], [0x97, 0x1A, 0x2B]);
++	r.set([0x2F, 0x7D, 0x99], 0x27);
++	const left = decodeChannel(r);
++	assert.deepEqual([left.aniType, left.dmrId], [0, 0x2F7D99]);
++	assert.deepEqual([...encodeChannel(left, r).slice(0x27, 0x2A)], [0x2F, 0x7D, 0x99]);
++	// a kind's unit ID of 0x800000 or more reads as a signaling ID; channelmodes.js gives the bytes back as the number
++	// they were (a P25 or NXDN channel keeps its unit ID there)
++	const { aniByte } = await import("../static/js/codeplug/records.js");
++	r.set([0x91, 0x1A, 0x2B], 0x27);
++	const unit = decodeChannel(r);
++	assert.deepEqual([unit.aniType, unit.aniSend, unit.dmrId], [1, 1, 0]);
++	assert.equal(((aniByte(unit) << 16) | unit.aniId) >>> 0, 0x911A2B);
++	// a DMR channel's ID is its own: the FM fields are not written there
++	const dmr = encodeChannel({ ...mdc, mode: "dmr", dmrId: 3112345 }, blankChannel());
++	assert.deepEqual([...dmr.slice(0x27, 0x2A)], [0x2F, 0x7D, 0x99]);
++	assert.equal(decodeChannel(dmr).aniType, 0);
++
++	const m = empty();
++	m.channels.push({ ...mdc, number: 1 }, newChannel({ name: "FM", number: 2 }));
++	const text = exportTable(m, "channels");
++	const rows = parse(text);
++	const col = (row, name) => row[rows[0].indexOf(name)];
++	assert.deepEqual([col(rows[1], "ID Type"), col(rows[1], "Send ID"), col(rows[1], "MDC ID")], ["MDC-1200", "Both", "1A2B"]);
++	assert.deepEqual([col(rows[1], "Decode ID"), col(rows[2], "Decode ID")], ["No", ""]);
++	assert.deepEqual([col(rows[2], "ID Type"), col(rows[2], "Send ID"), col(rows[2], "MDC ID")], ["", "", ""]);
++	const n = empty();
++	assert.deepEqual(importTable(n, text).problems, []);
++	assert.deepEqual([n.channels[0].aniType, n.channels[0].aniSend, n.channels[0].aniId], [1, 3, 0x1A2B]);
++	assert.equal(n.channels[1].aniType, 0);
++	// typed by hand: the words in any case, the ID in hex; a blank cell keeps the value
++	const typed = empty();
++	const ok = importTable(typed, "Name,RX Frequency (MHz),ID Type,Send ID,MDC ID\nA,155.475,mdc-1200,start,beef\nB,155.475,,,\n");
++	assert.deepEqual(ok.problems, []);
++	// decode alone: a channel that only listens for IDs needs none of its own
++	const listen = empty();
++	assert.deepEqual(importTable(listen, "Name,RX Frequency (MHz),ID Type,Decode ID\nL,155.475,MDC-1200,yes\n").problems, []);
++	assert.deepEqual([listen.channels[0].aniType, listen.channels[0].aniDecode, listen.channels[0].aniSend, listen.channels[0].aniId], [1, true, 0, 0]);
++	const { encodeChannel: enc, blankChannel: blank } = await import("../static/js/codeplug/records.js");
++	assert.equal(enc(listen.channels[0], blank())[0x27], 0xC1);
++	assert.deepEqual([typed.channels[0].aniType, typed.channels[0].aniSend, typed.channels[0].aniId], [1, 1, 0xBEEF]);
++	assert.equal(typed.channels[1].aniType, 0);
++	const bad = importTable(empty(), "Name,RX Frequency (MHz),ID Type,MDC ID\nX,155.475,five-tone,12345\n");
++	assert.deepEqual(bad.problems.map((p) => p.code).sort(), ["bad_value", "range"]);
++});
++
++// model.encode writes a channel record only when a field it compares (CHANNEL_KEYS) differs from the image, so every
++// signaling ID field has to be compared: a change to only one of them must still reach the image
++test("FM signaling ID: changing any one field alone is written to the image", () => {
++	const first = sim();
++	const fm = first.channels.find((c) => c.mode === "fm");
++	assert.ok(fm, "the simulated codeplug has an FM channel");
++	Object.assign(fm, { aniType: 1, aniSend: 1, aniId: 0x1A2B });
++	let img = encode(first);
++	for (const change of [{ aniSend: 3 }, { aniDecode: true }, { aniId: 0xBEEF }, { aniType: 0 }]) {
++		const m = decode(img);
++		Object.assign(m.channels.find((c) => c.number === fm.number), change);
++		const next = encode(m);
++		assert.notDeepEqual(next.bytes, img.bytes, JSON.stringify(change));
++		img = next;
++	}
++});
+diff --git a/site/tests/editor.test.mjs b/site/tests/editor.test.mjs
+index d9cb83d..946cb53 100644
+--- a/site/tests/editor.test.mjs
++++ b/site/tests/editor.test.mjs
+@@ -90,3 +90,24 @@ test("Radio tab ARS server and IP gateway: empty is an absent key, 0 is off", ()
+ 	assert.deepEqual(typed("16776415"), { value: 16776415 });
+ 	for (const s of ["16776416", "-1", "1.5", "abc"]) assert.deepEqual(typed(s), { error: "editor.err.range 0-16776415" }, s);
+ });
++
++test("an FM channel's signaling ID: its rows show once a type is chosen, the MDC-1200 ID is typed in hex", () => {
++	const form = channelForm(empty(), t);
++	const f = (key) => form.find((x) => x.key === key);
++	const fm = { mode: "fm", aniType: 0 }, mdc = { mode: "fm", aniType: 1 }, dmr = { mode: "dmr", aniType: 1 };
++	assert.deepEqual([fm, mdc, dmr].map((r) => f("aniType").show(r)), [true, true, false]);
++	assert.deepEqual([fm, mdc, dmr].map((r) => f("aniSend").show(r)), [false, true, false]);
++	assert.deepEqual([fm, mdc, dmr].map((r) => f("aniId").show(r)), [false, true, false]);
++	assert.deepEqual([fm, mdc, dmr].map((r) => f("aniDecode").show(r)), [false, true, false]);
++	assert.equal(f("aniDecode").type, "bool");
++	assert.deepEqual(f("aniType").options().map(([v]) => v), [0, 1]);
++	assert.deepEqual(f("aniSend").options().map(([v]) => v), [0, 1, 2, 3]);
++	const id = f("aniId");
++	assert.deepEqual([id.format(0), id.format(0x2B), id.format(0xBEEF)], ["", "002B", "BEEF"]);
++	const typed = (s) => {
++		const r = { aniId: 0x1234 };
++		return id.parse(r, "aniId", s) ?? r.aniId;
++	};
++	assert.deepEqual(["1a2b", " BEEF ", "0x10", "1", "", "  "].map(typed), [0x1A2B, 0xBEEF, 0x10, 1, 0, 0]);
++	for (const s of ["10000", "12G4", "-1", "any"]) assert.equal(typed(s), "editor.err.mdc_id", s);
++});

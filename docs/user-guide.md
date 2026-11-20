@@ -59,6 +59,36 @@ between the channel's own NAC/RAN and every NAC/RAN, keeping the TX one.
 | System ID | - | - | 3 hex digits, from the system's administrator (or RadioReference); 0 hears any (receive only) |
 | Unit ID | the channel's ID, else the radio's DMR ID | the same; NXDN needs 1-65519 | the same: **the ID the administrator assigned you** |
 
+## MDC-1200 PTT ID on FM channels
+
+An FM channel can send an MDC-1200 ID burst so that dispatch consoles and radios that decode MDC-1200 show who is
+transmitting. Set it per channel, in the radio's channel menu:
+
+| Row | Values |
+|---|---|
+| ID type | Off, or `MDC-1200` |
+| Send ID | `Off`, `At start` (each transmission starts with the ID), `At end` (the ID goes out when PTT is released), or `Start and end` |
+| Own ID | the unit ID, 4 hex digits (0001-FFFF). The keys type the digits, the knob or ▲▼ steps the last one through A-F |
+| Decode IDs | show the MDC-1200 ID of whoever transmits on the channel. Independent of sending: a channel can send, decode, both or neither |
+
+There is no radio-wide MDC-1200 ID: a channel without an ID sends nothing. The burst lasts about 0.2 s and the
+microphone is muted while it plays, so with the ID at the start wait a moment after pressing PTT (about 0.3 s)
+before talking.
+
+With **Decode IDs** on, an ID received at the start of a transmission shows under the signal meter while the
+transmission is received (`ID 0644`). The ID then stays on the home screen as the last one heard, with its age
+(`Last ID 0644 2s ago`), as a P25 channel does. An ID sent at the end of a transmission appears this way, after the
+transmission. IDs are shown as 4 hex digits and are not currently mapped to contacts or names. On a channel that
+decodes:
+
+- the battery saver is off (the receiver must be awake for the burst at the start of a transmission);
+- nothing is decoded while scanning or in dual watch;
+- on the APRS receive frequency, APRS has the receive audio and MDC-1200 is not decoded;
+- the receive audio takes the radio's digital audio path, so it may sound slightly different from other FM channels.
+
+Tested with Motorola and Kenwood radios: IDs sent by this firmware were decoded by them, and IDs they sent were
+decoded by this firmware.
+
 ## DMR repeaters with restricted access (RAS)
 
 A repeater with RAS (restricted access to system) alters the checks of each call's header and embedded link control
