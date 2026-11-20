@@ -25,6 +25,7 @@ PATCHES = (
 	'dmr-motorola-privacy.patch',
 	'digital-repeater-interop.patch',
 	'ysf-dn-narrow.patch',
+	'unified-tx-splash.patch',
 )
 
 
