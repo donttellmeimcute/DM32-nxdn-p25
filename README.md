@@ -27,7 +27,7 @@ los cambios de esta rama en [`integration/current/base.patch`](integration/curre
 | AM | Tipo de canal AM propio, solo RX, en cualquier frecuencia que sintonice el receptor (p. ej. banda aérea) |
 | Recepción ampliada | Activada por defecto. Solo RX fuera de las bandas de TX |
 | Monitor digital (DMon) | En P25 y NXDN: oye llamadas de cualquier grupo, NAC o RAN del canal |
-| AES-256 DMR | Formato Motorola (PI header FID 0x10, ALG 0x25, KID 1-255). En **Ajustes › Privacidad › Tipo clave: AES-256**, con el ID de la clave; la clave se carga en el editor (pestaña Radio, «DMR AES-256»). El keystream descifra 180 de 180 tramas de una grabación real con clave publicada. **Sin probar contra un Motorola en el aire** |
+| AES-256 DMR | Formato Motorola (FID `0x10`, ALG `0x25`, ID de clave 1–255). Compatible en ambos sentidos con la DM‑32UV de fábrica en llamadas de grupo, en simplex y por repetidor, según las [pruebas en el aire de `01da5d26`](https://github.com/donttellmeimcute/DM32-nxdn-p25/issues/40#issuecomment-7021512953) |
 | AES-256 P25 | Formato TIA-102.AAAD-A (ALGID `0x84`, KID de 16 bits). El keystream coincide con el de OP25 para una clave y un MI de referencia. **Sin probar contra un Motorola u otra marca** |
 | AES-256 NXDN | Formato del estándar NXDN TS 1-D (cipher 3, KID 0-63, VCALL_IV). Coincide bit a bit con los 32 vectores de prueba del estándar. Entrada tardía: descifra desde la sesión siguiente (hasta 1,3 s). **Sin probar contra Icom o Kenwood** |
 | DMR Tier III | Estación móvil: control channel, registro, llamadas de grupo y privadas, datos cortos (RadioFoundry). Sin probar en un sistema real |
@@ -44,7 +44,7 @@ pierde, por ahora:
 |---|---|
 | Cuatro claves AES en EEPROM (`0x7C00`) y la clave por canal en el byte `0x32` | Las claves van en el llavero del codeplug (CPS web, pestaña Radio). **Vuelve a cargar tus claves** después de actualizar y revisa los canales que tenían AES |
 | P25 fase 2 (TDMA), TX troncal P25 | No están |
-| AES-256 en DMR por canal (byte `0x32`) | AES-256 en DMR para toda la radio, en Ajustes › Privacidad (como la privacidad DMR de RadioFoundry) |
+| AES-256 en DMR por canal (byte `0x32`) | Selección por canal en el editor y en la radio. **Predeterminado de la radio** usa el ajuste general de privacidad |
 | Tema «Rosa», mensajes DMR de texto libre | El tema Rosa volvió como capa Kawaii (`CONFIG_UI_KAWAII`, `7c972f0`): tema rosa claro en toda la UI y foto de arranque. Los mensajes DMR de texto libre de la serie vieja siguen fuera; lo que trae esta base es DMR SMS/TMS de RadioFoundry |
 
 En la radio del autor, actualizar desde la versión anterior conservó canales y calibración. Haz siempre el respaldo
@@ -54,6 +54,14 @@ que ofrece el flasher. La serie de parches anterior queda en `integration/radiof
 
 El NAC/RAN de **TX** debe coincidir con el del otro equipo; Pi-Star usa NAC 293 y RAN 1. NXDN 4800 es el «VN» de Icom
 (6,25 kHz). Si el hotspot necesita un offset de cientos de Hz, corrige la radio en **Ajustes › Avanzado › Ajuste frec**.
+
+### DMR AES-256 con el firmware de fábrica
+
+1. En el CPS de Baofeng, abre **Digital Encrypt Systems** y consulta la clave **AES256** de 32 bytes y su número en la columna **Encryption ID**. Usa el valor completo de 64 caracteres hexadecimales del editor de la clave. La cuadrícula puede ocultar los primeros ocho.
+2. En el CPS web, abre **Radio → Claves AES-256**, registra el mismo valor para **DMR** con ese **ID de clave** y selecciónalo en cada canal que lo use. Por ejemplo, una clave en la fila **No. 1** con **Encryption ID 4** debe quedar como **ID 4**.
+3. Guarda el codeplug y comprueba una llamada en cada sentido con el mismo grupo, CC y ranura. Para esta interoperabilidad ambos radios deben usar AES-256. Las entradas AES128 y ARC4 del CPS de fábrica quedan fuera de este procedimiento.
+
+El importador de respaldos de fábrica requiere volver a cargar y asignar las claves manualmente. La ubicación de **Encryption ID** en el archivo `.data` sigue por confirmar. [Reporte de interoperabilidad y formato del respaldo](../../issues/42)
 
 ## Instalar
 
@@ -113,7 +121,9 @@ NXDN TS 1-D test vectors). Since 2026-11-17 it builds on current [RadioFoundry](
 (`e89121e9`) plus `integration/current/base.patch`; the old patch series no longer builds. Motorola-style talk permit tones. The first DMR PTT after NXDN/FM/P25 no longer goes out voiceless (`3f1c173`, host-tested; on-air confirmation still pending). DSD+ decodes NXDN96 calls from this firmware (18 Nov: TG 91, RID 321, RAN 22). A talkgroup-less NXDN channel now transmits all-call (`e6c105f`). The 40 Hz NXDN TX pre-compensation (`d30230a`) has no equivalent in this build — NXDN TX goes through the HR_C7000 native 4FSK slot engine, not an audio path — so it was documented as not portable (`3e83541`), not ported. Lost
 in the switch: P25 Phase 2, P25 trunking TX; AES keys must be loaded again. The pink theme is back as the Kawaii layer (`7c972f0`). Releases ship the image **without** the proprietary AMBE
 codec; the [web flasher](https://donttellmeimcute.github.io/dm32-web-cps-flasher/) takes it from your own radio.
-Interoperability with other makers' encrypted radios is untested. GPL-3.0-or-later, RadioFoundry code MIT.
+DMR AES-256 group calls were verified over the air in both directions with stock Baofeng DM-32UV firmware, on simplex and through a repeater. In Baofeng CPS, **Encryption ID** is the on-air key ID. Use that ID and the same full 32-byte key when entering the key manually in the web CPS. [Interoperability report](../../issues/42)
+
+GPL-3.0-or-later, RadioFoundry code MIT.
 
 **Support:** want firmware for another radio? Gift one from my wishlist and I can port it:
 <https://throne.com/lyraarsgoetia> · Support development on Ko-fi: <https://ko-fi.com/lyraarsgoetia>
