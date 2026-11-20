@@ -26,6 +26,7 @@ PATCHES = (
 	'digital-repeater-interop.patch',
 	'ysf-dn-narrow.patch',
 	'unified-tx-splash.patch',
+	'radiofoundry-660-audio-fifo.patch',
 	# MDC-1200 ID on FM channels (the firmware, then the web editor); off unless CONFIG_MDC1200=y
 	'mdc1200-ptt-id.patch',
 	'mdc1200-decode.patch',
