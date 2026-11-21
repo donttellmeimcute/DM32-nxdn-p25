@@ -36,6 +36,8 @@ PATCHES = (
 	'mdc1200-editor.patch',
 	# Per-channel FM squelch, including an explicit always-open level 0
 	'channel-squelch.patch',
+	# Bulk Edit RX Only: apply to every selected row and close without a false Boolean error
+	'rxonly-bulk-edit.patch',
 )
 
 

@@ -1,0 +1,53 @@
+diff --git a/site/static/js/editor/views.js b/site/static/js/editor/views.js
+index 6edb366..0986c3b 100644
+--- a/site/static/js/editor/views.js
++++ b/site/static/js/editor/views.js
+@@ -94,7 +94,11 @@ const recordField = (r, key) => !r.kind || !!kindMod(r)?.recordFields?.includes(
+ const ownFreqs = (r) => !r.kind || kindMod(r)?.ownFreqs !== false;
+ // Receive only: for a channel of a kind, its tag's transmit allowed turned round (the record is receive only)
+ const rxOnlyGet = (r) => (r.kind ? !r.tagTx : r.rxOnly);
+-const rxOnlySet = (r, v) => (r.kind ? (r.tagTx = !v) : (r.rxOnly = !!v));
++const rxOnlySet = (r, v) => {
++	// Column setters return an error string or nothing, never the assigned Boolean: Bulk Edit treats truthy as an error.
++	if (r.kind) r.tagTx = !v;
++	else r.rxOnly = !!v;
++};
+ 
+ const tone = (t) => (r, k, v) => {
+ 	const s = parseTone(v);
+diff --git a/site/tests/editor.test.mjs b/site/tests/editor.test.mjs
+index 2397425..d41d326 100644
+--- a/site/tests/editor.test.mjs
++++ b/site/tests/editor.test.mjs
+@@ -7,7 +7,7 @@ import { test } from "node:test";
+ import assert from "node:assert/strict";
+ 
+ import { bulkColumns, channelForm, columns, parseAreaKey } from "../static/js/editor/views.js";
+-import { empty } from "../static/js/codeplug/model.js";
++import { empty, newChannel } from "../static/js/codeplug/model.js";
+ import { KEYS } from "../static/js/codeplug/kv.js";
+ import { Grid } from "../static/js/editor/grid.js";
+ 
+@@ -72,6 +72,22 @@ test("the channel table shows the mode the radio uses in a receive-only band", (
+ 		["editor.mode.air", "editor.mode.bcast", "FM", "DMR"]);
+ });
+ 
++test("Bulk Edit RX Only applies Yes and No to every selected channel without a false error", () => {
++	const m = empty();
++	m.channels.push(newChannel({ name: "One" }), newChannel({ name: "Two" }), newChannel({ name: "Three" }));
++	const c = bulkColumns("channels", m, t).find((x) => x.key === "rxOnly");
++	for (const want of [true, false]) {
++		let err = null;
++		// The same stop-on-error contract as app.js's bulkSet(). A concise setter returning true used to stop at row one.
++		for (const r of m.channels) {
++			err = c.set(r, want);
++			if (err) break;
++		}
++		assert.equal(err, undefined);
++		assert.deepEqual(m.channels.map((r) => r.rxOnly), [want, want, want]);
++	}
++});
++
+ test("Bulk Edit sets no names or numbers, and has nothing to set on zones and RX lists", () => {
+ 	const keys = (table) => bulkColumns(table, empty(), t).map((c) => c.key);
+ 	assert.deepEqual([keys("zones"), keys("rxLists")], [[], []]);
