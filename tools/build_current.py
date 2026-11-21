@@ -44,6 +44,10 @@ PATCHES = (
 	'quick-digital-selectors.patch',
 	# Host tests: the VFO AES flows need CONFIG_AIR_AES (the NoColor build has no air modes)
 	'nocolor-aes-flows.patch',
+	# DMR: channel-local recent activity, TX hang time, and correct burst-F PI for ARC4/AES late entry
+	'dmr-activity-hang-late-entry.patch',
+	# Tools: independent, persistent zone-scan dwell; FM 50 ms, digital at least 75 ms
+	'zone-scan-speed.patch',
 )
 
 

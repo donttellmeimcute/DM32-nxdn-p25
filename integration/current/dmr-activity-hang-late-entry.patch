@@ -1,0 +1,368 @@
+diff --git a/core/dmr/call/dmr_call.c b/core/dmr/call/dmr_call.c
+index fca44d1..f83d425 100644
+--- a/core/dmr/call/dmr_call.c
++++ b/core/dmr/call/dmr_call.c
+@@ -183,6 +183,7 @@ static struct {
+ 	dmr_target_t reply;
+ 	uint32_t reply_until;
+ 	bool reply_set;
++	bool reply_tx;		// our over's hang: shown even when its target is the channel's normal one
+ 
+ 	// data (dmr_call_data_tx): the list being sent, and where received data bursts go
+ 	dmr_data_source_t data;
+@@ -381,7 +382,7 @@ static uint8_t reply_window_s(bool private_call)
+ static bool reply_running(uint32_t now)
+ {
+ 	return s.reply_set && reply_window_s(s.reply.private_call) && before(now, s.reply_until) &&
+-		!same_target(s.reply, s.cfg.talk_target);
++		(s.reply_tx || !same_target(s.reply, s.cfg.talk_target));
+ }
+ 
+ static dmr_target_t effective_target(uint32_t now)
+@@ -389,15 +390,17 @@ static dmr_target_t effective_target(uint32_t now)
+ 	return reply_running(now) ? s.reply : s.cfg.talk_target;
+ }
+ 
+-static void set_reply(dmr_target_t t, uint32_t now)
++static void set_reply(dmr_target_t t, uint32_t now, bool own_tx)
+ {
+ 	uint8_t w = reply_window_s(t.private_call);
+ 
++	s.reply_tx = false;
+ 	if (!w)
+ 		return;
+ 	s.reply = t;
+ 	s.reply_until = now + (uint32_t)w * 1000u;
+ 	s.reply_set = true;
++	s.reply_tx = own_tx;
+ 	s.dirty = true;
+ }
+ 
+@@ -608,7 +611,7 @@ static void rx_end(uint32_t now)
+ 		dmr_target_t t = { .id = s.view.caller.group ? s.view.caller.dst : s.view.caller.src,
+ 				   .private_call = !s.view.caller.group };
+ 		if (s.view.caller.group || s.view.caller.to_us)
+-			set_reply(t, now);
++			set_reply(t, now, false);
+ 	}
+ 	s.last_call_end_ms = now;
+ 	s.call_end_seen = true;
+@@ -1882,7 +1885,7 @@ static void tx_finished(uint32_t now)
+ 	s.tx = TX_NONE;
+ 	s.tx_end_ms = now;
+ 	s.tx_end_seen = true;
+-	set_reply(s.tx_target_used, now);
++	set_reply(s.tx_target_used, now, true);
+ 	s.last_call_end_ms = now;
+ 	s.call_end_seen = true;
+ 	s.dirty = true;
+@@ -2325,6 +2328,16 @@ void dmr_call_set_tx_gps(const dmr_gps_t *gps)
+ void dmr_call_reply_cancel(void)
+ {
+ 	s.reply_set = false;
++	s.reply_tx = false;
++	s.dirty = true;
++}
++
++void dmr_call_clear_last_heard(void)
++{
++	memset(&s.view.last_heard, 0, sizeof s.view.last_heard);
++	s.view.last_heard_ms = 0;
++	s.reply_set = false;
++	s.reply_tx = false;
+ 	s.dirty = true;
+ }
+ 
+diff --git a/core/dmr/call/dmr_call.h b/core/dmr/call/dmr_call.h
+index 9529d51..8b97e64 100644
+--- a/core/dmr/call/dmr_call.h
++++ b/core/dmr/call/dmr_call.h
+@@ -314,6 +314,9 @@ void dmr_call_tx_alias(char out[DMR_TA_TEXT_MAX + 1]);
+ // Zero the counters only (the view's evq_overflows / tx_underruns keep counting). From any task; an increment racing
+ // the reset may survive it
+ void dmr_call_reset_stats(void);
++// A channel/VFO change: forget the previous channel's last-heard contact and any reply/hang window. The active call,
++// if one is being retuned by the normal configure/stop path, is not ended here
++void dmr_call_clear_last_heard(void);
+ 
+ // RX trace (CONFIG_DEBUGLINK builds, DMR_RX_TRACE): every burst event as the stack saw it and what it did with it,
+ // packed into dlog() lines "crx @<slot> <entries>" (docs: dmr_call.c, rx trace). On by default; off saves the lines
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 6393542..bd69a05 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -845,6 +845,18 @@ static void tune(radio_sm_t *sm, uint32_t now_ms)
+ 		air_begin(sm);
+ 	}
+ #endif
++	if (sm->activity_reset) {
++		// After dmr_end/dmr_begin: stopping the old stack may have just published its final last-heard record
++		sm->activity_reset = false;
++		sm->view.last_rx_ms = 0;
++#if CONFIG_DMR
++		dmr_call_clear_last_heard();
++		memset(&sm->view.dmr.last, 0, sizeof sm->view.dmr.last);
++		sm->view.dmr.last_ms = 0;
++		sm->view.dmr.reply_active = false;
++		sm->view.dmr.reply_s = 0;
++#endif
++	}
+ 	outputs(sm);
+ 	changed(sm);
+ }
+@@ -907,6 +919,7 @@ static void set_channel(radio_sm_t *sm, uint16_t pos, const channel_t *ch)
+ 	uint32_t rx_hz = sm->view.ch.rx_hz, tx_hz = sm->view.ch.tx_hz;
+ 	uint8_t cc = sm->view.ch.color_code, ts = sm->view.ch.timeslot;
+ #endif
++	sm->activity_reset = true;
+ 	sm->view.vfo = false;
+ 	sm->view.zone_pos = pos;
+ 	sm->view.channel_number = sm->zone.channels[pos];
+@@ -985,6 +998,7 @@ static void enter_vfo(radio_sm_t *sm, uint32_t now_ms)
+ #if CONFIG_DMR_TRUNK
+ 	t3_off(sm);
+ #endif
++	sm->activity_reset = true;
+ 	sm->view.ch = sm->vfo_ch;
+ 	sm->view.vfo = true;
+ #if RADIO_MDC_RX
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index 23e0d28..772e734 100644
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -303,6 +303,7 @@ typedef struct {
+ 	uint32_t host_pushes;		// the host's audio pushes last seen, and when they last moved (the watchdog)
+ 	uint32_t host_push_ms;
+ 	bool retune_pending;		// receive settings changed during TX: retune on PTT release
++	bool activity_reset;		// channel/VFO changed: clear its predecessor's history after this retune
+ 	bool retune_due;		// the reference trim changed: tune at retune_due_ms (RREQ_RETUNE)
+ 	uint32_t retune_due_ms;
+ 	uint32_t tx_start_ms;
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+index 2e4215e..f608e45 100644
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -1097,6 +1097,7 @@ static bool air_save_now(uint16_t number, const channel_t *ch, bool *ok)
+ 	return false;
+ }
+ 
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
+ // Quick's masked digital fields into the channel's block. The block and every field Quick didn't touch stay as read.
+ // P25/NXDN targets are contacts in this codeplug format: an unknown TG remains temporary, never silently becomes TG 1.
+ static bool air_quick_save(bool *ok, bool *missing)
+@@ -1207,6 +1208,7 @@ static bool air_quick_save(bool *ok, bool *missing)
+ #endif
+ 	return false;
+ }
++#endif
+ 
+ // Power, bandwidth, tones, mode, color code and timeslot go into the channel; the squelch is radio-wide (the default
+ // squelch preference). The radio core re-reads the channel (codeplug_serial), and the clear makes the remaining
+diff --git a/docs/spec/dmr-voice.md b/docs/spec/dmr-voice.md
+index ba74d3d..31da026 100644
+--- a/docs/spec/dmr-voice.md
++++ b/docs/spec/dmr-voice.md
+@@ -47,7 +47,9 @@ PTT sends to, in order:
+ 1. the reply target while the reply window runs: after a call we played, its talkgroup (group call) or its caller
+    (private call to us); after our own call, its target again. The window is the codeplug's group or private call
+    hang time (rounded up to whole seconds, at most 30 s), or 10 s when the codeplug has none; the reply time setting
+-   (`reply_s`, 0 to 30 s, Settings > Talk & listen) replaces the codeplug's for both. BACK on Home ends it.
++   (`reply_s`, 0 to 30 s, Settings > Talk & listen) replaces the codeplug's for both. Our own call shows this countdown
++   even when its target is already the channel's normal target; a received call on that target does not open a redundant
++   reply window. BACK on Home ends either one.
+ 2. a talk target chosen for now: a typed ID or talkgroup, a codeplug contact (with its timeslot override), or "call
+    back", which takes the last call heard (its caller for a private call, its talkgroup for a group call). It lasts
+    until the channel changes or it is cleared.
+diff --git a/docs/spec/modem-hrc7000.md b/docs/spec/modem-hrc7000.md
+index a1fa64c..145edec 100644
+--- a/docs/spec/modem-hrc7000.md
++++ b/docs/spec/modem-hrc7000.md
+@@ -137,7 +137,7 @@ repeated LC).
+ | 0x370–0x37C | (undocumented) | 0xF0, 0x1FF, 0x10F, 0x00 |
+ | 0x380 | CRC8_INIT | 0 | short LC CRC-8 init |
+ | 0x384 | LOCAL_CC | color code in b3:0; b9:8 cc_opt: 0 = deframe only on matching CC, 1 = deframe any CC; b16 encryption type | cc_opt 0 and the filter's code with a CC filter; cc_opt 1 without one (RF_MODE b12 must then be 0). Channel TX code after slot lock, receive code restored after TX |
+-| 0x388 | VOICE_EMB_CTRL | 0 at init, **2** when entering DMR receive | b1 = burst F EMB from the chip's own RC encoder; b0 = PI bit for bursts B–E |
++| 0x388 | VOICE_EMB_CTRL | 0 at init, **2** when entering DMR receive | b1 = burst F EMB from the chip's own RC encoder; b0 = PI bit for bursts B–E and burst F. With a CPU-supplied same-channel single block in F, keep the call's PI on B–E but write 0 for F: SB uses even-parity BPTC rows, whereas PI 1 selects odd-parity RC decoding |
+ | 0x38C | SCRAMBLE_REG | 0 | built-in simple voice scrambler keys (RX in b31:16, TX in b15:0); unused |
+ 
+ ### 2.4 Interrupt control
+@@ -816,7 +816,7 @@ make repeater wake work (which of the two matters is not known).
+ | LC header, terminator | RS(12,9) with RS_H_MASK / RS_T_MASK, BPTC(196,96), slot type Golay | 9 LC bytes |
+ | CSBK, MBC header, data header, PI header | CRC-16 with the programmed mask (when SEND_TYPE b8 = 0), BPTC, slot type | 10 bytes |
+ | Rate ½ / ¾ / 1 data | BPTC / trellis ¾ / none, slot type | 12 / 18 / 24 bytes including CRC-9 and the final CRC-32 |
+-| Voice | sync / EMB (QR), embedded LC fragments (5-bit checksum from TX RAM byte 9 or computed), burst F EMB from the RC encoder when VOICE_EMB_CTRL b1 = 1 | 27 AMBE bytes; LC for burst A |
++| Voice | sync / EMB (QR), embedded LC fragments (5-bit checksum from TX RAM byte 9 or computed), burst F EMB from the RC encoder when VOICE_EMB_CTRL b1 = 1, or the CPU's four-byte single block at TX RAM 0x29–0x2C when b1 = 0 | 27 AMBE bytes; LC for burst A; PI 0 with a single block |
+ | Short LC (CACH) | CRC-8 (CRC8_INIT) | repeater mode only |
+ 
+ On receive the chip checks the same codes and reports them in RX_TYPE_INFO b30:24; it decodes FEC and leaves only
+diff --git a/drivers/modem/hrc7000/hrc7000_dmr.c b/drivers/modem/hrc7000/hrc7000_dmr.c
+index 8298f93..ae89b53 100644
+--- a/drivers/modem/hrc7000/hrc7000_dmr.c
++++ b/drivers/modem/hrc7000/hrc7000_dmr.c
+@@ -429,18 +429,23 @@ static void arm(hrc7000_dmr_t *e, const dmr_tx_burst_t *b)
+ 			memcpy(buf10, lc, 9);
+ 			buf10[9] = hrc7000_dmr_emb_checksum(lc);
+ 			write_tx_ram(e, buf10, 10);
+-			// Program the voice EMB PI from the call's service options, not from an alias or GPS fragment.
+-			uint32_t emb = (e->call_lc[2] & DMR_SVC_PRIVACY) != 0 ? 1u : 0u;
+-			if (e->emb_filler_set) {
+-				// Burst F's EMB filler (modem-hrc7000.md 2.8): the single block, already BPTC-encoded, at
+-				// TX RAM 0x29-0x2C, and the chip's own RC encoder off so it sends this instead of its own
++		}
++		// B-E carry the call's privacy indication. F is different when the CPU supplies a same-channel
++		// single block: that block's BPTC rows use even parity, so F needs PI 0 or receivers try the
++		// odd-parity RC decoder. Program it for each burst, not once for the whole superframe
++		uint32_t emb = (e->call_lc[2] & DMR_SVC_PRIVACY) != 0 ? 1u : 0u;
++		if (e->emb_filler_set) {
++			if (idx == 0) {
++				// Already BPTC-encoded single block at TX RAM 0x29-0x2C (modem-hrc7000.md 2.8)
+ 				for (uint8_t i = 0; i < 4; i++)
+ 					e->dev->buf[C7_TX_RAM + TXRAM_BURST_F_EMB + i] = e->emb_filler[i];
+-			} else {
+-				emb |= 2u;	// F uses the chip's RC encoder
+ 			}
+-			w(e, C7_VOICE_EMB_CTRL, emb);
++			if (idx == 5)
++				emb = 0;
++		} else {
++			emb |= 2u;	// F uses the chip's RC encoder
+ 		}
++		w(e, C7_VOICE_EMB_CTRL, emb);
+ 		e->next_voice = (uint8_t)((idx + 1u) % 6u);
+ 		w(e, C7_LAYER2_SEND_TYPE, hrc7000_dmr_send_type(kind, idx, e->lcss));
+ 	} else {
+diff --git a/tests/host/dmrCallTest.c b/tests/host/dmrCallTest.c
+index fbd0895..789a841 100644
+--- a/tests/host/dmrCallTest.c
++++ b/tests/host/dmrCallTest.c
+@@ -603,8 +603,13 @@ static void test_tx_call(void)
+ 	CHECK(silent == V()->tx_underruns);
+ 	CHECK(silent <= 3);
+ 	printf("# TX: %u headers, %u voice bursts, %u silence frames, 1 terminator\n", DMR_CALL_TX_HEADERS, v, silent);
+-	// The talk target was the channel's: no reply countdown
+-	CHECK(!V()->reply_active && V()->tx_target.id == TG_TALK);
++	// Our own over leaves the normal hang time even when it went to the channel's talk target
++	CHECK(V()->reply_active && V()->tx_target.id == TG_TALK && V()->reply_s > 0);
++	uint8_t hang_s = V()->reply_s;
++	run_ms(1000);
++	CHECK(V()->reply_active && V()->reply_s < hang_s);
++	run_ms(10000);
++	CHECK(!V()->reply_active && V()->reply_s == 0 && V()->tx_target.id == TG_TALK);
+ }
+ 
+ static void test_tx_timeout_and_starve(void)
+diff --git a/tests/host/hrc7000DmrTest.c b/tests/host/hrc7000DmrTest.c
+index 0ff327b..cd30685 100644
+--- a/tests/host/hrc7000DmrTest.c
++++ b/tests/host/hrc7000DmrTest.c
+@@ -487,6 +487,46 @@ static void test_tx_color_code(void)
+ 	CHECK(eng.cc_filter == -1 && REG(C7_LOCAL_CC) == (LOCAL_CC_ANY | 5u));
+ }
+ 
++// Burst F with a same-channel single block is not reverse channel: its BPTC rows use even parity, so only F clears
++// PI on a privacy call; B-E keep it. The four already-encoded bytes go to the chip unchanged. The no-filler path
++// above keeps its RC encoder and privacy PI (VOICE_EMB_CTRL == 3).
++static void test_tx_single_block_pi(void)
++{
++	setup();
++	const dmr_config_t cfg = { .own_id = 1234, .cc = 1, .access = DMR_ACCESS_IMPOLITE };
++	hrc7000_dmr_configure(&eng, &cfg);
++	hrc7000_dmr_set_cc_filter(&eng, cfg.cc);
++	hrc7000_dmr_run(&eng);
++	CHECK(hrc7000_dmr_tx_begin(&eng, DMR_TIMING_OWN, 1, DMR_ACCESS_IMPOLITE));
++	dmr_tx_burst_t h = { .kind = DMR_BURST_VOICE_LC_HEADER, .len = 9 };
++	h.payload[2] = 0x40;	// DMR_SVC_PRIVACY
++	const uint8_t sb[4] = { 0x12, 0x34, 0x56, 0x78 };
++	hrc7000_dmr_set_burst_f_emb(&eng, sb);
++	CHECK(hrc7000_dmr_tx_queue(&eng, &h));
++	for (uint8_t i = 0; i < 6; i++) {
++		dmr_tx_burst_t b = voice(i, (uint8_t)(0x11 + i));
++		CHECK(hrc7000_dmr_tx_queue(&eng, &b));
++	}
++	static const uint8_t types[6] = { 0x08, 0x19, 0x2B, 0x3B, 0x4A, 0x58 };
++	uint8_t seen = 0;
++	for (int i = 0; i < 68; i++) {
++		tick(false);
++		tick(true);
++		if (REG(C7_LAYER2_TXRX_CTRL) == 0x80) {
++			for (uint8_t v = 0; v < 6; v++) {
++				if (REG(C7_LAYER2_SEND_TYPE) == types[v]) {
++					seen |= (uint8_t)(1u << v);
++					CHECK(REG(C7_VOICE_EMB_CTRL) == (v == 5 ? 0u : 1u));
++					if (v == 5)
++						CHECK(memcmp(&buf[C7_TX_RAM + 0x29], sb, sizeof sb) == 0);
++				}
++			}
++		}
++		count_kind(0xFF, NULL);
++	}
++	CHECK(seen == 0x3F);
++}
++
+ static void test_cc_restore(void)
+ {
+ 	for (int end = 0; end < 4; end++) {
+@@ -1841,6 +1881,7 @@ int main(void)
+ 	test_rx_resync();
+ 	test_cc_any();
+ 	test_tx_color_code();
++	test_tx_single_block_pi();
+ 	test_cc_restore();
+ 	test_tx();
+ 	test_tx_end_hold();
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 78f8fef..ae8ac34 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -1903,6 +1903,43 @@ static void test_dmr_channel_change_view(void)
+ 	CHECK(d->ts == 1 && d->cc == 2 && !d->rmo);
+ }
+ 
++// Recent activity belongs to the channel that heard it. Clear both the radio-wide timestamp and the DMR stack's
++// last-heard record, including when the next DMR channel has the same CC/TS and configure sees no RF change.
++static void test_activity_cleared_on_channel_change(void)
++{
++	dmr_start(false);
++	const radio_dmr_view_t *d = &sm.view.dmr;
++	hear_call(true, 201, 9991234, 2, 1, true);
++	CHECK(d->last_ms != 0 && d->last.src == 9991234 && sm.view.last_rx_ms != 0);
++
++	chans[1].mode = RADIO_MODE_DMR;
++	chans[1].rx_hz = 438600000;
++	chans[1].tx_hz = 433600000;
++	chans[1].color_code = 2;
++	chans[1].timeslot = 1;
++	reload_channel();
++	req(RREQ_ZONE_POS, 0);
++	CHECK(sm.view.channel_number == 1 && d->cc == 2 && d->ts == 1);
++	CHECK(d->last_ms == 0 && d->last.src == 0 && sm.view.last_rx_ms == 0);
++	run(50);	// the stack must not publish the old channel's record again
++	CHECK(d->last_ms == 0 && d->last.src == 0 && sm.view.last_rx_ms == 0);
++
++	req(RREQ_CH_STEP, 1);	// channel 2, FM
++	CHECK(sm.view.ch.mode == RADIO_MODE_FM && d->last_ms == 0 && sm.view.last_rx_ms == 0);
++	uint8_t thr = radio_sm_squelch_open_below(RADIO_SQUELCH_DEFAULT);
++	rx_signal(thr - 10, true);
++	poll_for(RADIO_POLL_MS);
++	CHECK(sm.view.state == RS_RX);
++	rx_signal(thr + RADIO_SQL_HYST_DB, true);
++	poll_for(2 * RADIO_POLL_MS);
++	CHECK(sm.view.state == RS_IDLE && sm.view.last_rx_ms != 0);
++	req(RREQ_VFO, 1);
++	CHECK(sm.view.vfo && sm.view.last_rx_ms == 0 && d->last_ms == 0);
++	req(RREQ_VFO, 0);
++	CHECK(!sm.view.vfo && sm.view.last_rx_ms == 0 && d->last_ms == 0);
++	setup_codeplug();
++}
++
+ static void test_dmr_tx(void)
+ {
+ 	dmr_start(true);
+@@ -10985,6 +11022,7 @@ int main(int argc, char **argv)
+ 	test_tone_lists();
+ 	test_dmr_rx();
+ 	test_dmr_channel_change_view();
++	test_activity_cleared_on_channel_change();
+ 	test_dmr_rssi_hold();
+ 	test_fm_rssi_raw();
+ 	test_dmr_tx();

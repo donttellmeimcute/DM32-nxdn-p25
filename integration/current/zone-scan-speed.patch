@@ -1,0 +1,582 @@
+diff --git a/core/debuglink/debuglink_view_radio.c b/core/debuglink/debuglink_view_radio.c
+index d506780..3c8b0b5 100644
+--- a/core/debuglink/debuglink_view_radio.c
++++ b/core/debuglink/debuglink_view_radio.c
+@@ -278,6 +278,10 @@ static bool set_one(radio_settings_t *s, uint8_t id, uint16_t v)
+ 	case 30: if (v > RADIO_DUAL_DELAY_MAX_MS) return false; s->dual_delay_ms = v; break;
+ 	case 33: if (v >= RADIO_CWID_CODES || !CONFIG_SFR_CWID) return false; s->sfr_cwid = (uint8_t)v; break;
+ 	case 34: if (v > 2 || (v == 2 && !CONFIG_SFR_DUALPATH_RX)) return false; s->sfr_rx = (uint8_t)v; break;
++	case 38:
++		if (v < RADIO_ZONE_SCAN_DWELL_MIN_MS || v > RADIO_ZONE_SCAN_DWELL_MAX_MS || v % 25u != 0) return false;
++		s->zone_scan_dwell_ms = v;
++		break;
+ 	default: return false;
+ 	}
+ 	return true;
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+index 9afcc7d..57c3522 100644
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -44,6 +44,12 @@ typedef enum { RADIO_BCL_OFF, RADIO_BCL_CARRIER, RADIO_BCL_WRONG_TONE } radio_bc
+ // VOX: off, on channels whose codeplug entry allows it, on every FM channel
+ typedef enum { RADIO_VOX_OFF, RADIO_VOX_CHANNEL, RADIO_VOX_ALL } radio_vox_t;
+ 
++// Zone scan has its own empty-channel dwell: speeding it up does not shorten VFO or dual-watch visits. The receiver
++// still gets SCAN_SETTLE_MS after every retune; 500 ms is the slowest choice offered by Tools > Zone scan speed
++#define RADIO_ZONE_SCAN_DWELL_MIN_MS	50u
++#define RADIO_ZONE_SCAN_DWELL_MS	RADIO_ZONE_SCAN_DWELL_MIN_MS
++#define RADIO_ZONE_SCAN_DWELL_MAX_MS	500u
++
+ // The radio core's settings (docs/spec/radio-features.md). The radio core loads them from the settings store at
+ // start-up (docs/spec/settings-store.md 3) and saves every change made with radio_set_settings
+ typedef struct {
+@@ -56,7 +62,8 @@ typedef struct {
+ 	uint8_t scan_resume;	// scan_resume_t (radio/scan.h): 0 time, 1 carrier, 2 stop
+ 	uint8_t scan_hold_s;	// time mode: move on after this long on a signal
+ 	uint16_t scan_delay_ms;	// after the signal ends, move on after this long
+-	uint16_t scan_dwell_ms;	// listen time per channel with nothing heard
++	uint16_t scan_dwell_ms;	// VFO / dual watch: listen time per stop with nothing heard
++	uint16_t zone_scan_dwell_ms;	// zone scan: its independent empty-channel dwell (50-500 ms)
+ 	bool scan_priority;	// zone scan: revisit the start channel between the others
+ 	bool scan_beep;		// a short beep when the scan stops on a signal
+ 	uint16_t dual_delay_ms;	// dual watch on one receiver: after a signal ends, stay on its channel this long (the
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index bd69a05..5522ae2 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -196,6 +196,7 @@ void radio_settings_default(radio_settings_t *s)
+ 	s->scan_hold_s = RADIO_SCAN_HOLD_S;
+ 	s->scan_delay_ms = RADIO_SCAN_DELAY_MS;
+ 	s->scan_dwell_ms = RADIO_SCAN_DWELL_MS;
++	s->zone_scan_dwell_ms = RADIO_ZONE_SCAN_DWELL_MS;
+ 	s->dual_delay_ms = RADIO_DUAL_DELAY_MS;
+ 	s->beep_level = 50;
+ 	s->key_beep = true;
+@@ -4492,7 +4493,8 @@ static bool scan_step(radio_sm_t *sm, uint32_t now_ms)
+ static void scan_config(const radio_sm_t *sm, uint8_t kind, scan_cfg_t *cfg)
+ {
+ 	memset(cfg, 0, sizeof(*cfg));
+-	cfg->dwell_ms = sm->set.scan_dwell_ms < SCAN_SETTLE_MS ? SCAN_SETTLE_MS : sm->set.scan_dwell_ms;
++	uint16_t dwell_ms = kind == SCAN_ZONE ? sm->set.zone_scan_dwell_ms : sm->set.scan_dwell_ms;
++	cfg->dwell_ms = dwell_ms < SCAN_SETTLE_MS ? SCAN_SETTLE_MS : dwell_ms;
+ 	cfg->hold_ms = (uint16_t)(sm->set.scan_hold_s * 1000u);
+ 	cfg->delay_ms = sm->set.scan_delay_ms;
+ 	cfg->resume = sm->set.scan_resume;
+@@ -4833,6 +4835,14 @@ static void scan_service(radio_sm_t *sm, const radio_status_t *st, uint32_t now_
+ 	{
+ 		active = sm->view.state == RS_RX && (sm->view.squelch != 0 || carrier);
+ 	}
++	if (sc->kind == SCAN_ZONE) {
++		// FM can advance at the configured 50 ms. Digital receivers keep the proven 75 ms minimum: a faster empty
++		// channel visit must not end before their carrier detector has had a chance to see the signal
++		uint16_t dwell = sm->set.zone_scan_dwell_ms;
++		if ((dmr || air) && dwell < RADIO_SCAN_DWELL_MS)
++			dwell = RADIO_SCAN_DWELL_MS;
++		sc->cfg.dwell_ms = dwell < SCAN_SETTLE_MS ? SCAN_SETTLE_MS : dwell;
++	}
+ 	sc->cfg.probe_ms = dmr ? RADIO_SCAN_DMR_PROBE_MS : air ? RADIO_SCAN_AIR_PROBE_MS :
+ 			   tone_needed(sm) ? RADIO_SCAN_FM_PROBE_MS : 0;
+ 	sc->cfg.sync_ms = dmr ? RADIO_SCAN_DMR_SYNC_MS : air ? RADIO_SCAN_AIR_SYNC_MS : 0;
+@@ -7415,6 +7425,11 @@ static void persist(radio_sm_t *sm, uint32_t now_ms)
+ 
+ static void clamp_settings(radio_settings_t *s)
+ {
++	if (s->zone_scan_dwell_ms < SCAN_SETTLE_MS) {
++		s->zone_scan_dwell_ms = SCAN_SETTLE_MS;
++	} else if (s->zone_scan_dwell_ms > RADIO_ZONE_SCAN_DWELL_MAX_MS) {
++		s->zone_scan_dwell_ms = RADIO_ZONE_SCAN_DWELL_MAX_MS;
++	}
+ 	if (s->beep_level > 100) {
+ 		s->beep_level = 100;
+ 	}
+@@ -7493,6 +7508,10 @@ static void settings_to_radio(const settings_t *st, radio_settings_t *s)
+ 		clamp_settings(s);
+ 	}
+ 	// Page 1: 0 (never set, or a page 0 alone) keeps the default
++	if (st->zone_scan_dwell_25ms != 0) {
++		s->zone_scan_dwell_ms = (uint16_t)st->zone_scan_dwell_25ms * 25u;
++		clamp_settings(s);
++	}
+ 	if (st->rs_dual_delay != 0) {
+ 		s->dual_delay_ms = (uint16_t)((st->rs_dual_delay - 1u) * 100u);
+ 		clamp_settings(s);
+@@ -7549,6 +7568,7 @@ static void radio_to_settings(const radio_settings_t *s, uint32_t now_ms)
+ 	st->rs_scan_hold_s = s->scan_hold_s;
+ 	st->rs_scan_delay_ms = s->scan_delay_ms;
+ 	st->rs_scan_dwell_ms = s->scan_dwell_ms;
++	st->zone_scan_dwell_25ms = (uint8_t)(s->zone_scan_dwell_ms / 25u);
+ 	st->rs_beep_level = s->beep_level;
+ 	st->rs_vox = s->vox;
+ 	st->rs_vox_level = s->vox_level;
+@@ -7586,6 +7606,13 @@ static void use_settings(radio_sm_t *sm, const radio_settings_t *s, uint32_t now
+ 	sm->set = *s;
+ 	clamp_settings(&sm->set);
+ 	apply_tot(sm);
++#if CONFIG_SCAN
++	if (sm->scan.kind == SCAN_ZONE && sm->scan.cfg.dwell_ms != sm->set.zone_scan_dwell_ms) {
++		// Tools' zone dwell takes effect on this stop too; all signal probe and hold times stay unchanged
++		sm->scan.cfg.dwell_ms = sm->set.zone_scan_dwell_ms < SCAN_SETTLE_MS ? SCAN_SETTLE_MS :
++					       sm->set.zone_scan_dwell_ms;
++	}
++#endif
+ #if CONFIG_DMR_ROAMING
+ 	roam_cfg_t rc;
+ 	roam_cfg_of(&sm->set, &rc);
+diff --git a/core/settings/settings.h b/core/settings/settings.h
+index f979ba7..d246906 100644
+--- a/core/settings/settings.h
++++ b/core/settings/settings.h
+@@ -252,7 +252,8 @@ typedef struct {
+ 	uint8_t vfo_nxdn_key[2];
+ 	uint8_t vfo_dmr_kid[2];
+ 	uint8_t classic_style;	// 1: RadioFoundry visual style, 0: this build's default
+-	uint8_t reserved_vfo;
++	// Zone scan's independent empty-channel dwell, in 25 ms units (50-500 ms). 0 in an older record = the 50 ms default
++	uint8_t zone_scan_dwell_25ms;	// was reserved_vfo
+ } settings_t;
+ 
+ // Pages: settings_t is stored as records of SETTINGS_PAGE_BYTES each (settings-store.md 2.1). Only the pages its size
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index c67bee4..d8fec99 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -6701,7 +6701,13 @@ void ui_crash_tick(uint32_t now_ms)
+ // Every tool keeps its number on every radio and build, so a key path (OK 6 7: Diagnostics; tests/hil/test_ui.py and the
+ // user guide) is the same everywhere. The one a radio may not have (Battery) is last, so no radio has a gap; a build
+ // without diagnostics skips 7
+-enum { T_SCAN, T_POSITION, T_HOTSPOT, T_USB_NET, T_SFR, T_ROAM, T_DIAG, T_APRS, T_BATTERY, T_ZONE_OFFER, T_COUNT };
++enum { T_SCAN, T_POSITION, T_HOTSPOT, T_USB_NET, T_SFR, T_ROAM, T_DIAG, T_APRS, T_BATTERY, T_ZONE_OFFER,
++       T_ZONE_SCAN, T_COUNT };
++
++// Defined with the generic settings groups below; appended to Tools so every existing tool keeps its number
++#if CONFIG_SCAN && CONFIG_UI_SETTINGS
++static void zone_scan_open(void);
++#endif
+ 
+ // A tool this build or radio doesn't have is left out of the list (Battery, Supply on a radio that measures its DC
+ // input instead, is left out where the radio measures neither)
+@@ -6712,7 +6718,7 @@ static bool tool_shown(uint16_t i)
+ 		return offer_waiting();	// 0 on the keypad: only while another radio's zone waits
+ #endif
+ 	return (i != T_DIAG || CONFIG_DIAG) && (i != T_BATTERY || board_volts() != BOARD_VOLTS_NONE) &&
+-	       i != T_ZONE_OFFER;
++	       (i != T_ZONE_SCAN || (CONFIG_SCAN && CONFIG_UI_SETTINGS)) && i != T_ZONE_OFFER;
+ }
+ 
+ static uint16_t tools_last;	// the highest tool's number, found on each count (the list counts before the hint)
+@@ -6759,7 +6765,8 @@ static void tools_item(uint16_t row, ui_item_t *it)
+ 		TRN(TITLE_HOTSPOT, "Hotspot"), TRN(TOOLS_ROW_USB_NETWORK, "USB network"),
+ 		TRN(TOOLS_ROW_SFR, "Single-freq repeater"), TRN(TITLE_ROAMING, "Roaming"),
+ 		TRN(TITLE_DIAGNOSTICS, "Diagnostics"), TRX(WORD_APRS, "APRS"), TRN(TITLE_BATTERY, "Battery"),
+-		TRN(TOOLS_ROW_SHARES_RECEIVED, "Zones/Chs Received") };
++		TRN(TOOLS_ROW_SHARES_RECEIVED, "Zones/Chs Received"),
++		TRN(TOOLS_ROW_ZONE_SCAN_SPEED, "Zone scan speed") };
+ 	uint16_t i = tools_row(row);
+ 	if (i >= T_COUNT)
+ 		return;
+@@ -6812,6 +6819,10 @@ static void tools_item(uint16_t row, ui_item_t *it)
+ 		sb_u32(&b, ui_st.battery_pct, 1);
+ 		sb_chr(&b, '%');
+ 		break;
++	case T_ZONE_SCAN:
++		sb_i32(&b, ui_svc_setting_get(UI_SET_ZONE_SCAN_DWELL));
++		sb_str(&b, " ms");
++		break;
+ 	case T_ROAM:
+ #if CONFIG_DMR_ROAMING
+ 		sb_str(&b, ui_view()->roam.zone_on ? TR(VALUE_ON, "On") : TR(VALUE_OFF, "Off"));
+@@ -6843,6 +6854,11 @@ static void tools_select(uint16_t row, bool hold)
+ {
+ 	(void)hold;
+ 	switch (tools_row(row)) {
++	case T_ZONE_SCAN:
++#if CONFIG_SCAN && CONFIG_UI_SETTINGS
++		zone_scan_open();
++#endif
++		break;
+ 	case T_SCAN:
+ 		if (!(feats() & UI_FEAT_SCAN)) {
+ 			ui_toast(TR(WHY_SCAN_NOT_IN_BUILD, "Scan: not in this build"));
+@@ -7098,6 +7114,15 @@ static const tr_id_t n_ptype[] = { TRN(VALUE_OFF, "Off"), TRX(VALUE_MOTOROLA, "M
+ #define LIST(nm, syn_, sid, v, nms) { nm, syn_, ST_LIST, sid, sizeof v / sizeof v[0], { .values = v, .names = nms } }
+ #define ACTION(nm, syn_, a) { nm, syn_, ST_ACTION, a, 0, { { 0, 0, 0, NULL } } }
+ 
++static const int16_t v_zone_scan_dwell[] = { 50, 75, 100, 150, 250, 500 };
++static const tr_id_t n_zone_scan_dwell[] = { TRX(ZONE_SCAN_VALUE_50_MS, "50 ms"), TRX(ZONE_SCAN_VALUE_75_MS, "75 ms"),
++	TRX(ZONE_SCAN_VALUE_100_MS, "100 ms"), TRX(ZONE_SCAN_VALUE_150_MS, "150 ms"),
++	TRX(ZONE_SCAN_VALUE_250_MS, "250 ms"), TRX(ZONE_SCAN_VALUE_500_MS, "500 ms") };
++static const set_item_t s_zone_scan[] = {
++	LIST(TRN(SET_LABEL_EMPTY_CHANNEL_DWELL, "Empty-channel dwell"), "zone scan speed delay channel time",
++	     UI_SET_ZONE_SCAN_DWELL, v_zone_scan_dwell, n_zone_scan_dwell),
++};
++
+ static const set_item_t s_sound[] = {
+ 	NUMBER(TRN(TITLE_VOLUME, "Volume"), "speaker loudness", UI_SET_VOLUME, 0, RADIO_VOLUME_MAX, 1, NULL),
+ 	TOGGLE(TRN(SET_LABEL_KEY_TONES, "Key tones"), "beep", UI_SET_KEY_TONES),
+@@ -7320,10 +7345,16 @@ static const set_group_t groups[] = {
+ 	GROUP(TRN(SET_ROW_KEYS, "Keys"), s_keys), GROUP(TRN(WORD_KEY_LOCK, "Key lock"), s_lock),
+ 	GROUP_T(TRN(SET_ROW_MY_RADIO, "My radio"), TRN(SET_TITLE_MY_RADIO, "My Radio"), s_my_radio),
+ 		GROUP(TRN(SET_ROW_ADVANCED, "Advanced"), s_advanced),
++	GROUP(TRN(TOOLS_ROW_ZONE_SCAN_SPEED, "Zone scan speed"), s_zone_scan),
+ };
+ #define GROUPS	(sizeof groups / sizeof groups[0])
+ 
+-uint8_t ui_set_group_count(void) { return GROUPS; }
++static void zone_scan_open(void)
++{
++	ui_push(SCR_GROUP, GROUPS - 1u);
++}
++
++uint8_t ui_set_group_count(void) { return GROUPS - 1u; }
+ tr_id_t ui_set_group_name(uint8_t g) { return g < GROUPS ? groups[g].name : TR_NONE; }
+ 
+ #if RFOUNDRY_HWOPTS
+@@ -7423,7 +7454,8 @@ void ui_open_setting(uint8_t g, uint8_t i)
+ 	ui_frame()->focus = i;
+ }
+ 
+-static uint16_t settings_count(void) { return GROUPS; }
++// The last group is opened from Tools > Zone scan speed, not duplicated at the end of Settings
++static uint16_t settings_count(void) { return GROUPS - 1u; }
+ 
+ static void settings_item(uint16_t i, ui_item_t *it)
+ {
+@@ -7563,6 +7595,8 @@ static const char *set_why_not(const set_item_t *s)
+ 	case UI_SET_SCAN_TONE:
+ 		return !CONFIG_BEEP ? TR(WHY_TONES_NOT_IN_BUILD, "Tones: not in this build") : feats() & UI_FEAT_SCAN ?
+ 			NULL : TR(WHY_SCAN_NOT_IN_BUILD, "Scan: not in this build");
++	case UI_SET_ZONE_SCAN_DWELL:
++		return feats() & UI_FEAT_SCAN ? NULL : TR(WHY_SCAN_NOT_IN_BUILD, "Scan: not in this build");
+ 	case UI_SET_EMERGENCY_TONE:
+ 		return !CONFIG_BEEP ? TR(WHY_TONES_NOT_IN_BUILD, "Tones: not in this build") :
+ 			feats() & UI_FEAT_EMERGENCY ? NULL :
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+index 34a340e..e0b3223 100644
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -430,6 +430,8 @@ typedef enum {
+ 	// ... and two kept where they already were: the scan stop tone (radio_settings_t.scan_beep, off by default) and
+ 	// the emergency tone for an alert heard (dmr_emergency_settings_t.rx_tone, CONFIG_DMR_EMERGENCY)
+ 	UI_SET_SCAN_TONE,
++	// Tools > Zone scan speed: empty-channel dwell, ms; independent of the VFO / dual-watch scan_dwell_ms
++	UI_SET_ZONE_SCAN_DWELL,
+ 	UI_SET_EMERGENCY_TONE,
+ 	UI_SET_CLASSIC_STYLE,	// use the RadioFoundry interface and boot artwork (CONFIG_UI_KAWAII)
+ 	UI_SET_COUNT
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+index 0bddbfc..be57834 100644
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -600,6 +600,9 @@ void ui_svc_apply(uint8_t id, int32_t value)
+ 	case UI_SET_SCAN_TONE:
+ 		rs.scan_beep = value != 0;
+ 		break;
++	case UI_SET_ZONE_SCAN_DWELL:
++		rs.zone_scan_dwell_ms = v16;
++		break;
+ 	case UI_SET_VFO_STEP:		// 10 Hz units; 833 is the exact 8.33 kHz grid
+ 		radio_req_vfo_step_size(value == 833 ? 8333u : value > 0 && value <= 100000 ? (uint32_t)value * 10u : 0u);
+ 		return;
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+index f608e45..b3ef856 100644
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -300,6 +300,9 @@ int32_t ui_svc_setting_get(uint8_t id)
+ 	case UI_SET_SCAN_TONE:
+ 		radio_get_settings(&rs);
+ 		return id == UI_SET_TALK_PERMIT ? rs.talk_permit : rs.scan_beep;
++	case UI_SET_ZONE_SCAN_DWELL:
++		radio_get_settings(&rs);
++		return rs.zone_scan_dwell_ms;
+ 	case UI_SET_CALL_END_TONE:
+ 	case UI_SET_TOT_WARN_TONE:
+ 	case UI_SET_BATTERY_TONE:
+@@ -428,6 +431,7 @@ bool ui_svc_setting_set(uint8_t id, int32_t value)
+ 	case UI_SET_REPLY_S:
+ 	case UI_SET_TALK_PERMIT:
+ 	case UI_SET_SCAN_TONE:
++	case UI_SET_ZONE_SCAN_DWELL:
+ #if CONFIG_SFR
+ 	case UI_SET_SFR_RX:
+ #endif
+diff --git a/docs/spec/debuglink.md b/docs/spec/debuglink.md
+index 5bc3283..ca74ab3 100644
+--- a/docs/spec/debuglink.md
++++ b/docs/spec/debuglink.md
+@@ -406,7 +406,7 @@ At most one per 20 ms (busy otherwise; the radio core's queue holds 16).
+ | 21 | lo u32, hi u32 | `radio_req_scan_vfo`: VFO scan from lo to hi Hz in the VFO step |
+ | 22 | beep u8 [, delay u8] | `radio_req_beep`: 1 key (only with `set.key_beep`), 2 error, 3 TX permit, 4 TX deny, 5 call end, 6 time-out warning, 7 battery low, 8 battery critical, 9 scan hold, 10 emergency, 11 message, 12 TX permit before keying, 13 the speaker test's sweep (`radio-features.md` 4; CONFIG_BEEP builds). A delay of 1-255 s plays it that much later (`radio_req_beep_after`), so a radio that mutes its speaker with the cable in can be unplugged first; a later request replaces one still waiting |
+ | 23 | on u8, max_ms u16 (optional) | `radio_req_tone_burst`: the 1750 Hz burst, keys up while on (FM channels, CONFIG_FM_TX_TONES builds). It ends by itself `max_ms` after it started (0 or missing: `inject_max_ms`, also the cap), as PTT does, so a host that goes away, or a link the radio's own transmission jams, can't leave the radio keyed; `tone_burst_max_ms` in the version reply is the cap, and its presence says the burst has the limit |
+-| 24 | id u8, value u16 | one radio setting (`radio_set_settings`: in effect at once and saved by the settings store, as from the settings screen; the ids marked "not stored" below are RAM only): 1 tot_s, 2 tot_warn_s, 3 bcl (0 off, 1 carrier, 2 wrong tone), 4 roger_beep, 5 tx_inhibit, 6 scan_resume (0 time, 1 carrier, 2 stop), 7 scan_hold_s, 8 scan_delay_ms, 9 scan_dwell_ms, 10 scan_priority, 11 beep_level (0-100), 12 key_beep, 13 vox (0 off, 1 channel, 2 all), 14 vox_level (0-10), 15 vox_tail_ms, 16 rx_save (0-3), 17 rx_save_idle_s, 18 battery_off_s, 19 scan_beep, 20 reply_s (0-30, 255 = the codeplug's hang times), 21 roam_rssi_dbm (-125..-60, two's complement), 22 roam_hyst_db (1-30), 23 roam_probe (0 passive, 1 wake), 24 roam_check_s (0 or 30-3600), 25 roam_beacon_s (0 or 10-600), 26 roam_beacon_len_s (1-10), 27 roam_survey (0 off, 1 synced, 2 per site), 28 rpt_beacon (0/1), 29 mic_gain (0-10, `radio_set_mic_gain`: the UI's stored setting is not changed, so a restart brings it back; unavailable when the setting does nothing in this build), 30 dual_delay_ms (0-10000), 31 enc_options (0-7, the vocoder's encode options `VOCODER_OPT_*` for the next frames, `ambeVoiceSetEncodeOptions`: not stored, so a restart or a change of Mic noise reduction or Mic AGC brings the settings' back; 0 gives the AMBE+2 hosts' plain 0x800 word; unavailable when the vocoder has no options, a bad argument in builds without DMR; `dmr-voice.md` 6), 32 zs_offers (0 off, 1 ask; `zone_share_set_offers`, not stored: a restart brings back the stored setting; unavailable without `CONFIG_ZONE_SHARE`; `zone-share.md` 5.1), 33 sfr_cwid (the SFR repeater's CW ID interval, `sfr.md` 4: 0 off, 1 5 min, 2 10 min, 3 15 min, 4 30 min; refused without `CONFIG_SFR_CWID`), 34 sfr_rx (an SFR user's receive mode, `sfr.md` 4: 0 repeater only, 1 first copy, 2 dual-path RX; 2 is refused without `CONFIG_SFR_DUALPATH_RX`), 35 ref_trim (the reference trim, ppb -10000..+10000 as two's complement, rounded to 100 ppb (0.1 ppm); `radio_set_ref_trim`: not stored, so a restart brings back the stored setting; unavailable on a radio without `hal_radio_t.ref_trim`; `radio-features.md` 6.1), 36 tones_off (the Settings > Sound tones that are off, bits as `beep.tones_off`; stored as the menu stores them, `codeplug_keys_store`: each tone's key is written to the codeplug's settings area when it can be, `codeplug-settings.md` 5.2; busy when the codeplug holds a key that couldn't be updated; a bit past the tones is a bad argument), 37 gps (Settings > Location > GPS, 0 off, 1 on; stored and applied as the menu does: `board_t.gps` switches the module's power once it has been heard, [position.md](position.md) 2; unavailable without `CONFIG_GPS` or on a radio without a module). Out of range: bad argument |
++| 24 | id u8, value u16 | one radio setting (`radio_set_settings`: in effect at once and saved by the settings store, as from the settings screen; the ids marked "not stored" below are RAM only): 1 tot_s, 2 tot_warn_s, 3 bcl (0 off, 1 carrier, 2 wrong tone), 4 roger_beep, 5 tx_inhibit, 6 scan_resume (0 time, 1 carrier, 2 stop), 7 scan_hold_s, 8 scan_delay_ms, 9 scan_dwell_ms, 10 scan_priority, 11 beep_level (0-100), 12 key_beep, 13 vox (0 off, 1 channel, 2 all), 14 vox_level (0-10), 15 vox_tail_ms, 16 rx_save (0-3), 17 rx_save_idle_s, 18 battery_off_s, 19 scan_beep, 20 reply_s (0-30, 255 = the codeplug's hang times), 21 roam_rssi_dbm (-125..-60, two's complement), 22 roam_hyst_db (1-30), 23 roam_probe (0 passive, 1 wake), 24 roam_check_s (0 or 30-3600), 25 roam_beacon_s (0 or 10-600), 26 roam_beacon_len_s (1-10), 27 roam_survey (0 off, 1 synced, 2 per site), 28 rpt_beacon (0/1), 29 mic_gain (0-10, `radio_set_mic_gain`: the UI's stored setting is not changed, so a restart brings it back; unavailable when the setting does nothing in this build), 30 dual_delay_ms (0-10000), 31 enc_options (0-7, the vocoder's encode options `VOCODER_OPT_*` for the next frames, `ambeVoiceSetEncodeOptions`: not stored, so a restart or a change of Mic noise reduction or Mic AGC brings the settings' back; 0 gives the AMBE+2 hosts' plain 0x800 word; unavailable when the vocoder has no options, a bad argument in builds without DMR; `dmr-voice.md` 6), 32 zs_offers (0 off, 1 ask; `zone_share_set_offers`, not stored: a restart brings back the stored setting; unavailable without `CONFIG_ZONE_SHARE`; `zone-share.md` 5.1), 33 sfr_cwid (the SFR repeater's CW ID interval, `sfr.md` 4: 0 off, 1 5 min, 2 10 min, 3 15 min, 4 30 min; refused without `CONFIG_SFR_CWID`), 34 sfr_rx (an SFR user's receive mode, `sfr.md` 4: 0 repeater only, 1 first copy, 2 dual-path RX; 2 is refused without `CONFIG_SFR_DUALPATH_RX`), 35 ref_trim (the reference trim, ppb -10000..+10000 as two's complement, rounded to 100 ppb (0.1 ppm); `radio_set_ref_trim`: not stored, so a restart brings back the stored setting; unavailable on a radio without `hal_radio_t.ref_trim`; `radio-features.md` 6.1), 36 tones_off (the Settings > Sound tones that are off, bits as `beep.tones_off`; stored as the menu stores them, `codeplug_keys_store`: each tone's key is written to the codeplug's settings area when it can be, `codeplug-settings.md` 5.2; busy when the codeplug holds a key that couldn't be updated; a bit past the tones is a bad argument), 37 gps (Settings > Location > GPS, 0 off, 1 on; stored and applied as the menu does: `board_t.gps` switches the module's power once it has been heard, [position.md](position.md) 2; unavailable without `CONFIG_GPS` or on a radio without a module), 38 zone_scan_dwell_ms (zone scan only, 50-500 in 25 ms steps; applied and stored like Tools > Zone scan speed; digital stops keep a 75 ms minimum, `radio-features.md` 2). Out of range: bad argument |
+ | 25 | on u8: 1 network, 0 serial | switch the USB personality once the reply has gone out (`CONFIG_USB_NETWORK`; status 4 without it). The radio re-enumerates; in network mode this link answers over UDP to the radio's address, port 3334 (`docs/spec/usb-network.md`) |
+ | 26 | cmd u8 | `radio_req_roam` (CONFIG_DMR_ROAMING builds; status 4 without): 0 zone off, 1 zone on, 2 zone toggle (the current zone's roaming flag, stored), 3 roam now, 4 lock to this site, 5 unlock, 6 lock toggle ([dmr-roaming.md](dmr-roaming.md) 6.1) |
+ | 27 | flags u8, link IP u32 | the USB network settings, stored and applied at once (`docs/spec/usb-network.md` 5.4): bit 0 the network personality at power-on, bit 1 control station passthrough, bit 2 the fixed link pair; the radio's link address (0 = 192.168.10.1). Bits 1 and 2 need `CONFIG_DMR_CONTROL_STATION` (ignored without); UNAVAILABLE without `CONFIG_USB_NETWORK`. `rfoundry_debug.py radio usb-settings [boot] [passthrough] [fixed[=IP]]` |
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index 1375782..7e5d171 100644
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -31,7 +31,8 @@ quick changes therefore never reads back a value from before its own last change
+ | `scan_resume` | carrier | time (move on after `scan_hold_s` on a signal, or when it ends), carrier (move on `scan_delay_ms` after it ends), stop (the scan ends on the first signal) |
+ | `scan_hold_s` | 5 | time mode's hold |
+ | `scan_delay_ms` | 2000 | wait after a signal ends before moving on (a pause between overs) |
+-| `scan_dwell_ms` | 75 | listen time per channel with nothing heard (at least 50) |
++| `scan_dwell_ms` | 75 | VFO scan and dual watch: listen time per stop with nothing heard (at least 50) |
++| `zone_scan_dwell_ms` | 50 | zone scan: independent empty-channel dwell, 50-500 ms in 25 ms steps; digital stops keep at least 75 ms |
+ | `scan_priority` | off | zone scan: the start channel again after every 2 others |
+ | `scan_beep` | off | a short beep when the scan stops on a signal |
+ | `dual_delay_ms` | 1000 | dual watch on one receiver: its wait after a signal ends, in place of `scan_delay_ms` (0-10000; section 2.1) |
+@@ -67,7 +68,12 @@ tuned channel or frequency is the core view's as usual.
+   screens, the keys) is in [dual-watch.md](../ux/dual-watch.md).
+ - **Priority** (zone scan): the start channel again after every 2 others.
+ 
+-Each stop: 50 ms settle (readings from the previous frequency are ignored), then `scan_dwell_ms` listening. A signal
++Each stop: 50 ms settle (readings from the previous frequency are ignored), then its empty-channel dwell. Zone
++scan uses `zone_scan_dwell_ms`; VFO scan and dual watch keep using `scan_dwell_ms`, so the zone setting does not
++shorten their visits. Tools > Zone scan speed offers 50, 75, 100, 150, 250 and 500 ms, saves the choice and applies
++it immediately, including to the current stop of an active zone scan. FM stops can use 50 ms; DMR, P25, NXDN and
++YSF stops keep a 75 ms minimum so their carrier detector still gets a reading after the settle. The tone, carrier,
++digital-sync and hold probes below are unchanged. A signal
+ is "active" when FM squelch opens (with the RX tone if the channel needs one) or DMR plays a call (`dmr.state` rx).
+ A carrier that isn't active yet earns a probe: 350 ms on FM channels that need a tone (CTCSS detection takes 100 to
+ 250 ms), 700 ms on DMR; other FM channels move on at once. On DMR a carrier is the noise reading at the squelch level
+diff --git a/docs/spec/settings-store.md b/docs/spec/settings-store.md
+index 1cfc769..4e78f1f 100644
+--- a/docs/spec/settings-store.md
++++ b/docs/spec/settings-store.md
+@@ -156,6 +156,7 @@ callsign. The own DMR ID is always the codeplug's.
+ | dual watch | `ui_flags` bit 7 (0x80) is talk back (Settings > Talk > Dual watch talk back; off = the bit clear, as in a record from before). Page 1: `dual_b`, the last B: 0 none, 1..1024 a codeplug channel number, 1025 the first VFO, 1026 the second. The UI looks the channel number up again at power-on, in A's zone first, then in the first zone that holds it; if it is gone, the picker opens ([dual-watch.md](../ux/dual-watch.md) 5). `dual_state` bit 0 (`SETTINGS_DUAL_ON`) says the watch was on: the UI starts it again at power-on, with `dual_b` as the channel that wasn't selected and bit 1 (`SETTINGS_DUAL_B_SEL`) set when B was the selected one |
+ | second VFO | Page 1: `vfo_index` (the VFO in use at power off, 0 or 1) and `vfo2_rx_hz` (0 = never set), `vfo2_tx_hz`, `vfo2_talk` (the DMR talk target: ID in bits 0-23, bit 31 private call), tone values and types, `vfo2_mode`, `vfo2_bw`, `vfo2_power` (`SETTINGS_UNSET8` = default), `vfo2_cc`, `vfo2_ts`: the first VFO's fields, unpacked. Dual watch gives each channel its own VFO ([radio-features.md](radio-features.md) 2.1). A record without page 1 reads as the first VFO in use and no second VFO frequency |
+ | dual watch wait | Page 1: `rs_dual_delay`, `radio_settings_t.dual_delay_ms` as n - 1 steps of 100 ms (1 = no wait, 11 = 1 s); 0 (never set, or no page 1) = the default, 1 s. Settings > Talk > Dual watch delay |
++| zone scan speed | Page 1: `zone_scan_dwell_25ms`, the last byte reserved after `classic_style` (was `reserved_vfo`), stores `radio_settings_t.zone_scan_dwell_ms` in 25 ms units (2 = 50 ms through 20 = 500 ms). Zero in an older record selects the 50 ms default. Tools > Zone scan speed changes and saves it independently of `rs_scan_dwell_ms`; see [radio-features.md](radio-features.md) 2 |
+ | broadcast step | Page 1: `rs_bcast_step`, `radio_settings_t.bcast_step` + 1 (1 = 200 kHz on the odd tenths, 2 = 100 kHz); 0 (never set, or no page 1) = the default, 200 kHz. Settings > Talk & listen > FM broadcast step ([airband-and-broadcast.md](airband-and-broadcast.md) 4.4) |
+ | zone journal | Page 1, appended for the zone editor: `zone_jrn_kind` (0 none, 1 add, 2 delete), `zone_jrn_index` (the index added at or deleted from), `zone_jrn_count` (the stored zone count before it, 0 with only the built-in zone). Written before a zone write that moves zone indexes and cleared in the record that moves `zone_index` and `roam_zones` to match; set at power on, the change is finished from the zone list (`zone_edit_settle`, [ui.md](ui.md) 2.2). 0 (no page 1, an older record) = none |
+ | language | Page 1, after the zone journal (was reserved): `lang`, the UI's language as its two ISO 639-1 letters (`es`), English `en`; both 0 = never picked, which reads as the build's default language (`CONFIG_LANG_DEFAULT_<CODE>`, else English). A language this image wasn't built with reads as English ([ui.md](ui.md) 4) |
+diff --git a/docs/spec/ui.md b/docs/spec/ui.md
+index 2484b9f..1a21c38 100644
+--- a/docs/spec/ui.md
++++ b/docs/spec/ui.md
+@@ -160,6 +160,12 @@ without its label, for the cursor's steps. With 1024 channels a key took 0.34 s
+ 
+ The gallery (section 7) shows every screen at every display class.
+ 
++Tools > Zone scan speed (`CONFIG_SCAN && CONFIG_UI_SETTINGS`) opens a one-row settings group for the empty-channel
++dwell: 50, 75, 100, 150, 250 or 500 ms. The Tools row shows the current value. OK applies and saves it at once,
++including during a zone scan; VFO scan and dual watch keep their own dwell ([radio-features.md](radio-features.md) 2).
++This group is appended after the Settings groups but is not duplicated in Settings or Find, so every existing
++Settings and Tools position keeps its number.
++
+ ### 2.1 Channel editor
+ 
+ The Channel screen edits a working copy of the channel. Nothing is written until the user saves.
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index ae8ac34..e17e352 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -3037,9 +3037,10 @@ static void test_persist(void)
+ 	settings_t cur;
+ 	settings_read(&cur);
+ 	CHECK(cur.rs_stored == 1 && cur.rs_tot_s == 45 && cur.rs_vox_level == 10 &&
+-	      (cur.rs_flags & SETTINGS_RS_SCAN_DWELL_SET));
++	      (cur.rs_flags & SETTINGS_RS_SCAN_DWELL_SET) && cur.zone_scan_dwell_25ms == 2);
+ 	boot();
+-	CHECK(sm.set.tot_s == 45 && !sm.set.key_beep && sm.set.roger_beep && sm.set.vox_level == 10);
++	CHECK(sm.set.tot_s == 45 && !sm.set.key_beep && sm.set.roger_beep && sm.set.vox_level == 10 &&
++	      sm.set.zone_scan_dwell_ms == RADIO_ZONE_SCAN_DWELL_MS);
+ 	// An old record's legacy 150 ms default migrates to the fast default;
+ 	// explicitly saving 150 ms after that keeps the user's choice.
+ 	st = settings_begin();
+@@ -3053,11 +3054,22 @@ static void test_persist(void)
+ 	radio_sm_set_settings(&sm, &rs, now);
+ 	boot();
+ 	CHECK(sm.set.scan_dwell_ms == 150);
+-	settings_begin()->rs_stored = 0;	// never set: the defaults
++	// The zone-only value survives a reboot and leaves the general VFO/dual dwell alone
++	rs = sm.set;
++	rs.zone_scan_dwell_ms = 100;
++	radio_sm_set_settings(&sm, &rs, now);
++	settings_read(&cur);
++	CHECK(cur.zone_scan_dwell_25ms == 4);
++	boot();
++	CHECK(sm.set.zone_scan_dwell_ms == 100 && sm.set.scan_dwell_ms == 150);
++	st = settings_begin();
++	st->rs_stored = 0;	// never set: the defaults
++	st->zone_scan_dwell_25ms = 0;	// an old record: no zone-only value yet
+ 	settings_end(now);
+ 	boot();
+ 	CHECK(sm.set.tot_s == RADIO_TOT_DEFAULT_S && sm.set.key_beep && !sm.set.roger_beep &&
+-	      sm.set.scan_dwell_ms == RADIO_SCAN_DWELL_MS);
++	      sm.set.scan_dwell_ms == RADIO_SCAN_DWELL_MS &&
++	      sm.set.zone_scan_dwell_ms == RADIO_ZONE_SCAN_DWELL_MS);
+ 
+ 	// The DMR data service's settings: saved when they change, back after a reboot
+ 	dmrDataSettings_t ds;
+@@ -4814,6 +4826,23 @@ static void test_ui_glue(void)
+ 	CHECK(debuglink_radio_feature_op(DL_OP_SETTING, (const uint8_t[]){ 36, 0x10, 0 }, 3) == DL_ST_BAD_ARG);
+ 	kv_tone[0] = -1;
+ 	n_ev = 0;
++	// Tools > Zone scan speed: every offered value reads back, reaches the core and is stored in 25 ms units
++	static const uint16_t zone_dwells[] = { 50, 75, 100, 150, 250, 500 };
++	CHECK(ui_svc_setting_get(UI_SET_ZONE_SCAN_DWELL) == RADIO_ZONE_SCAN_DWELL_MS);
++	for (size_t i = 0; i < sizeof zone_dwells / sizeof zone_dwells[0]; i++) {
++		CHECK(ui_svc_setting_set(UI_SET_ZONE_SCAN_DWELL, zone_dwells[i]));
++		ui_svc_apply(UI_SET_ZONE_SCAN_DWELL, zone_dwells[i]);
++		run(20);
++		CHECK(sm.set.zone_scan_dwell_ms == zone_dwells[i] &&
++		      ui_svc_setting_get(UI_SET_ZONE_SCAN_DWELL) == zone_dwells[i]);
++		settings_read(&sv);
++		CHECK(sv.zone_scan_dwell_25ms == zone_dwells[i] / 25u);
++	}
++	CHECK(debuglink_radio_feature_op(DL_OP_SETTING, (const uint8_t[]){ 38, 150, 0 }, 3) == DL_ST_OK);
++	run(20);
++	CHECK(sm.set.zone_scan_dwell_ms == 150);
++	CHECK(debuglink_radio_feature_op(DL_OP_SETTING, (const uint8_t[]){ 38, 51, 0 }, 3) == DL_ST_BAD_ARG);
++	CHECK(debuglink_radio_feature_op(DL_OP_SETTING, (const uint8_t[]){ 38, 0xF5, 1 }, 3) == DL_ST_BAD_ARG);
+ 	// The scan stop tone is the radio core's (rs_flags), the emergency tone the emergency service's (em_flags)
+ 	CHECK(ui_svc_setting_get(UI_SET_SCAN_TONE) == 0);
+ 	CHECK(ui_svc_setting_set(UI_SET_SCAN_TONE, 1));
+diff --git a/tests/host/radioFeaturesTest.c b/tests/host/radioFeaturesTest.c
+index 21b962d..0d20485 100644
+--- a/tests/host/radioFeaturesTest.c
++++ b/tests/host/radioFeaturesTest.c
+@@ -1149,13 +1149,20 @@ static void test_zone_scan(void)
+ 	CHECK(!visited);
+ 	hw.sig[0].hz = 0;
+ 
+-	// Monitor pauses the stepping
++	// Monitor pauses the stepping. On DMR the same key controls digital monitor instead, so land on an FM stop first:
++	// with the shorter zone dwell, an arbitrary delay can otherwise change which mode this request reaches.
++	for (int i = 0; i < 200 && sm.view.ch.mode == RADIO_MODE_DMR; i++) {
++		run(25);
++	}
++	CHECK(sm.view.ch.mode != RADIO_MODE_DMR);
+ 	req(RREQ_MONITOR, 1);
+ 	uint16_t at = sm.view.zone_pos;
+ 	run(2000);
+ 	CHECK(sm.view.zone_pos == at && sm.view.scan_phase == SCAN_PH_PAUSED);
+ 	req(RREQ_MONITOR, 0);
+-	run(500);
++	for (int i = 0; i < 20 && sm.view.zone_pos == at; i++) {
++		run(25);
++	}
+ 	CHECK(sm.view.zone_pos != at);
+ 
+ 	// Cancel: back to where it started (Home); the nuisance list is gone with the scan
+@@ -1182,10 +1189,10 @@ static void test_zone_scan(void)
+ static void test_scan_ptt_and_modes(void)
+ {
+ 	start();
+-	// Empty channels use the fast 75 ms default: three polls after the retune,
+-	// the scan is already on the next stop. Signal probes are tested below.
++	// Empty zone channels use the independent 50 ms default: two polls after
++	// the retune, the scan is already on the next stop. Signal probes are tested below.
+ 	req(RREQ_SCAN, RSCAN_ZONE);
+-	run(50);
++	run(25);
+ 	CHECK(sm.view.zone_pos == 1);
+ 	run(25);
+ 	CHECK(sm.view.zone_pos == 4);
+@@ -1216,7 +1223,10 @@ static void test_scan_ptt_and_modes(void)
+ 	CHECK(sm.view.zone_pos == 1);
+ 	run(250);
+ 	CHECK(sm.view.zone_pos == 1 && sm.view.scan_phase == SCAN_PH_PROBE);
+-	run(400);
++	// Stop at the first departure: after it, a fast empty-zone sweep may wrap onto this channel again.
++	for (int i = 0; i < 16 && sm.view.zone_pos == 1; i++) {
++		run(25);
++	}
+ 	CHECK(sm.view.zone_pos != 1);
+ 	hw.sig[0].tone = (subtone_t){ TONE_CTCSS, 1000 };
+ 	for (int i = 0; i < 400 && !(sm.view.zone_pos == 1 && sm.view.scan_phase == SCAN_PH_HOLD); i++) {
+@@ -1305,6 +1315,38 @@ static void set_resume_stop(radio_settings_t *s) { s->scan_resume = SCAN_RESUME_
+ static void set_resume_carrier(radio_settings_t *s) { s->scan_resume = SCAN_RESUME_CARRIER; s->scan_priority = false; }
+ static void set_priority(radio_settings_t *s) { s->scan_priority = true; }
+ 
++static void test_zone_scan_dwell_setting(void)
++{
++	start();
++	CHECK(sm.set.zone_scan_dwell_ms == RADIO_ZONE_SCAN_DWELL_MS && RADIO_ZONE_SCAN_DWELL_MS == 50);
++	CHECK(sm.set.scan_dwell_ms == RADIO_SCAN_DWELL_MS && RADIO_SCAN_DWELL_MS == 75);
++	req(RREQ_SCAN, RSCAN_ZONE);
++	// A slower choice applies to the scan already running, not only to the next one
++	radio_settings_t rs = sm.set;
++	rs.zone_scan_dwell_ms = 150;
++	radio_sm_set_settings(&sm, &rs, now);
++	CHECK(sm.scan.cfg.dwell_ms == 150);
++	run(75);
++	CHECK(sm.view.zone_pos == 1);
++	run(75);
++	CHECK(sm.view.zone_pos == 4);
++	// Back to fast: this stop advances after its 50 ms settle/listen window
++	rs = sm.set;
++	rs.zone_scan_dwell_ms = 50;
++	radio_sm_set_settings(&sm, &rs, now);
++	run(50);
++	CHECK(sm.view.zone_pos == 5);
++	// The configured 50 ms is only for FM: this DMR stop keeps the proven 75 ms carrier-detection window.
++	run(25);
++	CHECK(sm.view.ch.mode == RADIO_MODE_DMR && sm.scan.cfg.dwell_ms == RADIO_SCAN_DWELL_MS);
++	req(RREQ_SCAN, RSCAN_STOP);
++	// The VFO's existing 75 ms dwell does not follow the zone-only setting
++	req(RREQ_VFO_SET, 146000000);
++	req2(RREQ_SCAN_VFO, 146000000, 146100000);
++	CHECK(sm.view.scan == SCAN_VFO && sm.scan.cfg.dwell_ms == RADIO_SCAN_DWELL_MS);
++	req(RREQ_SCAN, RSCAN_STOP);
++}
++
+ static void test_vfo_scan(void)
+ {
+ 	start();
+@@ -1418,7 +1460,10 @@ static void test_mixed_scan(void)
+ 	CHECK(sm.view.zone_pos == 5 && sm.view.ch.mode == RADIO_MODE_DMR && sim.started);
+ 	run(300);
+ 	CHECK(sm.view.zone_pos == 5 && sm.view.scan_phase == SCAN_PH_PROBE);
+-	run(700);
++	// As above, observe the departure itself rather than a later position after a possible complete sweep.
++	for (int i = 0; i < 28 && sm.view.zone_pos == 5; i++) {
++		run(25);
++	}
+ 	CHECK(sm.view.zone_pos != 5 && !sim.started);	// back on FM: the stack let go of the modem
+ 	// Next time round a call is on: the scan holds on it
+ 	for (int i = 0; i < 200 && sm.view.zone_pos != 5; i++) {
+@@ -3887,6 +3932,7 @@ int main(void)
+ 	test_vibe_module();
+ 	test_zone_scan();
+ 	test_scan_ptt_and_modes();
++	test_zone_scan_dwell_setting();
+ 	test_vfo_scan();
+ 	test_mixed_scan();
+ 	test_scan_dmr_mid_call();
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 23d6df3..753cc08 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2617,8 +2617,11 @@ void sim_reset(const sim_geom_t *g, sim_map_t map)
+ 	ui_svc_setting_set(UI_SET_ARS_SERVER, 0);
+ 	ui_svc_setting_set(UI_SET_IP_GATEWAY, 0);
+ 	ui_svc_setting_set(UI_SET_PTT_LOCKED, 1);
+-	for (uint8_t id = UI_SET_CALL_END_TONE; id <= UI_SET_EMERGENCY_TONE; id++)
+-		ui_svc_setting_set(id, id != UI_SET_SCAN_TONE);	// as on a new radio: the scan stop tone off, the rest on
++	for (uint8_t id = UI_SET_CALL_END_TONE; id <= UI_SET_EMERGENCY_TONE; id++) {
++		if (id != UI_SET_ZONE_SCAN_DWELL)
++			ui_svc_setting_set(id, id != UI_SET_SCAN_TONE);	// scan stop tone off, the other tones on
++	}
++	ui_svc_setting_set(UI_SET_ZONE_SCAN_DWELL, RADIO_ZONE_SCAN_DWELL_MS);
+ 	ui_svc_setting_set(UI_SET_HEAR_ALL_DEFAULT, 0);
+ 	ui_svc_setting_set(UI_SET_NOISE_REDUCTION, 1);
+ 	ui_svc_setting_set(UI_SET_MIC_AGC, 0);
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 9cd2f78..73106cd 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -227,6 +227,10 @@ static const flow_t flows[] = {
+ 	{ "9 squelch 2 steps (FM)", "down", "quick 2 up up back", "sq=7 screen=home", 5, false },
+ 	{ "10 privacy", "", "quick 6 back", "privacy=1 screen=home", 3, false },
+ 	{ "11 scan start (Tools > Scan)", "", "ok 6 1", "scanning=1", 3, false },
++	{ "11 zone scan speed opens from Tools", "", "ok 6 up ok",
++	  "screen=group shows=Zone_scan_speed shows=Empty-channel_dwell shows=50_ms", 4, false },
++	{ "11 zone scan speed survives a restart", "ok 6 up ok ok", "reboot ok 6 up",
++	  "screen=tools shows=Zone_scan_speed shows=75_ms", 3, false },
+ 	{ "11 nuisance skip", "ok 6 1", "ctx 1", "pos=4 scanning=1", 2, false },
+ 	{ "11 scan stop", "ok 6 1", "back", "scanning=0", 1, false },
+ 	// Dual watch (docs/ux/dual-watch.md): on in a few presses, PTT on the selected channel, the other one press away
