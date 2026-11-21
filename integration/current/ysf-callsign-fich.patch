@@ -1,0 +1,457 @@
+--- a/core/ysf/ysf_tx.c
++++ b/core/ysf/ysf_tx.c
+@@ -10,9 +10,22 @@
+ #include "ysf_tx.h"
+ #include <string.h>
+ 
++// Number of communication frames in one cycle. With no auxiliary data,
++// Yaesu Tables 4-3/4-4 rotate only the CSD frames; adding empty DT frames
++// would misstate FT and delay the repeated source callsign.
++static unsigned cc_frames(const ysf_tx_config *cfg)
++{
++	switch (cfg->dt) {
++	case YSF_DT_VD_MODE1: return cfg->data ? 8u : 3u;
++	case YSF_DT_VD_MODE2: return cfg->data ? 8u : 6u;
++	case YSF_DT_DATA_FR: case YSF_DT_VOICE_FR: return 8u;
++	default: return 0;
++	}
++}
++
+ unsigned ysf_tx_total_frames(const ysf_tx_config *cfg)
+ {
+-	return 2u + 8u * (cfg->cycles ? cfg->cycles : 1u);
++	return 2u + cc_frames(cfg) * (cfg->cycles ? cfg->cycles : 1u);
+ }
+ 
+ // Voice-block length of one 20 ms block in this mode.
+@@ -62,8 +75,10 @@
+ 
+ static void csd3(const ysf_tx_config *c, uint8_t out[20])
+ {
+-	memcpy(out, c->rem1, 10);
+-	memcpy(out + 10, c->rem2, 10);
++	memcpy(out, c->rem1, 5);
++	memcpy(out + 5, c->rem2, 5);
++	memcpy(out + 10, c->rem3, 5);
++	memcpy(out + 15, c->rem4, 5);
+ }
+ 
+ // One 10-byte DN data unit: Dest / Src / Down / Up / Rem1+2 / Rem3+4.
+@@ -87,18 +102,12 @@
+ 
+ bool ysf_tx_frame_build(const ysf_tx_config *cfg, unsigned frame_no, uint8_t frame[YSF_FRAME_BYTES])
+ {
+-	unsigned cycles = cfg->cycles ? cfg->cycles : 1u;
+-	unsigned total = 2u + 8u * cycles;
+-	if (frame_no >= total) return false;
+-	switch (cfg->dt) {
+-	case YSF_DT_VD_MODE1: case YSF_DT_DATA_FR: case YSF_DT_VD_MODE2: case YSF_DT_VOICE_FR:
+-		break;
+-	default:
+-		return false;
+-	}
++	unsigned cc_count = cc_frames(cfg);
++	unsigned total = ysf_tx_total_frames(cfg);
++	if (!cc_count || frame_no >= total) return false;
+ 	ysf_fich f;
+ 	memset(&f, 0, sizeof f);
+-	f.cs = cfg->cs;
++	f.cs = YSF_CS_CSD;
+ 	f.cm = cfg->cm;
+ 	f.dev = cfg->dev;
+ 	f.mr = cfg->mr;
+@@ -116,13 +125,15 @@
+ 		ysf_frame_build(&f, d1, d2, frame);
+ 		return true;
+ 	}
+-// Communication frames: FN cycles 0..7, data index counts DT units.
+-	unsigned fn = (frame_no - 1) % 8;
++// Communication frames: FT is the final FN in this CSD/data cycle.
++	unsigned fn = (frame_no - 1) % cc_count;
+ 	f.fi = YSF_FI_COMMUNICATION;
+ 	f.fn = (uint8_t)fn;
+-	f.ft = 7;	// final index of the eight communication frames in the block
+-	if (cfg->dt == YSF_DT_VOICE_FR && cfg->vw_subheader && frame_no == 1)
+-		f.ft = 1;	// identify the CSD3 sub-header
++	f.ft = (uint8_t)(cc_count - 1);
++	if (cfg->dt == YSF_DT_VOICE_FR) {
++		f.fn = 0;
++		f.ft = cfg->vw_subheader && frame_no == 1 ? 1 : 0;
++	}
+ 	uint8_t dch[20], dch2[20];
+ 	memset(dch, 0, sizeof dch);
+ 	memset(dch2, 0, sizeof dch2);
+--- a/core/ysf/ysf_tx.h
++++ b/core/ysf/ysf_tx.h
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ // YSF transmitter, firmware: builds a whole transmission (header ->
+-// communication frames FN 0..7 -> terminator), one frame at a time. Mirror
+-// of the RX frame layer (ysf_frame.h): the TX chain is
++// mode-dependent communication cycle -> terminator), one frame at a time.
++// Mirror of the RX frame layer (ysf_frame.h): the TX chain is
+ //
+ //   ysf_tx_config (callsigns, mode, DG-ID)
+ //     -> ysf_tx_frame_build() (FICH + DCH rotation + voice blocks)
+@@ -70,7 +70,7 @@
+ 	uint8_t dev;  // 0 = Wide (+-2700/+-900 Hz), 1 = Narrow (+-1350/+-450 Hz)
+ 	uint8_t cm;  // YSF_CM_GROUP / RADIO_ID / INDIVIDUAL
+ 	uint8_t mr;  // YSF_MR_DIRECT / DOWNLINK_FREE / DOWNLINK_BUSY
+-	uint8_t cs;  // 2 bits, usually 0
++	uint8_t cs;  // YSF_CS_CSD; the builder enforces this fixed value
+ 	uint8_t sql;  // 0 = DG-ID squelch enabled, 1 = disabled
+ 	uint8_t voip;  // 0 = RF, 1 = VoIP
+ 	uint8_t dgid;  // FICH SC: 0 = none, 1..126 = codes, 127 = Break Out
+@@ -83,18 +83,19 @@
+ 	char rem3[YSF_CALLSIGN_LEN];
+ 	char rem4[YSF_CALLSIGN_LEN];
+ 	bool vw_subheader;  // send the CSD3 sub-header in the first VW communication frame
+-	unsigned cycles;  // communication-block repeats, >= 1 (1 = 10 frames)
+-	ysf_tx_data_fn data;  // NULL: data units are zero-filled
++	unsigned cycles;  // communication-cycle repeats, >= 1
++	ysf_tx_data_fn data;  // NULL: voice modes omit DT units and rotate only CSD
+ 	ysf_tx_voice_fn voice;  // NULL: voice blocks are zero-filled (test payload, not AMBE)
+ 	void *ctx;
+ } ysf_tx_config;
+ 
+-// Total frames of a transmission: 2 + 8 * cycles (header + cycles x 8 CC + terminator).
++// Total frames: header + cycles of the mode's CSD/data sequence + terminator.
++// Voice-only V/D-1 cycles have 3 CC frames; DN has 6; cycles with data and the
++// FR modes have 8.
+ unsigned ysf_tx_total_frames(const ysf_tx_config *cfg);
+ 
+-// Build one frame of the sequence: frame_no 0 = header, 1..8*cycles =
+-// communication (FN (frame_no-1) % 8), last = terminator. False when
+-// frame_no is out of range or the mode is unknown.
++// Build one frame of the sequence: frame_no 0 = header, followed by the
++// communication cycles, last = terminator. False when out of range or unknown.
+ bool ysf_tx_frame_build(const ysf_tx_config *cfg, unsigned frame_no, uint8_t frame[YSF_FRAME_BYTES]);
+ 
+ #ifdef __cplusplus
+--- a/core/ysf/ysf_frame.h
++++ b/core/ysf/ysf_frame.h
+@@ -62,6 +62,7 @@
+ enum {
+ 	YSF_FI_HEADER = 0, YSF_FI_COMMUNICATION = 1, YSF_FI_TERMINATOR = 2, YSF_FI_TEST = 3,
+ 	YSF_DT_VD_MODE1 = 0, YSF_DT_DATA_FR = 1, YSF_DT_VD_MODE2 = 2, YSF_DT_VOICE_FR = 3,
++	YSF_CS_CSD = 2,  // CSD1 + CSD2 + CSD3 are present
+ 	YSF_CM_GROUP = 0, YSF_CM_RADIO_ID = 1, YSF_CM_INDIVIDUAL = 3,
+ 	YSF_MR_DIRECT = 0, YSF_MR_DOWNLINK_FREE = 1, YSF_MR_DOWNLINK_BUSY = 2
+ };
+--- a/core/ysf/ysf_engine.c
++++ b/core/ysf/ysf_engine.c
+@@ -39,7 +39,7 @@
+ }
+ 
+ // A callsign from the air: 10 characters, space-padded. n bytes are taken
+-// (DN carries only the first 5 characters of Rem1..Rem4); trailing spaces
++// (Rem1..Rem4 use their first 5 characters); trailing spaces
+ // are trimmed, the result NUL-terminated. All spaces becomes empty.
+ static void copy_call(char dst[YSF_CALLSIGN_LEN + 1], const uint8_t *data, unsigned n)
+ {
+@@ -74,8 +74,10 @@
+ 			copy_call(c->down, f->dch, 10);
+ 			copy_call(c->up, f->dch + 10, 10);
+ 		} else if (f->fich.fn == 2) {
+-			copy_call(c->rem1, f->dch, 10);
+-			copy_call(c->rem2, f->dch + 10, 10);
++			copy_call(c->rem1, f->dch, 5);
++			copy_call(c->rem2, f->dch + 5, 5);
++			copy_call(c->rem3, f->dch + 10, 5);
++			copy_call(c->rem4, f->dch + 15, 5);
+ 		}
+ 		break;
+ 	case YSF_DT_VD_MODE2:
+@@ -102,14 +104,18 @@
+ 			copy_call(c->down, f->dch2, 10);
+ 			copy_call(c->up, f->dch2 + 10, 10);
+ 		} else if (f->fich.fn == 1) {
+-			copy_call(c->rem1, f->dch, 10);
+-			copy_call(c->rem2, f->dch + 10, 10);
++			copy_call(c->rem1, f->dch, 5);
++			copy_call(c->rem2, f->dch + 5, 5);
++			copy_call(c->rem3, f->dch + 10, 5);
++			copy_call(c->rem4, f->dch + 15, 5);
+ 		}
+ 		break;
+ 	case YSF_DT_VOICE_FR:
+ 		if (ysf_vw_subheader(&f->fich)) {
+-			copy_call(c->rem1, f->dch, 10);
+-			copy_call(c->rem2, f->dch + 10, 10);
++			copy_call(c->rem1, f->dch, 5);
++			copy_call(c->rem2, f->dch + 5, 5);
++			copy_call(c->rem3, f->dch + 10, 5);
++			copy_call(c->rem4, f->dch + 15, 5);
+ 		}
+ 		break;
+ 	default:
+@@ -431,8 +437,8 @@
+ 		air_sym_put(packed, (uint16_t)i, (uint8_t)((frame[i / 4] >> (6 - 2 * (i % 4))) & 3u));
+ }
+ 
+-// Build the next sequence frame: 0 header, 1..8 communication (FN cycles
+-// 0..7, repeated while PTT is held), 9 terminator. False when the frame
++// Build the next sequence frame: header, the mode's CSD/data cycle (repeated
++// while PTT is held), then terminator. False when the frame
+ // waits for voice. After the key, a communication frame is still built while
+ // voice the encoder already made waits in the ring: the tail of the over is
+ // sent, not dropped, and the terminator follows once the ring is empty. The
+@@ -444,16 +450,19 @@
+ #define YSF_TX_STOP_MAX_FRAMES	10u	// communication frames built after the key, at most
+ static bool build_next(ysf_engine_t *e)
+ {
++	unsigned total = ysf_tx_total_frames(&e->txcfg);
++	unsigned terminator = total - 1;
++	unsigned last_cc = total - 2;
+ 	unsigned seq;
+ 
+ 	if (e->frame_no == 0)
+ 		seq = 0;	// header
+ 	else if (e->tx_stop && !e->tx_ended &&
+ 		 ((e->sq_n == 0 && e->stage_n == 0) || e->stop_frames >= YSF_TX_STOP_MAX_FRAMES))
+-		seq = 9;	// terminator: no voice left to drain, or the drain is stuck
++		seq = terminator;	// no voice left to drain, or the drain is stuck
+ 	else
+-		seq = e->frame_no;	// 1..8, communication
+-	if (seq >= 1 && seq <= 8 &&
++		seq = e->frame_no;
++	if (seq >= 1 && seq <= last_cc &&
+ 	    (half_rate(e->cfg.dt) || e->cfg.dt == YSF_DT_VOICE_FR) && !stage_voice(e))
+ 		return false;
+ 	if (!ysf_tx_frame_build(&e->txcfg, seq, e->buf.tx.txframe))
+@@ -463,11 +472,11 @@
+ 	if (seq == 0) {
+ 		e->frame_no = 1;
+ 		e->tx_started = true;
+-	} else if (seq == 9) {
++	} else if (seq == terminator) {
+ 		e->tx_ended = true;
+ 	} else {
+ 		e->txcfg.vw_subheader = false;
+-		e->frame_no = e->frame_no >= 8 ? 1 : e->frame_no + 1;
++		e->frame_no = e->frame_no >= last_cc ? 1 : e->frame_no + 1;
+ 		if (e->tx_stop && e->stop_frames < 255)
+ 			e->stop_frames++;
+ 	}
+@@ -503,16 +512,16 @@
+ 
+ static const air_session_ops_t ops = { tx_fill, NULL };
+ 
+-// The sequence builder's config follows the engine's: cs/sql/voip are 0
+-// (RF, DG-ID squelch on), cycles is 1 (the engine repeats the CC block
+-// itself while PTT is held).
++// The sequence builder's config follows the engine's: CS announces all three
++// callsign blocks, SQL/VoIP are 0 (RF, DG-ID squelch on), cycles is 1 (the
++// engine repeats the CC cycle itself while PTT is held).
+ static void refresh_txcfg(ysf_engine_t *e)
+ {
+ 	e->txcfg.dt = e->cfg.dt;
+ 	e->txcfg.dev = e->cfg.narrow ? 1 : 0;
+ 	e->txcfg.cm = e->cfg.cm;
+ 	e->txcfg.mr = e->cfg.mr;
+-	e->txcfg.cs = 0;
++	e->txcfg.cs = YSF_CS_CSD;
+ 	e->txcfg.sql = 0;
+ 	e->txcfg.voip = 0;
+ 	e->txcfg.dgid = e->cfg.tx_dgid;
+@@ -534,7 +543,7 @@
+ 	e->hooks = *hooks;
+ 	e->ctx = ctx;
+ 	e->mode = ysf_engine_mode(cfg->narrow);
+-	e->txcfg.data = tx_data_wrap;
++	e->txcfg.data = hooks->tx_data ? tx_data_wrap : NULL;
+ 	e->txcfg.voice = tx_voice_cb;
+ 	e->txcfg.ctx = e;
+ 	e->txcfg.cycles = 1;
+--- a/tests/host/ysfTest.c
++++ b/tests/host/ysfTest.c
+@@ -301,10 +301,10 @@
+ {
+ 	ysf_tx_config c;
+ 
+-	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 0 }) == 10, "total frames, cycles 0");
+-	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 1 }) == 10, "total frames, cycles 1");
+-	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 2 }) == 18, "total frames, cycles 2");
+-	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 3 }) == 26, "total frames, cycles 3");
++	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 0 }) == 5, "voice-only total frames, cycles 0");
++	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 1 }) == 5, "voice-only total frames, cycles 1");
++	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 2 }) == 8, "voice-only total frames, cycles 2");
++	CHECK(ysf_tx_total_frames(&(ysf_tx_config){ .cycles = 3 }) == 11, "voice-only total frames, cycles 3");
+ 
+ 	// The voice frames the callback serves: valid AMBE frames from random
+ 	// parameters, so the DN path has something real to convert
+@@ -328,7 +328,8 @@
+ 		tx_data_seen = 0;
+ 		CHECK(ysf_tx_frame_build(&c, fn, frame), "vd1 frame %u builds", fn);
+ 		CHECK(ysf_frame_decode(frame, &f, dch, dch2, &len), "vd1 frame %u decodes", fn);
+-		CHECK(f.dt == YSF_DT_VD_MODE1 && f.sc == 7 && f.cm == YSF_CM_GROUP, "vd1 frame %u fich", fn);
++		CHECK(f.dt == YSF_DT_VD_MODE1 && f.sc == 7 && f.cm == YSF_CM_GROUP && f.cs == 2,
++		      "vd1 frame %u fich", fn);
+ 		if (fn == 0) {
+ 			CHECK(f.fi == YSF_FI_HEADER && f.fn == 0 && !memcmp(dch, "DEST      SRC       ", 20) &&
+ 			      !memcmp(dch2, "DOWN      UP        ", 20), "vd1 header dch");
+@@ -344,7 +345,7 @@
+ 			else if (cc == 1)
+ 				CHECK(!memcmp(dch, "DOWN      UP        ", 20), "vd1 fn1 csd2");
+ 			else if (cc == 2)
+-				CHECK(!memcmp(dch, "REM1      REM2      ", 20), "vd1 fn2 csd3");
++				CHECK(!memcmp(dch, "REM1 REM2 REM3 REM4 ", 20), "vd1 fn2 csd3");
+ 			else
+ 				CHECK(dch[0] == cc - 3 && tx_data_seen == 1, "vd1 fn%u data unit %u", cc, cc - 3);
+ 			// The voice blocks are the staged AMBE frames, byte for byte
+@@ -413,7 +414,7 @@
+ 			CHECK(!memcmp(dch, "DEST      SRC       ", 20) && !memcmp(dch2, "DOWN      UP        ", 20),
+ 			      "datafr fn0");
+ 		else if (fn - 1 == 1)
+-			CHECK(!memcmp(dch, "REM1      REM2      ", 20) && dch2[0] == 0, "datafr fn1");
++			CHECK(!memcmp(dch, "REM1 REM2 REM3 REM4 ", 20) && dch2[0] == 0, "datafr fn1");
+ 		else
+ 			CHECK(dch[0] == 2 * (fn - 1) - 3 && dch2[0] == 2 * (fn - 1) - 2, "datafr fn%u data",
+ 			      fn - 1);
+@@ -444,7 +445,8 @@
+ 		c.data = NULL;
+ 		c.voice = NULL;
+ 		memcpy(c.dest, "ALL       ", 10);
+-		for (unsigned fn = 0; fn < 10; fn += 9) {
++		unsigned total = ysf_tx_total_frames(&c);
++		for (unsigned fn = 0; fn < total; fn += total - 1) {
+ 			uint8_t frame[YSF_FRAME_BYTES], dch[20];
+ 			ysf_fich f;
+ 			unsigned len = 0;
+@@ -478,6 +480,56 @@
+ 	      len == 20 && !memcmp(dch, "ALL       SRC       ", 20), "individual destination unchanged");
+ }
+ 
++// Yaesu Tables 4-3/4-4 and Figure 4-20: voice-only calls rotate through just
++// the CSD frames. FT is the last FN, and VW voice after its sub-header uses
++// FN0/FT0 rather than pretending that eight data frames follow.
++static void testTxVoiceSequence(void)
++{
++	static const struct { uint8_t dt; unsigned total, ft; } cases[] = {
++		{ YSF_DT_VD_MODE1, 5, 2 }, { YSF_DT_VD_MODE2, 8, 5 }, { YSF_DT_VOICE_FR, 10, 0 }
++	};
++
++	for (unsigned m = 0; m < sizeof cases / sizeof *cases; m++) {
++		ysf_tx_config c;
++		make_tx_cfg(&c, cases[m].dt);
++		c.data = NULL;
++		c.voice = NULL;
++		c.vw_subheader = c.dt == YSF_DT_VOICE_FR;
++		CHECK(ysf_tx_total_frames(&c) == cases[m].total, "voice-only total mode %u", c.dt);
++		for (unsigned fn = 0; fn < cases[m].total; fn++) {
++			uint8_t frame[YSF_FRAME_BYTES], dch[20], dch2[20];
++			ysf_fich f;
++			unsigned len = 99;
++			CHECK(ysf_tx_frame_build(&c, fn, frame) && ysf_frame_decode(frame, &f, dch, dch2, &len),
++			      "voice-only mode %u frame %u", c.dt, fn);
++			CHECK(f.cs == 2, "voice-only CS mode %u frame %u", c.dt, fn);
++			if (fn == 0 || fn == cases[m].total - 1) {
++				CHECK(len == 20 && !memcmp(dch, "DEST      SRC       ", 20),
++				      "voice-only header/terminator mode %u", c.dt);
++				continue;
++			}
++			unsigned cc = fn - 1;
++			if (c.dt == YSF_DT_VOICE_FR) {
++				CHECK(f.fn == 0 && f.ft == (cc == 0 ? 1 : 0), "vw voice FN/FT %u", cc);
++				if (cc == 0)
++					CHECK(len == 20 && !memcmp(dch, "REM1 REM2 REM3 REM4 ", 20), "vw CSD3");
++				else
++					CHECK(len == 0, "vw voice has no DCH %u", cc);
++			} else {
++				CHECK(f.fn == cc && f.ft == cases[m].ft, "voice-only FN/FT mode %u frame %u", c.dt, cc);
++				if (c.dt == YSF_DT_VD_MODE1 && cc == 2)
++					CHECK(!memcmp(dch, "REM1 REM2 REM3 REM4 ", 20), "vd1 voice-only CSD3");
++				if (c.dt == YSF_DT_VD_MODE2 && cc == 4)
++					CHECK(len == 10 && !memcmp(dch, "REM1 REM2 ", 10), "dn voice-only Rem1+2");
++				if (c.dt == YSF_DT_VD_MODE2 && cc == 5)
++					CHECK(len == 10 && !memcmp(dch, "REM3 REM4 ", 10), "dn voice-only Rem3+4");
++			}
++		}
++		CHECK(!ysf_tx_frame_build(&c, cases[m].total, (uint8_t[YSF_FRAME_BYTES]){ 0 }),
++		      "voice-only out of range mode %u", c.dt);
++	}
++}
++
+ // ── The DN voice field ──
+ static void testVoiceDn(void)
+ {
+@@ -543,6 +595,7 @@
+ 	testFrame();
+ 	testTx();
+ 	testTxGroupDest();
++	testTxVoiceSequence();
+ 	testVoiceDn();
+ 	printf("ysfTest: %d checks, %d failed\n", checks, failures);
+ 	return failures ? 1 : 0;
+--- a/tests/host/ysfEngineTest.c
++++ b/tests/host/ysfEngineTest.c
+@@ -215,6 +215,9 @@
+ static const ysf_engine_hooks_t hooks = { .rx_start = h_start, .rx_update = h_update, .rx_voice = h_voice,
+ 					   .rx_end = h_end, .rx_data = h_data, .tx_voice = h_tx_voice,
+ 					   .tx_data = h_tx_data };
++static const ysf_engine_hooks_t voice_only_hooks = { .rx_start = h_start, .rx_update = h_update,
++						      .rx_voice = h_voice, .rx_end = h_end,
++						      .rx_data = h_data, .tx_voice = h_tx_voice };
+ 
+ static void encode(radio_t *x, uint8_t n)
+ {
+@@ -346,7 +349,9 @@
+ 	CHECK(r[1].starts == 1 && r[1].ends == 1 && !r[1].call.late && !strcmp(r[1].call.dest, "CQ") &&
+ 	      !strcmp(r[1].call.src, "XE1ARS") && !strcmp(r[1].call.down, "DOWN") &&
+ 	      !strcmp(r[1].call.up, "UP") && !strcmp(r[1].call.rem1, "REM1") &&
+-	      !strcmp(r[1].call.rem2, "REM2") && r[1].call.fich.dt == dt && r[1].call.fich.sc == 7 &&
++	      !strcmp(r[1].call.rem2, "REM2") && !strcmp(r[1].call.rem3, "REM3") &&
++	      !strcmp(r[1].call.rem4, "REM4") && r[1].call.fich.cs == 2 &&
++	      r[1].call.fich.dt == dt && r[1].call.fich.sc == 7 &&
+ 	      r[1].call.fich.dev == (narrow ? 1 : 0),
+ 	      "%s: heard: starts %u ends %u dest %s src %s", name, r[1].starts, r[1].ends, r[1].call.dest,
+ 	      r[1].call.src);
+@@ -438,6 +443,28 @@
+ 	ysf_engine_end(&r[1].e);
+ }
+ 
++// The radio installs no TX data callback: the engine must select the shorter
++// voice-only CSD cycle, while preserving audio and all four CSD3 fields.
++static void testVoiceOnlyCall(uint8_t dt)
++{
++	ysf_engine_cfg_t cfg = base_cfg(dt, false);
++	uint16_t first;
++
++	begin(0, &cfg, &voice_only_hooks);
++	begin(1, &cfg, &voice_only_hooks);
++	steps(10);
++	over(50, 0, 0);
++	CHECK(r[1].starts == 1 && r[1].ends == 1 && r[1].ndata == 0 &&
++	      !strcmp(r[1].call.src, "XE1ARS") && !strcmp(r[1].call.rem1, "REM1") &&
++	      !strcmp(r[1].call.rem2, "REM2") && !strcmp(r[1].call.rem3, "REM3") &&
++	      !strcmp(r[1].call.rem4, "REM4") && r[1].call.fich.cs == 2,
++	      "voice-only engine mode %u preserves the complete call", dt);
++	CHECK(check_order(&r[1], &r[0], &first) == 0 && first == 0,
++	      "voice-only engine mode %u preserves audio", dt);
++	ysf_engine_end(&r[0].e);
++	ysf_engine_end(&r[1].e);
++}
++
+ static void testSquelch(void)
+ {
+ 	ysf_engine_cfg_t cfg = base_cfg(YSF_DT_VD_MODE1, false);
+@@ -592,7 +619,9 @@
+ 	CHECK(vw_taken == vw_made && heard == vw_made && vw_heard % 5 == 2,
+ 	      "VW all %u blocks heard (%u with filler), exactly one two-block sub-header", vw_made, vw_heard);
+ 	CHECK(r[1].starts == 1 && r[1].nvoice == 0 && r[1].ndata == 0 &&
+-	      !strcmp(r[1].call.rem1, "REM1") && !strcmp(r[1].call.rem2, "REM2"),
++	      !strcmp(r[1].call.rem1, "REM1") && !strcmp(r[1].call.rem2, "REM2") &&
++	      !strcmp(r[1].call.rem3, "REM3") && !strcmp(r[1].call.rem4, "REM4") &&
++	      r[1].call.fich.cs == 2,
+ 	      "VW preserves CSD3 and uses only the full-rate voice hooks");
+ 	ysf_engine_end(&r[0].e);
+ 	ysf_engine_end(&r[1].e);
+@@ -638,6 +667,8 @@
+ 	testCall(YSF_DT_VD_MODE1, false);
+ 	testCall(YSF_DT_VD_MODE2, false);
+ 	testCall(YSF_DT_VD_MODE1, true);
++	testVoiceOnlyCall(YSF_DT_VD_MODE1);
++	testVoiceOnlyCall(YSF_DT_VD_MODE2);
+ 	testSquelch();
+ 	testBadData(YSF_DT_VD_MODE1);
+ 	testBadData(YSF_DT_VD_MODE2);
