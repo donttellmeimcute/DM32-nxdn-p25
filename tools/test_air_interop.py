@@ -15,8 +15,8 @@ MODES = {
     "p25": ("-f1", r"NAC/CC: 293;", r"Group 123 Source 4567"),
     "nxdn48": ("-fi", r"NXDN48\b.*RAN 01", r"Src=4567.*Dst/TG=123"),
     "nxdn96": ("-fn", r"NXDN96\b.*RAN 01", r"Src=4567.*Dst/TG=123"),
-    "dn": ("-fy", r"V/D2.*\bHC\b.*DST: ALL +SRC: XE1ABC", r"\bAMBE [0-9A-Fa-f]{14} err"),
-    "vw": ("-fy", r"VWFR.*\bHC\b.*DST: ALL +SRC: XE1ABC", r"\bIMBE [0-9A-Fa-f]{22} err"),
+    "dn": ("-fy", r"V/D2.*\bHC\b.*DST: \*{10} +SRC: XE1ABC", r"\bAMBE [0-9A-Fa-f]{14} err"),
+    "vw": ("-fy", r"VWFR.*\bHC\b.*DST: \*{10} +SRC: XE1ABC", r"\bIMBE [0-9A-Fa-f]{22} err"),
 }
 
 

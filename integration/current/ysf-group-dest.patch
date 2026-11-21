@@ -1,0 +1,96 @@
+--- a/core/ysf/ysf_tx.c
++++ b/core/ysf/ysf_tx.c
+@@ -37,9 +37,20 @@
+ 	}
+ }
+ 
+-static void csd1(const ysf_tx_config *c, uint8_t out[20])
++// Yaesu puts ten asterisks in Dest for a direct Group/CQ call. ALL is the
++// codeplug/UI spelling; accepting it on the air makes MMDVM decode the call,
++// but is not the wire representation used by Yaesu radios.
++static void dest_unit(const ysf_tx_config *c, uint8_t out[10])
+ {
+ 	memcpy(out, c->dest, 10);
++	if (c->cm == YSF_CM_GROUP &&
++	    (!memcmp(out, "ALL       ", 10) || !memcmp(out, "          ", 10)))
++		memset(out, '*', 10);
++}
++
++static void csd1(const ysf_tx_config *c, uint8_t out[20])
++{
++	dest_unit(c, out);
+ 	memcpy(out + 10, c->src, 10);
+ }
+ 
+@@ -59,7 +70,7 @@
+ static void dn_unit(const ysf_tx_config *c, unsigned fn, uint8_t out[10])
+ {
+ 	switch (fn) {
+-	case 0: memcpy(out, c->dest, 10); break;
++	case 0: dest_unit(c, out); break;
+ 	case 1: memcpy(out, c->src, 10); break;
+ 	case 2: memcpy(out, c->down, 10); break;
+ 	case 3: memcpy(out, c->up, 10); break;
+--- a/tests/host/ysfTest.c
++++ b/tests/host/ysfTest.c
+@@ -432,6 +432,52 @@
+ 	}
+ }
+ 
++// A direct Group/CQ transmission uses ten asterisks on the air, as a Yaesu
++// radio does. "ALL" is the CPS/display spelling, not the CSD1 wire value.
++static void testTxGroupDest(void)
++{
++	static const uint8_t modes[] = { YSF_DT_VD_MODE1, YSF_DT_VD_MODE2, YSF_DT_VOICE_FR };
++
++	for (unsigned m = 0; m < sizeof modes; m++) {
++		ysf_tx_config c;
++		make_tx_cfg(&c, modes[m]);
++		c.data = NULL;
++		c.voice = NULL;
++		memcpy(c.dest, "ALL       ", 10);
++		for (unsigned fn = 0; fn < 10; fn += 9) {
++			uint8_t frame[YSF_FRAME_BYTES], dch[20];
++			ysf_fich f;
++			unsigned len = 0;
++			CHECK(ysf_tx_frame_build(&c, fn, frame) && ysf_frame_decode(frame, &f, dch, NULL, &len),
++			      "group header/terminator mode %u frame %u", modes[m], fn);
++			CHECK(len == 20 && !memcmp(dch, "**********SRC       ", 20),
++			      "group CSD1 mode %u frame %u", modes[m], fn);
++		}
++		if (modes[m] != YSF_DT_VOICE_FR) {
++			uint8_t frame[YSF_FRAME_BYTES], dch[20];
++			ysf_fich f;
++			unsigned len = 0;
++			unsigned fn = modes[m] == YSF_DT_VD_MODE2 ? 2 : 1;
++			CHECK(ysf_tx_frame_build(&c, fn, frame) && ysf_frame_decode(frame, &f, dch, NULL, &len),
++			      "group communication mode %u", modes[m]);
++			CHECK((modes[m] == YSF_DT_VD_MODE2 && len == 10 && !memcmp(dch, "SRC       ", 10)) ||
++			      (modes[m] == YSF_DT_VD_MODE1 && len == 20 && !memcmp(dch, "**********SRC       ", 20)),
++			      "group communication callsign mode %u", modes[m]);
++		}
++	}
++
++	// An explicitly addressed individual call must not be rewritten.
++	ysf_tx_config c;
++	make_tx_cfg(&c, YSF_DT_VD_MODE2);
++	c.cm = YSF_CM_INDIVIDUAL;
++	memcpy(c.dest, "ALL       ", 10);
++	uint8_t frame[YSF_FRAME_BYTES], dch[20];
++	ysf_fich f;
++	unsigned len = 0;
++	CHECK(ysf_tx_frame_build(&c, 0, frame) && ysf_frame_decode(frame, &f, dch, NULL, &len) &&
++	      len == 20 && !memcmp(dch, "ALL       SRC       ", 20), "individual destination unchanged");
++}
++
+ // ── The DN voice field ──
+ static void testVoiceDn(void)
+ {
+@@ -496,6 +542,7 @@
+ 	testSyncDibits();
+ 	testFrame();
+ 	testTx();
++	testTxGroupDest();
+ 	testVoiceDn();
+ 	printf("ysfTest: %d checks, %d failed\n", checks, failures);
+ 	return failures ? 1 : 0;
