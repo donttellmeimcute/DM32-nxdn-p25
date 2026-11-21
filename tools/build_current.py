@@ -38,6 +38,8 @@ PATCHES = (
 	'channel-squelch.patch',
 	# Bulk Edit RX Only: apply to every selected row and close without a false Boolean error
 	'rxonly-bulk-edit.patch',
+	# Quick menu: NAC/RAN/DG-ID and talk group/destination selectors on P25, NXDN and YSF channels
+	'quick-digital-selectors.patch',
 )
 
 

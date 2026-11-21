@@ -1,0 +1,1979 @@
+diff --git a/core/debuglink/debuglink_view.c b/core/debuglink/debuglink_view.c
+index d46dd74..1fe02c6 100644
+--- a/core/debuglink/debuglink_view.c
++++ b/core/debuglink/debuglink_view.c
+@@ -144,7 +144,7 @@ static void core_section(const radio_view_t *v, dl_text_t *t)
+ 		dl_text(t, "%s%u-%u", i != 0 ? "," : "", (unsigned)board.bands[i].lo_hz, (unsigned)board.bands[i].hi_hz);
+ 	}
+ 	dl_text(t, "\n");
+-	dl_text(t, "temporary=%u\ntemp=0x%02x\n", v->temporary, v->temp);
++	dl_text(t, "temporary=%u\ntemp=0x%03x\n", v->temporary, v->temp);
+ 	dl_text(t, "squelch=%u\nmonitor=%u\ntone_ok=%u\n", v->squelch, v->monitor, v->tone_ok);
+ 	dl_text(t, "rssi_dbm=%d\nnoise=%u\n", v->rssi_dbm, v->noise);
+ 	dl_text(t, "tx_elapsed_ms=%u\ntot_s=%u\n", (unsigned)v->tx_elapsed_ms, v->tot_s);
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+index af20c8c..9afcc7d 100644
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -395,7 +395,7 @@ typedef struct {
+ 	channel_t ch;		// what the radio is set to now (VFO: the VFO settings, with ch.name "VFO")
+ 	uint8_t power;		// effective board power level index
+ 	bool temporary;		// a temporary change (P7) is in effect on this channel
+-	uint8_t temp;		// which settings are temporary changes: RADIO_TEMP_* bits (temporary == (temp != 0))
++	uint16_t temp;		// which settings are temporary changes: RADIO_TEMP_* bits (temporary == (temp != 0))
+ 	uint8_t squelch;	// 0 = open .. 9 = tight
+ 	bool monitor;		// squelch held open by the user
+ 	bool tone_ok;		// the RX tone or code is heard (debounced; true when the channel has no RX tone)
+@@ -492,6 +492,7 @@ typedef struct {
+ #define RADIO_TEMP_TS		0x20u	// DMR timeslot (radio_req_dmr_timeslot)
+ #define RADIO_TEMP_CC		0x40u	// DMR color code (radio_req_dmr_color_code)
+ #define RADIO_TEMP_MODE		0x80u	// FM <-> DMR <-> P25 <-> NXDN <-> YSF (radio_req_mode)
++#define RADIO_TEMP_AIR		0x100u	// P25 NAC/TG, NXDN RAN/TG or YSF DG-ID/destination (radio_req_*_quick)
+ 
+ // Which tone radio_req_tone sets
+ #define RADIO_TONE_TX		0x01u
+@@ -571,14 +572,21 @@ void radio_req_vfo_aes(uint8_t mode, int32_t kid);
+ #if CONFIG_P25
+ // The P25 settings (RAM only, radio_p25.h): copied now, in force from the radio task's next turn
+ void radio_req_p25_settings(const radio_p25_settings_t *s);
++// A stored channel's NAC and/or talk group for now (mask RADIO_P25_QUICK_*), until it is saved or cleared; in the
++// VFO these are the RAM settings themselves
++void radio_req_p25_quick(const radio_p25_settings_t *s, uint8_t mask);
+ #endif
+ #if CONFIG_NXDN
+ // The NXDN settings (RAM only, radio_nxdn.h): the same
+ void radio_req_nxdn_settings(const radio_nxdn_settings_t *s);
++// A stored channel's RAN and/or talk group for now (mask RADIO_NXDN_QUICK_*): the same
++void radio_req_nxdn_quick(const radio_nxdn_settings_t *s, uint8_t mask);
+ #endif
+ #if CONFIG_YSF
+ // The YSF settings (RAM only, radio_ysf.h): the same
+ void radio_req_ysf_settings(const radio_ysf_settings_t *s);
++// A stored channel's DG-ID and/or destination for now (mask RADIO_YSF_QUICK_*): the same
++void radio_req_ysf_quick(const radio_ysf_settings_t *s, uint8_t mask);
+ #endif
+ #if CONFIG_DMR
+ void radio_req_reply_cancel(void);		// BACK on Home: end the DMR reply window
+diff --git a/core/radio/radio_nxdn.c b/core/radio/radio_nxdn.c
+index a0d147d..0a338bd 100644
+--- a/core/radio/radio_nxdn.c
++++ b/core/radio/radio_nxdn.c
+@@ -42,6 +42,8 @@ static const radio_nxdn_settings_t defaults = {
+ 	.tx_dst = 1, .emergency = false,
+ };
+ static radio_nxdn_settings_t set;
++static radio_nxdn_settings_t quick;
++static uint8_t quick_mask;
+ static nxdn_engine_t *eng;		// while running
+ static radio_nxdn_stats_t stats;
+ static nxdn_call_stats_t call_base;	// the call layer's counters already counted (they restart with the engine)
+@@ -51,6 +53,7 @@ static uint32_t rx_calls_base, tx_calls_base, filler_base, rejects_base;
+ void radio_nxdn_init(void)
+ {
+ 	set = defaults;
++	quick_mask = 0;
+ 	eng = NULL;
+ }
+ 
+@@ -72,6 +75,31 @@ void radio_nxdn_set_settings(const radio_nxdn_settings_t *s)
+ 		set.unit_id = 0;
+ }
+ 
++void radio_nxdn_set_quick(const radio_nxdn_settings_t *s, uint8_t mask, bool vfo)
++{
++	radio_nxdn_settings_t *to = vfo ? &set : &quick;
++	if (mask & RADIO_NXDN_QUICK_RAN) {
++		to->rx_ran = s->rx_ran <= RADIO_NXDN_RAN_MAX ? s->rx_ran : NXDN_RAN_ANY;
++		to->tx_ran = s->tx_ran <= RADIO_NXDN_RAN_MAX ? s->tx_ran : 1;
++	}
++	if (mask & RADIO_NXDN_QUICK_TG) {
++		to->unit_call = false;
++		to->tx_dst = s->tx_dst;
++	}
++	quick_mask = vfo ? 0 : (uint8_t)(quick_mask | mask);
++}
++
++uint8_t radio_nxdn_quick_settings(radio_nxdn_settings_t *out)
++{
++	*out = quick;
++	return quick_mask;
++}
++
++void radio_nxdn_clear_quick(void)
++{
++	quick_mask = 0;
++}
++
+ uint32_t radio_nxdn_fit(bool rate9600)
+ {
+ 	return board.air != NULL ? nxdn_engine_fit(board.air, rate9600) : 0;
+@@ -124,6 +152,18 @@ static void params(const channel_t *ch, uint16_t number, nxdn_engine_cfg_t *c)
+ 	}
+ }
+ 
++static void params_quick(nxdn_engine_cfg_t *c)
++{
++	if (quick_mask & RADIO_NXDN_QUICK_RAN) {
++		c->rx_ran = quick.rx_ran;
++		c->tx_ran = quick.tx_ran;
++	}
++	if (quick_mask & RADIO_NXDN_QUICK_TG) {
++		c->tx_call_type = NXDN_CALL_GROUP;
++		c->tx_dst = quick.tx_dst;
++	}
++}
++
+ static void params_channel(const channel_t *ch, uint16_t number, nxdn_engine_cfg_t *c)
+ {
+ 	nxdn_conv_cfg_t cc;
+@@ -145,6 +185,7 @@ static void params_channel(const channel_t *ch, uint16_t number, nxdn_engine_cfg
+ 		c->unit_id = cc.unit_id;
+ 		c->tx_call_type = cc.target_unit ? NXDN_CALL_INDIVIDUAL : NXDN_CALL_GROUP;
+ 		c->tx_dst = cc.target;
++		params_quick(c);
+ 		return;
+ 	}
+ 	uint8_t variant = ch->vfo_digital & VFO_DIG_NXDN_MASK;
+@@ -160,6 +201,7 @@ static void params_channel(const channel_t *ch, uint16_t number, nxdn_engine_cfg
+ 	c->tx_call_type = set.unit_call ? NXDN_CALL_INDIVIDUAL : NXDN_CALL_GROUP;
+ 	c->tx_dst = set.tx_dst;
+ 	c->emergency = set.emergency;
++	params_quick(c);
+ }
+ 
+ // ── Voice: the DMR side's voice path (ambeVoice.h), its sink on receive and its source on transmit. The hooks run in
+diff --git a/core/radio/radio_nxdn.h b/core/radio/radio_nxdn.h
+index 3a746e5..b91515c 100644
+--- a/core/radio/radio_nxdn.h
++++ b/core/radio/radio_nxdn.h
+@@ -83,6 +83,13 @@ bool radio_nxdn_receives(const channel_t *ch, uint16_t number);
+ void radio_nxdn_settings(radio_nxdn_settings_t *out);		// any task
+ void radio_nxdn_set_settings(const radio_nxdn_settings_t *s);	// radio task (RREQ_NXDN_SET)
+ 
++// The Quick menu's changes (RREQ_NXDN_SET with a mask): which fields radio_nxdn_set_quick takes, as P25's
++#define RADIO_NXDN_QUICK_RAN	0x01u	// the RAN (receive and transmit)
++#define RADIO_NXDN_QUICK_TG	0x02u	// the group PTT calls
++void radio_nxdn_set_quick(const radio_nxdn_settings_t *s, uint8_t mask, bool vfo);	// radio task
++uint8_t radio_nxdn_quick_settings(radio_nxdn_settings_t *out);	// the mask in force, the values in out (any task)
++void radio_nxdn_clear_quick(void);
++
+ // The parameters in force, as settings: false when the engine isn't running. Any task: a read that crosses a change
+ // of channel may mix the two (diagnostics only)
+ bool radio_nxdn_in_force(radio_nxdn_settings_t *out);
+diff --git a/core/radio/radio_p25.c b/core/radio/radio_p25.c
+index 6396564..0348891 100644
+--- a/core/radio/radio_p25.c
++++ b/core/radio/radio_p25.c
+@@ -91,6 +91,9 @@ static const radio_p25_settings_t defaults = {
+ 	.unit_call = false, .tx_dst = 1, .unit_id = 0,
+ };
+ static radio_p25_settings_t set;
++// Quick's channel-only fields. A mask, not a whole replacement block: saving one field never rewrites the others.
++static radio_p25_settings_t quick;
++static uint8_t quick_mask;
+ static p25_mem_t *mem;			// while running
+ static radio_p25_stats_t stats;
+ static p25_call_stats_t call_base;	// the call layer's counters when the engine started (they restart with it)
+@@ -106,6 +109,7 @@ static bool ttx;			// the follower's transmit side is on
+ void radio_p25_init(const hal_audio_t *audio)
+ {
+ 	set = defaults;
++	quick_mask = 0;
+ 	mem = NULL;
+ #if CONFIG_IMBE
+ 	p25VoiceInit(audio);
+@@ -119,15 +123,46 @@ void radio_p25_settings(radio_p25_settings_t *out)
+ 	*out = set;
+ }
+ 
++static void settings_clean(radio_p25_settings_t *s)
++{
++	s->rx_nac &= 0xFFFu;
++	s->tx_nac &= 0xFFFu;
++	s->unit_id &= 0xFFFFFFu;
++	s->tx_dst &= s->unit_call ? 0xFFFFFFu : 0xFFFFu;
++	if (s->talkaround > RADIO_P25_TA_OFF)
++		s->talkaround = RADIO_P25_TA_AUTO;
++}
++
+ void radio_p25_set_settings(const radio_p25_settings_t *s)
+ {
+ 	set = *s;
+-	set.rx_nac &= 0xFFFu;
+-	set.tx_nac &= 0xFFFu;
+-	set.unit_id &= 0xFFFFFFu;
+-	set.tx_dst &= set.unit_call ? 0xFFFFFFu : 0xFFFFu;
+-	if (set.talkaround > RADIO_P25_TA_OFF)
+-		set.talkaround = RADIO_P25_TA_AUTO;
++	settings_clean(&set);
++}
++
++void radio_p25_set_quick(const radio_p25_settings_t *s, uint8_t mask, bool vfo)
++{
++	radio_p25_settings_t *to = vfo ? &set : &quick;
++	if (mask & RADIO_P25_QUICK_NAC) {
++		to->rx_nac = s->rx_nac;
++		to->tx_nac = s->tx_nac;
++	}
++	if (mask & RADIO_P25_QUICK_TG) {
++		to->unit_call = false;
++		to->tx_dst = s->tx_dst;
++	}
++	settings_clean(to);
++	quick_mask = vfo ? 0 : (uint8_t)(quick_mask | mask);
++}
++
++uint8_t radio_p25_quick_settings(radio_p25_settings_t *out)
++{
++	*out = quick;
++	return quick_mask;
++}
++
++void radio_p25_clear_quick(void)
++{
++	quick_mask = 0;
+ }
+ 
+ // What PTT calls: talk group or unit dst
+@@ -164,6 +199,16 @@ void radio_p25_params(const channel_t *ch, uint16_t number, uint32_t own_id, p25
+ 	params_monitor(cfg);
+ }
+ 
++static void params_quick(p25_engine_cfg_t *cfg)
++{
++	if (quick_mask & RADIO_P25_QUICK_NAC) {
++		cfg->rx_nac = quick.rx_nac;
++		cfg->tx_nac = quick.tx_nac;
++	}
++	if (quick_mask & RADIO_P25_QUICK_TG)
++		talk_lc(&cfg->tx_lc, false, quick.tx_dst);	// Talk to a group; the RX filter/list stays as it was
++}
++
+ static void params_channel(const channel_t *ch, uint16_t number, uint32_t own_id, p25_engine_cfg_t *cfg)
+ {
+ 	p25_conv_cfg_t cc;
+@@ -184,6 +229,7 @@ static void params_channel(const channel_t *ch, uint16_t number, uint32_t own_id
+ 		cfg->unit_id = (ch->dmr_id == 0 && set.unit_id != 0 ? set.unit_id : cc.unit_id) & 0xFFFFFFu;
+ 		talk_lc(&cfg->tx_lc, cc.target_unit, cc.target);
+ 		cfg->talkaround = cc.talkaround;
++		params_quick(cfg);
+ 		return;
+ 	}
+ #if CONFIG_AIR_AES
+@@ -197,6 +243,7 @@ static void params_channel(const channel_t *ch, uint16_t number, uint32_t own_id
+ 	talk_lc(&cfg->tx_lc, set.unit_call, set.tx_dst);
+ 	cfg->talkaround = set.talkaround == RADIO_P25_TA_ON ||
+ 			  (set.talkaround == RADIO_P25_TA_AUTO && (ch->tx_hz == ch->rx_hz || ch->tx_hz == 0));
++	params_quick(cfg);
+ }
+ 
+ // The engine's configuration as settings: what the screen, the view and the debug link show
+diff --git a/core/radio/radio_p25.h b/core/radio/radio_p25.h
+index 10cdb69..61442a9 100644
+--- a/core/radio/radio_p25.h
++++ b/core/radio/radio_p25.h
+@@ -129,6 +129,14 @@ bool radio_p25_fits(void);
+ bool radio_p25_take(channel_t *ch);
+ void radio_p25_settings(radio_p25_settings_t *out);	// any task
+ void radio_p25_set_settings(const radio_p25_settings_t *s);	// radio task (RREQ_P25_SET)
++
++// The Quick menu's changes (RREQ_P25_SET with a mask): which fields radio_p25_set_quick takes. A stored channel's
++// are its parameters for now; the VFO's are the RAM settings themselves
++#define RADIO_P25_QUICK_NAC	0x01u	// the NAC (receive and transmit)
++#define RADIO_P25_QUICK_TG	0x02u	// the talk group PTT calls
++void radio_p25_set_quick(const radio_p25_settings_t *s, uint8_t mask, bool vfo);	// radio task
++uint8_t radio_p25_quick_settings(radio_p25_settings_t *out);	// the mask in force, the values in out (any task)
++void radio_p25_clear_quick(void);
+ // The engine's configuration for channel ch, stored at number (0: the VFO, or none): the one place P25 parameters come
+ // from. A live P25 channel's tag and record give them, else the settings. own_id: the radio's DMR ID, the last resort
+ // for our unit ID (after the settings' and the channel's, then the radio-wide P25 one)
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 40d68f1..6393542 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -399,7 +399,7 @@ static bool same_tone(const subtone_t *a, const subtone_t *b)
+ // the VFO's settings, never temporary
+ static void set_temporary(radio_sm_t *sm)
+ {
+-	uint8_t t = 0;
++	uint16_t t = 0;
+ 	if (sm->temp_power) {
+ 		t |= RADIO_TEMP_POWER;
+ 	}
+@@ -419,6 +419,9 @@ static void set_temporary(radio_sm_t *sm)
+ 		if (sm->view.ch.mode != sm->base_mode) {
+ 			t |= RADIO_TEMP_MODE;
+ 		}
++		if (sm->temp_air) {
++			t |= RADIO_TEMP_AIR;
++		}
+ 		if (sm->view.ch.mode == RADIO_MODE_DMR) {
+ 			if (sm->view.ch.color_code != sm->base_cc) {
+ 				t |= RADIO_TEMP_CC;
+@@ -437,7 +440,17 @@ static void set_temporary(radio_sm_t *sm)
+ static bool clear_temporary(radio_sm_t *sm)
+ {
+ 	bool retune = (sm->view.temp & (RADIO_TEMP_BW | RADIO_TEMP_RX_TONE | RADIO_TEMP_MODE | RADIO_TEMP_CC |
+-					RADIO_TEMP_TS)) != 0;
++					RADIO_TEMP_TS | RADIO_TEMP_AIR)) != 0;
++	sm->temp_air = false;
++#if CONFIG_P25
++	radio_p25_clear_quick();
++#endif
++#if CONFIG_NXDN
++	radio_nxdn_clear_quick();
++#endif
++#if CONFIG_YSF
++	radio_ysf_clear_quick();
++#endif
+ 	sm->temp_power = false;
+ 	sm->temp_squelch = false;
+ 	sm->temp_ts = 0;
+@@ -4104,6 +4117,23 @@ static void dual_keep_save(radio_sm_t *sm, uint8_t i)
+ 	k->timeslot = ch->timeslot;
+ 	k->rx_tone = ch->rx_tone;
+ 	k->tx_tone = ch->tx_tone;
++	k->temp_air = sm->temp_air;
++	k->air_mode = ch->mode;
++	k->air_mask = 0;
++	if (k->temp_air) {
++#if CONFIG_P25
++		if (ch->mode == RADIO_MODE_P25)
++			k->air_mask = radio_p25_quick_settings(&k->air.p25);
++#endif
++#if CONFIG_NXDN
++		if (ch->mode == RADIO_MODE_NXDN)
++			k->air_mask = radio_nxdn_quick_settings(&k->air.nxdn);
++#endif
++#if CONFIG_YSF
++		if (ch->mode == RADIO_MODE_YSF)
++			k->air_mask = radio_ysf_quick_settings(&k->air.ysf);
++#endif
++	}
+ #if CONFIG_DMR
+ 	k->manual = sm->manual && sm->manual_ch == sm->view.channel_number && sm->manual_vfo == sm->view.vfo;
+ 	k->manual_id = sm->manual_id;
+@@ -4139,6 +4169,21 @@ static void dual_keep_load(radio_sm_t *sm, uint8_t i)
+ 		ch->tx_tone = k->tx_tone;
+ 		sm->temp_ts = k->temp_ts;
+ 	}
++	sm->temp_air = !sm->view.vfo && k->temp_air && k->air_mode == sm->view.ch.mode && k->air_mask != 0;
++	if (sm->temp_air) {
++#if CONFIG_P25
++		if (sm->view.ch.mode == RADIO_MODE_P25)
++			radio_p25_set_quick(&k->air.p25, k->air_mask, false);
++#endif
++#if CONFIG_NXDN
++		if (sm->view.ch.mode == RADIO_MODE_NXDN)
++			radio_nxdn_set_quick(&k->air.nxdn, k->air_mask, false);
++#endif
++#if CONFIG_YSF
++		if (sm->view.ch.mode == RADIO_MODE_YSF)
++			radio_ysf_set_quick(&k->air.ysf, k->air_mask, false);
++#endif
++	}
+ 	set_temporary(sm);
+ #if CONFIG_DMR
+ 	sm->manual = k->manual;
+@@ -8584,6 +8629,10 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ #if CONFIG_P25
+ 	case RREQ_P25_SET:
+ 		// radio_task.c copied the settings in: the engine takes them now, or when its transmission is done (air_tick)
++		if (req->arg != 0 && !sm->view.vfo && sm->view.ch.mode == RADIO_MODE_P25) {
++			sm->temp_air = true;
++			set_temporary(sm);
++		}
+ 		if (radio_p25_running()) {
+ 			radio_p25_apply(&sm->view.ch, air_number(sm), p25_own_id(sm));
+ 		}
+@@ -8593,6 +8642,10 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ #if CONFIG_NXDN
+ 	case RREQ_NXDN_SET:
+ 		// The same for NXDN; a new rate starts the engine over (radio_nxdn_apply)
++		if (req->arg != 0 && !sm->view.vfo && sm->view.ch.mode == RADIO_MODE_NXDN) {
++			sm->temp_air = true;
++			set_temporary(sm);
++		}
+ 		if (radio_nxdn_running()) {
+ 			radio_nxdn_apply(&sm->view.ch, air_number(sm));
+ 		} else if (sm->view.ch.mode == RADIO_MODE_NXDN && sm->board_mode == RADIO_MODE_DMR && !BENCH_HELD(sm) &&
+@@ -8606,6 +8659,10 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ #if CONFIG_YSF
+ 	case RREQ_YSF_SET:
+ 		// The same for YSF; a new data type or deviation starts the engine over (radio_ysf_apply)
++		if (req->arg != 0 && !sm->view.vfo && sm->view.ch.mode == RADIO_MODE_YSF) {
++			sm->temp_air = true;
++			set_temporary(sm);
++		}
+ 		if (radio_ysf_running()) {
+ 			radio_ysf_apply(&sm->view.ch, air_number(sm));
+ 		} else if (sm->view.ch.mode == RADIO_MODE_YSF && sm->board_mode == RADIO_MODE_DMR && !BENCH_HELD(sm) &&
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index 8bc57cb..23e0d28 100644
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -245,6 +245,20 @@ typedef struct {
+ 	bool manual, manual_private, hear_all_latch;	// DMR: a talk target for now, hear all latched
+ 	uint8_t manual_ts;
+ 	uint32_t manual_id;
++	bool temp_air;		// a P25/NXDN/YSF Quick change, its mode and which fields (RADIO_*_QUICK_*)
++	uint8_t air_mode;
++	uint8_t air_mask;
++	union {
++#if CONFIG_P25
++		radio_p25_settings_t p25;
++#endif
++#if CONFIG_NXDN
++		radio_nxdn_settings_t nxdn;
++#endif
++#if CONFIG_YSF
++		radio_ysf_settings_t ysf;
++#endif
++	} air;
+ } radio_dual_keep_t;
+ #endif
+ 
+@@ -267,6 +281,7 @@ typedef struct {
+ 	uint8_t base_squelch;		// squelch without the temporary change
+ 	bool temp_power;
+ 	bool temp_squelch;
++	bool temp_air;		// a P25/NXDN/YSF Quick change on a stored channel (the module holds the values)
+ 	bool squelch_save;		// a squelch set in the VFO: the radio's default, written by persist()
+ 	uint8_t base_bw;		// the channel's own bandwidth and tones, for undoing temporary changes
+ 	subtone_t base_rx_tone;
+diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
+index f982945..a367525 100644
+--- a/core/radio/radio_task.c
++++ b/core/radio/radio_task.c
+@@ -198,7 +198,10 @@ static void radio_task(void *arg)
+ 					xSemaphoreTake(view_lock, portMAX_DELAY);
+ 					p = pending_p25;
+ 					xSemaphoreGive(view_lock);
+-					radio_p25_set_settings(&p);
++					if (req.arg != 0)
++						radio_p25_set_quick(&p, (uint8_t)req.arg, sm.view.vfo);
++					else
++						radio_p25_set_settings(&p);
+ 					radio_sm_request(&sm, &req, hal_millis());
+ #endif
+ #if CONFIG_NXDN
+@@ -207,7 +210,10 @@ static void radio_task(void *arg)
+ 					xSemaphoreTake(view_lock, portMAX_DELAY);
+ 					n = pending_nxdn;
+ 					xSemaphoreGive(view_lock);
+-					radio_nxdn_set_settings(&n);
++					if (req.arg != 0)
++						radio_nxdn_set_quick(&n, (uint8_t)req.arg, sm.view.vfo);
++					else
++						radio_nxdn_set_settings(&n);
+ 					radio_sm_request(&sm, &req, hal_millis());
+ #endif
+ #if CONFIG_YSF
+@@ -216,7 +222,10 @@ static void radio_task(void *arg)
+ 					xSemaphoreTake(view_lock, portMAX_DELAY);
+ 					y = pending_ysf;
+ 					xSemaphoreGive(view_lock);
+-					radio_ysf_set_settings(&y);
++					if (req.arg != 0)
++						radio_ysf_set_quick(&y, (uint8_t)req.arg, sm.view.vfo);
++					else
++						radio_ysf_set_settings(&y);
+ 					radio_sm_request(&sm, &req, hal_millis());
+ #endif
+ 				} else if (req.type == RREQ_SETTINGS) {
+@@ -463,7 +472,7 @@ void radio_req_vfo_aes(uint8_t mode, int32_t kid) { post_pair(RREQ_VFO_AES, kid,
+ #endif
+ #endif
+ #if CONFIG_P25
+-void radio_req_p25_settings(const radio_p25_settings_t *s)
++static void p25_post(const radio_p25_settings_t *s, uint8_t quick)
+ {
+ 	if (view_lock == NULL) {
+ 		return;
+@@ -471,11 +480,13 @@ void radio_req_p25_settings(const radio_p25_settings_t *s)
+ 	xSemaphoreTake(view_lock, portMAX_DELAY);
+ 	pending_p25 = *s;
+ 	xSemaphoreGive(view_lock);
+-	post(RREQ_P25_SET, 0, pdMS_TO_TICKS(50));
++	post(RREQ_P25_SET, quick, pdMS_TO_TICKS(50));
+ }
++void radio_req_p25_settings(const radio_p25_settings_t *s) { p25_post(s, 0); }
++void radio_req_p25_quick(const radio_p25_settings_t *s, uint8_t mask) { p25_post(s, mask); }
+ #endif
+ #if CONFIG_NXDN
+-void radio_req_nxdn_settings(const radio_nxdn_settings_t *s)
++static void nxdn_post(const radio_nxdn_settings_t *s, uint8_t quick)
+ {
+ 	if (view_lock == NULL) {
+ 		return;
+@@ -483,11 +494,13 @@ void radio_req_nxdn_settings(const radio_nxdn_settings_t *s)
+ 	xSemaphoreTake(view_lock, portMAX_DELAY);
+ 	pending_nxdn = *s;
+ 	xSemaphoreGive(view_lock);
+-	post(RREQ_NXDN_SET, 0, pdMS_TO_TICKS(50));
++	post(RREQ_NXDN_SET, quick, pdMS_TO_TICKS(50));
+ }
++void radio_req_nxdn_settings(const radio_nxdn_settings_t *s) { nxdn_post(s, 0); }
++void radio_req_nxdn_quick(const radio_nxdn_settings_t *s, uint8_t mask) { nxdn_post(s, mask); }
+ #endif
+ #if CONFIG_YSF
+-void radio_req_ysf_settings(const radio_ysf_settings_t *s)
++static void ysf_post(const radio_ysf_settings_t *s, uint8_t quick)
+ {
+ 	if (view_lock == NULL) {
+ 		return;
+@@ -495,8 +508,10 @@ void radio_req_ysf_settings(const radio_ysf_settings_t *s)
+ 	xSemaphoreTake(view_lock, portMAX_DELAY);
+ 	pending_ysf = *s;
+ 	xSemaphoreGive(view_lock);
+-	post(RREQ_YSF_SET, 0, pdMS_TO_TICKS(50));
++	post(RREQ_YSF_SET, quick, pdMS_TO_TICKS(50));
+ }
++void radio_req_ysf_settings(const radio_ysf_settings_t *s) { ysf_post(s, 0); }
++void radio_req_ysf_quick(const radio_ysf_settings_t *s, uint8_t mask) { ysf_post(s, mask); }
+ #endif
+ 
+ #if CONFIG_AIR_RAW
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index 0877751..0139543 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -33,6 +33,8 @@ static const radio_ysf_settings_t defaults = {
+ 	.dest = YSF_CP_DEST_ALL, .src = "", .down = "", .up = "",
+ };
+ static radio_ysf_settings_t set;
++static radio_ysf_settings_t quick;
++static uint8_t quick_mask;
+ static ysf_engine_t *eng;		// while running
+ static bool tx_ambe_ready;		// radio task publishes it to the provider task
+ static radio_ysf_stats_t stats;
+@@ -42,6 +44,7 @@ static air_session_stats_t air_base;
+ void radio_ysf_init(void)
+ {
+ 	set = defaults;
++	quick_mask = 0;
+ 	eng = NULL;
+ }
+ 
+@@ -63,6 +66,33 @@ void radio_ysf_set_settings(const radio_ysf_settings_t *s)
+ 		strcpy(set.dest, YSF_CP_DEST_ALL);
+ }
+ 
++void radio_ysf_set_quick(const radio_ysf_settings_t *s, uint8_t mask, bool vfo)
++{
++	radio_ysf_settings_t *to = vfo ? &set : &quick;
++	if (mask & RADIO_YSF_QUICK_DGID) {
++		to->rx_dgid = s->rx_dgid <= RADIO_YSF_DGID_MAX ? s->rx_dgid : 0;
++		to->tx_dgid = s->tx_dgid <= RADIO_YSF_DGID_MAX ? s->tx_dgid : 0;
++	}
++	if (mask & RADIO_YSF_QUICK_DEST) {
++		strncpy(to->dest, s->dest, YSF_CALLSIGN_LEN);
++		to->dest[YSF_CALLSIGN_LEN] = 0;
++		if (to->dest[0] == '\0')
++			strcpy(to->dest, YSF_CP_DEST_ALL);
++	}
++	quick_mask = vfo ? 0 : (uint8_t)(quick_mask | mask);
++}
++
++uint8_t radio_ysf_quick_settings(radio_ysf_settings_t *out)
++{
++	*out = quick;
++	return quick_mask;
++}
++
++void radio_ysf_clear_quick(void)
++{
++	quick_mask = 0;
++}
++
+ uint32_t radio_ysf_fit(bool narrow)
+ {
+ 	return board.air != NULL ? ysf_engine_fit(board.air, narrow) : 0;
+@@ -125,6 +155,16 @@ static void callsigns_to_cfg(const radio_ysf_settings_t *s, const ysf_identity_t
+ 	memset(c->rem4, ' ', YSF_CALLSIGN_LEN);
+ }
+ 
++static void params_quick(ysf_engine_cfg_t *c)
++{
++	if (quick_mask & RADIO_YSF_QUICK_DGID) {
++		c->rx_dgid = quick.rx_dgid;
++		c->tx_dgid = quick.tx_dgid;
++	}
++	if (quick_mask & RADIO_YSF_QUICK_DEST)
++		ysf_callsign_pack(quick.dest, (uint8_t *)c->dest);
++}
++
+ static void params_channel(const channel_t *ch, uint16_t number, ysf_engine_cfg_t *c)
+ {
+ 	ysf_conv_cfg_t cc;
+@@ -140,6 +180,7 @@ static void params_channel(const channel_t *ch, uint16_t number, ysf_engine_cfg_
+ 		c->tx_dgid = cc.conv.tx_dgid;
+ 		ysf_callsign_pack(cc.conv.dest, (uint8_t *)c->dest);
+ 		callsigns_to_cfg(NULL, &cc.id, c);
++		params_quick(c);
+ 		return;
+ 	}
+ 	c->dt = set.dt;
+@@ -150,6 +191,7 @@ static void params_channel(const channel_t *ch, uint16_t number, ysf_engine_cfg_
+ 	ysf_callsign_pack(set.dest, (uint8_t *)c->dest);
+ 	ysf_identity_load(&cc.id);
+ 	callsigns_to_cfg(&set, &cc.id, c);
++	params_quick(c);
+ }
+ 
+ // ── Voice: the DMR side's voice path (ambeVoice.h), its sink on receive and its source on transmit. The hooks run in
+diff --git a/core/radio/radio_ysf.h b/core/radio/radio_ysf.h
+index 600daf7..856a3cc 100644
+--- a/core/radio/radio_ysf.h
++++ b/core/radio/radio_ysf.h
+@@ -29,6 +29,7 @@ typedef struct {
+ } radio_ysf_settings_t;
+ 
+ #define RADIO_YSF_DGID_MAX	127
++#define RADIO_YSF_DGID_USER_MAX	99	// a Yaesu offers DG-ID 00 to 99; the field itself holds 0 to 127
+ 
+ // view flags
+ #define RADIO_YSF_ON		0x01u	// the engine runs on this channel
+@@ -81,6 +82,13 @@ bool radio_ysf_receives(const channel_t *ch, uint16_t number);
+ void radio_ysf_settings(radio_ysf_settings_t *out);		// any task
+ void radio_ysf_set_settings(const radio_ysf_settings_t *s);	// radio task (RREQ_YSF_SET)
+ 
++// The Quick menu's changes (RREQ_YSF_SET with a mask): which fields radio_ysf_set_quick takes, as P25's
++#define RADIO_YSF_QUICK_DGID	0x01u	// the DG-ID (receive and transmit)
++#define RADIO_YSF_QUICK_DEST	0x02u	// the destination call sign PTT calls
++void radio_ysf_set_quick(const radio_ysf_settings_t *s, uint8_t mask, bool vfo);	// radio task
++uint8_t radio_ysf_quick_settings(radio_ysf_settings_t *out);	// the mask in force, the values in out (any task)
++void radio_ysf_clear_quick(void);
++
+ // The parameters in force, as settings: false when the engine isn't running. Any task: a read that crosses a change
+ // of channel may mix the two (diagnostics only)
+ bool radio_ysf_in_force(radio_ysf_settings_t *out);
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index 55cdbed..8fad1ab 100644
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -1352,6 +1352,75 @@ static int vfo_key_step(int32_t current, int dir)
+ }
+ #endif
+ 
++#if CONFIG_P25
++static uint8_t quick_hex_value(char c)
++{
++	return (uint8_t)(c <= '9' ? c - '0' : c - 'A' + 10);
++}
++
++static void quick_nac_typed_value(void)
++{
++	uint32_t v = 0;
++	for (uint8_t i = 0; i < ui_st.entry_len; i++)
++		v = (v << 4) | quick_hex_value(ui_st.entry_digits[i]);
++	ui_st.air_edit = v;
++}
++#endif
++
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++static uint32_t quick_air_code_max(void)
++{
++#if CONFIG_NXDN
++	if (view->ch.mode == RADIO_MODE_NXDN)
++		return RADIO_NXDN_RAN_MAX;
++#endif
++#if CONFIG_YSF
++	if (view->ch.mode == RADIO_MODE_YSF)
++		return RADIO_YSF_DGID_USER_MAX;
++#endif
++	return 0xFFFu;
++}
++
++static uint32_t quick_air_code_current(void)
++{
++#if CONFIG_P25
++	if (view->ch.mode == RADIO_MODE_P25)
++		return view->p25.rx_nac;
++#endif
++#if CONFIG_NXDN
++	if (view->ch.mode == RADIO_MODE_NXDN)
++		return view->nxdn.rx_ran;
++#endif
++#if CONFIG_YSF
++	if (view->ch.mode == RADIO_MODE_YSF)
++		return view->ysf.rx_dgid;
++#endif
++	return 0;
++}
++
++static uint32_t quick_air_target_current(void)
++{
++#if CONFIG_P25
++	if (view->ch.mode == RADIO_MODE_P25)
++		return view->p25.talk;
++#endif
++#if CONFIG_NXDN
++	if (view->ch.mode == RADIO_MODE_NXDN)
++		return view->nxdn.talk;
++#endif
++	return 1;
++}
++#endif
++
++#if CONFIG_YSF && CONFIG_CHANNEL_EDIT
++static void quick_dest_kept(void)
++{
++	if (!ui_svc_ysf_destination(ui_st.air_dest))
++		ui_toast(TR(WHY_NOT_IN_BUILD, "Not in this build"));
++	dirty = true;
++}
++#endif
++
+ static void quick_change(uint8_t kind, int8_t dir)
+ {
+ 	switch (kind) {
+@@ -1379,6 +1448,32 @@ static void quick_change(uint8_t kind, int8_t dir)
+ 		ui_st.cc_edit = (uint8_t)(c < 0 ? 15 : c > 15 ? 0 : c);
+ 		break;
+ 	}
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++	case QT_AIR_CODE:
++#if CONFIG_P25
++		if (view->ch.mode == RADIO_MODE_P25) {
++			if (ui_st.entry_len > 0) {
++				char *d = &ui_st.entry_digits[ui_st.entry_len - 1];
++				uint8_t n = (uint8_t)((quick_hex_value(*d) + dir + 16) & 15);
++				*d = (char)(n < 10 ? '0' + n : 'A' + n - 10);
++				quick_nac_typed_value();
++			} else {
++				ui_st.air_edit = (ui_st.air_edit + dir) & 0xFFFu;
++			}
++		} else
++#endif
++		{
++			uint32_t hi = quick_air_code_max();
++			ui_st.air_edit = (ui_st.air_edit + dir + hi + 1u) % (hi + 1u);
++		}
++		break;
++	case QT_AIR_TG:
++		if (dir > 0)
++			ui_st.air_edit = ui_st.air_edit >= 0xFFFFu ? 1 : ui_st.air_edit + 1u;
++		else
++			ui_st.air_edit = ui_st.air_edit <= 1 ? 0xFFFFu : ui_st.air_edit - 1u;
++		break;
++#endif
+ 	case QT_BRIGHTNESS: {
+ 		int b = ui_st.brightness + dir * 10;
+ 		ui_st.brightness = (uint8_t)(b < 10 ? 10 : b > 100 ? 100 : b);
+@@ -1390,6 +1485,8 @@ static void quick_change(uint8_t kind, int8_t dir)
+ 	dirty = true;
+ }
+ 
++static void quick_unavailable(uint8_t kind);
++
+ static void quick_close_editor(void)
+ {
+ 	uint8_t kind = ui_quick_kind(ui_st.quick_focus, view);
+@@ -1397,6 +1494,20 @@ static void quick_close_editor(void)
+ 		return;		// the editor stays open on what was typed
+ 	if (kind == QT_CC && ui_st.quick_edit && !ui_svc_dmr_color_code(ui_st.cc_edit))
+ 		ui_toast(TR(WHY_COLOR_CODE_NOT_IN_BUILD, "Color code: not in this build"));
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++	if (kind == QT_AIR_CODE && ui_st.quick_edit) {
++#if CONFIG_P25
++		if (view->ch.mode == RADIO_MODE_P25 && ui_st.air_edit == P25_NAC_REPEAT_ANY) {
++			ui_toast(TR(CHAN_TOAST_NAC_REPEATER, "F7F is for repeaters"));
++			return;		// keep the editor open, as the channel editor does
++		}
++#endif
++		if (!ui_svc_air_code(ui_st.air_edit))
++			quick_unavailable(kind);
++	}
++	if (kind == QT_AIR_TG && ui_st.quick_edit && !ui_svc_air_target(ui_st.air_edit))
++		quick_unavailable(kind);
++#endif
+ #if CONFIG_AIR_AES
+ 	if (kind == QT_AES && ui_st.quick_edit)
+ 		ui_svc_vfo_aes(view->ch.mode, ui_st.aes_edit);
+@@ -1557,6 +1668,25 @@ static void quick_activate(int tile)
+ 		ui_push(SCR_PICKER, 0);
+ 		break;
+ #endif
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++	case QT_AIR_CODE:
++		entry_cancel();
++		ui_st.air_edit = quick_air_code_current();
++		ui_st.quick_edit = true;
++		break;
++	case QT_AIR_TG:
++		entry_cancel();
++		ui_st.air_edit = quick_air_target_current();
++		ui_st.quick_edit = true;
++		break;
++	case QT_YSF_DEST:
++#endif
++#if CONFIG_YSF && CONFIG_CHANNEL_EDIT
++		strncpy(ui_st.air_dest, view->ysf.talk, YSF_CALLSIGN_LEN);
++		ui_st.air_dest[YSF_CALLSIGN_LEN] = 0;
++		ui_menu_text_open(ui_st.air_dest, YSF_CALLSIGN_LEN, quick_dest_kept);
++#endif
++		break;
+ 	case QT_POWER: {
+ 		// A cycle tile over three steps, low / the board's default / high, each press the next one up, wrapping
+ 		// (information-architecture.md 5). Other levels come from the channel
+@@ -1607,6 +1737,26 @@ bool ui_quick_key(const input_event_t *ev)
+ 		} else if (ui_st.quick_edit && kind == QT_CC) {
+ 			int c = ui_st.cc_edit * 10 + d;
+ 			ui_st.cc_edit = (uint8_t)(ui_st.cc_edit < 2 && c <= 15 && ui_st.cc_edit != 0 ? c : d);
++#if CONFIG_P25
++		} else if (ui_st.quick_edit && kind == QT_AIR_CODE && view->ch.mode == RADIO_MODE_P25) {
++			if (ui_st.entry_len >= 3)
++				ui_st.entry_len = 0;	// a fourth NAC digit starts over
++			ui_st.entry_digits[ui_st.entry_len++] = (char)('0' + d);
++			ui_st.entry_digits[ui_st.entry_len] = 0;
++			quick_nac_typed_value();
++#endif
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++		} else if (ui_st.quick_edit && (kind == QT_AIR_CODE || kind == QT_AIR_TG)) {
++			uint32_t hi = kind == QT_AIR_TG ? 0xFFFFu : quick_air_code_max();
++			uint32_t v = ui_st.entry_len == 0 ? (uint32_t)d : ui_st.air_edit * 10u + (uint32_t)d;
++			if (v > hi) {
++				v = (uint32_t)d;
++				ui_st.entry_len = 0;
++			}
++			ui_st.air_edit = v;
++			if (ui_st.entry_len < UI_ENTRY_MAX)
++				ui_st.entry_len++;
++#endif
+ 		} else if (ui_st.quick_edit && kind == QT_BRIGHTNESS) {
+ 			ui_st.brightness = (uint8_t)(d == 0 ? 100 : d * 10);
+ 			quick_close_editor();
+@@ -1653,6 +1803,13 @@ bool ui_quick_key(const input_event_t *ev)
+ 		if (press && ui_st.quick_edit && kind == QT_SPLIT && ui_st.entry_len > 0) {
+ 			ui_st.entry_digits[--ui_st.entry_len] = 0;
+ 			dirty = true;
++#if CONFIG_P25
++		} else if (press && ui_st.quick_edit && kind == QT_AIR_CODE && view->ch.mode == RADIO_MODE_P25 &&
++			   ui_st.entry_len > 0) {
++			ui_st.entry_digits[--ui_st.entry_len] = 0;
++			quick_nac_typed_value();
++			dirty = true;
++#endif
+ 		} else if (press) {
+ 			if (ui_st.quick_edit)
+ 				quick_close_editor();
+diff --git a/core/ui/ui_app.h b/core/ui/ui_app.h
+index f14b273..5797b7f 100644
+--- a/core/ui/ui_app.h
++++ b/core/ui/ui_app.h
+@@ -57,4 +57,8 @@ void ui_app_status(ui_app_status_t *st);
+ // The label of the focused row on a list screen ("" otherwise), for scripted checks
+ const char *ui_app_focus_label(void);
+ 
++// The text entry screen (ui_menus.c) on a buffer, kept() called once the text is kept: the Quick menu's YSF
++// destination
++void ui_menu_text_open(char *target, uint8_t max, void (*kept)(void));
++
+ #endif
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index e340922..c67bee4 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -2147,6 +2147,12 @@ static void ui_text_open_message(bool aprs)
+ 
+ #if CONFIG_CHANNEL_EDIT
+ static void ui_text_open(char *target, uint8_t max) { text_open(target, max, SCR_TEXT); }
++
++void ui_menu_text_open(char *target, uint8_t max, void (*kept)(void))
++{
++	text_open(target, max, SCR_TEXT);
++	text_done = kept;
++}
+ #endif
+ #if CONFIG_APRS_AFSK
+ static void ui_text_open_to(char *target, uint8_t max) { text_open(target, max, SCR_APRS_TO); }
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index 063de0f..762816b 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -3916,6 +3916,9 @@ uint8_t ui_quick_kind(int pos, const radio_view_t *v)
+ 	static const uint8_t dmr[UI_QUICK_TILES] = {
+ 		QT_POWER, QT_TIMESLOT, QT_CC, QT_MODE, QT_HEAR_ALL, QT_PRIVACY, QT_SCAN, QT_TALK_TO, QT_BRIGHTNESS,
+ 	};
++	static const uint8_t air[UI_QUICK_TILES] = {
++		QT_POWER, QT_AIR_CODE, QT_TONE, QT_MODE, QT_HEAR_ALL, QT_VOX, QT_SCAN, QT_AIR_TG, QT_BRIGHTNESS,
++	};
+ 	if (pos < 0 || pos >= UI_QUICK_TILES)
+ 		return QT_POWER;
+ 	if (!v->vfo && pos == 3)
+@@ -3925,11 +3928,11 @@ uint8_t ui_quick_kind(int pos, const radio_view_t *v)
+ 		       (pos == 4 && CONFIG_DMR_PRIVACY && v->ch.mode == RADIO_MODE_DMR)))
+ 		return QT_AES;
+ #endif
+-	uint8_t kind = v->ch.mode == RADIO_MODE_DMR ? dmr[pos] : fm[pos];
+-	// P25 and NXDN have the digital monitor, not the squelch one, on the FM layout's Monitor tile
+-	if (pos == 4 && CONFIG_DMR && (v->ch.mode == RADIO_MODE_P25 || v->ch.mode == RADIO_MODE_NXDN))
+-		kind = QT_HEAR_ALL;
+-	if (v->vfo && (kind == QT_MONITOR || kind == QT_PRIVACY))
++	bool air_mode = v->ch.mode == RADIO_MODE_P25 || v->ch.mode == RADIO_MODE_NXDN || v->ch.mode == RADIO_MODE_YSF;
++	uint8_t kind = v->ch.mode == RADIO_MODE_DMR ? dmr[pos] : air_mode ? air[pos] : fm[pos];
++	if (air_mode && v->ch.mode == RADIO_MODE_YSF && pos == 7)
++		kind = QT_YSF_DEST;
++	if (v->vfo && (kind == QT_MONITOR || kind == QT_PRIVACY || (air_mode && kind == QT_VOX)))
+ 		return QT_SPLIT;	// the VFO's TX frequency; Monitor stays on its key, privacy on channels
+ 	return kind;
+ }
+@@ -3966,6 +3969,9 @@ bool ui_quick_tile(int tile, const radio_view_t *v, const ui_state_t *s, char *l
+ 		[QT_TO_VFO] = TRN(QUICK_LABEL_COPY_TO_VFO, TEXT_ALT_OPEN "Copy to VFO"
+ 			TEXT_ALT_NEXT "To VFO" TEXT_ALT_CLOSE),
+ 		[QT_SPLIT] = TRN(QUICK_LABEL_TX_FREQ, TEXT_ALT_OPEN "TX freq" TEXT_ALT_NEXT "TXFreq" TEXT_ALT_CLOSE),
++		[QT_AIR_CODE] = TRN(QUICK_LABEL_CODE, "Code"),
++		[QT_AIR_TG] = TRX(QUICK_LABEL_TG, "TG"),
++		[QT_YSF_DEST] = TRN(QUICK_LABEL_DEST, TEXT_ALT_OPEN "Destination" TEXT_ALT_NEXT "Dest" TEXT_ALT_CLOSE),
+ 	};
+ 	uint8_t kind = ui_quick_kind(tile, v);
+ 	bool editing = s->quick_edit && s->quick_focus == tile;
+@@ -3973,6 +3979,12 @@ bool ui_quick_tile(int tile, const radio_view_t *v, const ui_state_t *s, char *l
+ 	sb_init(&b, label, label_len);
+ 	sb_chr(&b, (char)('1' + tile));
+ 	sb_str(&b, tr(names[kind]));
++	if (kind == QT_AIR_CODE) {
++		sb_init(&b, label, label_len);
++		sb_chr(&b, (char)('1' + tile));
++		sb_str(&b, v->ch.mode == RADIO_MODE_P25 ? tr(TRX(CHAN_LABEL_NAC, "NAC")) :
++			v->ch.mode == RADIO_MODE_NXDN ? "RAN" : "DG-ID");
++	}
+ 	sb_init(&b, value, value_len);
+ 	switch (kind) {
+ 	case QT_POWER:
+@@ -4061,6 +4073,64 @@ bool ui_quick_tile(int tile, const radio_view_t *v, const ui_state_t *s, char *l
+ 		sb_u32(&b, s->brightness, 1);
+ 		sb_chr(&b, '%');
+ 		return true;
++	case QT_AIR_CODE:
++		if (!editing && (v->temp & RADIO_TEMP_AIR))
++			sb_str(&b, GLYPH_DOT);
++		if (v->ch.mode == RADIO_MODE_P25) {
++#if CONFIG_P25
++			if (editing && s->entry_len > 0) {
++				sb_str(&b, s->entry_digits);
++				sb_chr(&b, '_');
++			} else {
++				sb_hex(&b, editing ? s->air_edit : v->p25.rx_nac, 3);
++			}
++			return v->ch.kind != CODEPLUG_KIND_P25_TRUNK;
++#else
++			return false;
++#endif
++		}
++		if (v->ch.mode == RADIO_MODE_NXDN) {
++#if CONFIG_NXDN
++			sb_u32(&b, editing ? s->air_edit : v->nxdn.rx_ran, 1);
++			return true;
++#else
++			return false;
++#endif
++		}
++		if (v->ch.mode == RADIO_MODE_YSF) {
++#if CONFIG_YSF
++			sb_u32(&b, editing ? s->air_edit : v->ysf.rx_dgid, 2);
++			return true;
++#else
++			return false;
++#endif
++		}
++		return false;
++	case QT_AIR_TG:
++		if (!editing && (v->temp & RADIO_TEMP_AIR))
++			sb_str(&b, GLYPH_DOT);
++#if CONFIG_P25
++		if (v->ch.mode == RADIO_MODE_P25) {
++			sb_u32(&b, editing ? s->air_edit : v->p25.talk, 1);
++			return v->ch.kind != CODEPLUG_KIND_P25_TRUNK;
++		}
++#endif
++#if CONFIG_NXDN
++		if (v->ch.mode == RADIO_MODE_NXDN) {
++			sb_u32(&b, editing ? s->air_edit : v->nxdn.talk, 1);
++			return true;
++		}
++#endif
++		return false;
++	case QT_YSF_DEST:
++#if CONFIG_YSF
++		if (v->temp & RADIO_TEMP_AIR)
++			sb_str(&b, GLYPH_DOT);
++		sb_str(&b, v->ysf.talk);
++		return CONFIG_CHANNEL_EDIT != 0;
++#else
++		return false;
++#endif
+ #if CONFIG_DMR
+ 	case QT_TIMESLOT:
+ 		sb_str(&b, "TS");
+diff --git a/core/ui/ui_screens.h b/core/ui/ui_screens.h
+index ff877f1..2be7c37 100644
+--- a/core/ui/ui_screens.h
++++ b/core/ui/ui_screens.h
+@@ -106,6 +106,8 @@ typedef struct {
+ 	uint8_t tone_target;		// Tone editor: RADIO_TONE_BOTH, RADIO_TONE_TX or RADIO_TONE_RX
+ 	subtone_t tone_edit;		// Tone editor: the value picked (shown at once, before the radio's view catches up)
+ 	uint8_t cc_edit;		// Color code editor: the value picked
++	uint32_t air_edit;		// the Quick air tile's value being edited (NAC, RAN, DG-ID or talk group)
++	char air_dest[YSF_CALLSIGN_LEN + 1];	// ... or its YSF destination
+ 	uint8_t diag_first;	// first board line on the diagnostics page
+ 	bool locked;		// keys locked (long QUICK)
+ 	bool scanning;
+@@ -144,7 +146,9 @@ enum {
+ 	QT_TO_VFO,		// on a channel, in place of QT_MODE: copy the channel to the VFO
+ 	QT_AES,		// AES-256 key for the current VFO and mode
+ 	QT_SPLIT,		// in the VFO, in place of QT_MONITOR (FM) / QT_PRIVACY (DMR): the TX frequency or offset
+-
++	QT_AIR_CODE,		// P25 NAC, NXDN RAN or YSF DG-ID (tile 2 on those modes)
++	QT_AIR_TG,		// the talk group PTT calls (P25/NXDN, tile 8)
++	QT_YSF_DEST,		// the YSF destination PTT calls (tile 8)
+ };
+ // The tile kind at position 0..8 (keys 1..9) for this channel or the VFO
+ uint8_t ui_quick_kind(int pos, const radio_view_t *v);
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+index 360e410..34a340e 100644
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -81,6 +81,11 @@ void ui_svc_focus_target(uint32_t id, bool private_call);
+ // --- On-the-fly channel changes (temporary, P7) ---
+ bool ui_svc_dmr_timeslot(uint8_t ts);
+ bool ui_svc_dmr_color_code(uint8_t cc);
++// The P25 NAC, NXDN RAN or YSF DG-ID of the channel or VFO in use (the mode decides which), and the talk group
++// (P25/NXDN) or destination (YSF) PTT calls; false: not a mode or channel these apply to (a trunked channel's too)
++bool ui_svc_air_code(uint32_t code);
++bool ui_svc_air_target(uint32_t id);
++bool ui_svc_ysf_destination(const char *dest);
+ // The VFO's SFR role (CONFIG_SFR, sfr.md 4): a as a channel's SFR byte A; false: not in this build
+ bool ui_svc_vfo_sfr(uint8_t a);
+ bool ui_svc_vfo_mode(uint8_t mode, uint8_t variant);
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+index 10e8458..0bddbfc 100644
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -145,6 +145,132 @@ bool ui_svc_dmr_color_code(uint8_t cc)
+ 	return true;
+ }
+ 
++bool ui_svc_air_code(uint32_t code)
++{
++	radio_get_view(&ui_svc_view);
++	if (ui_svc_view.hotspot)
++		return false;
++#if CONFIG_P25
++	if (ui_svc_view.ch.mode == RADIO_MODE_P25) {
++		if (code > 0xFFFu || code == P25_NAC_REPEAT_ANY || ui_svc_view.ch.kind == CODEPLUG_KIND_P25_TRUNK)
++			return false;
++		radio_p25_settings_t s;
++		if (!radio_p25_in_force(&s)) {
++			if (ui_svc_view.ch.kind != CODEPLUG_KIND_NONE)
++				return false;
++			radio_p25_settings(&s);
++		}
++		s.rx_nac = (uint16_t)code;
++		if (code != P25_NAC_ANY)
++			s.tx_nac = (uint16_t)code;
++		radio_req_p25_quick(&s, RADIO_P25_QUICK_NAC);
++		return true;
++	}
++#endif
++#if CONFIG_NXDN
++	if (ui_svc_view.ch.mode == RADIO_MODE_NXDN) {
++		if (code > RADIO_NXDN_RAN_MAX)
++			return false;
++		radio_nxdn_settings_t s;
++		if (!radio_nxdn_in_force(&s)) {
++			if (ui_svc_view.ch.kind != CODEPLUG_KIND_NONE)
++				return false;
++			radio_nxdn_settings(&s);
++		}
++		s.rx_ran = (uint8_t)code;
++		if (code != 0)
++			s.tx_ran = (uint8_t)code;
++		radio_req_nxdn_quick(&s, RADIO_NXDN_QUICK_RAN);
++		return true;
++	}
++#endif
++#if CONFIG_YSF
++	if (ui_svc_view.ch.mode == RADIO_MODE_YSF) {
++		if (code > RADIO_YSF_DGID_USER_MAX)
++			return false;
++		radio_ysf_settings_t s;
++		if (!radio_ysf_in_force(&s)) {
++			if (ui_svc_view.ch.kind != CODEPLUG_KIND_NONE)
++				return false;
++			radio_ysf_settings(&s);
++		}
++		s.rx_dgid = (uint8_t)code;
++		if (code != 0)
++			s.tx_dgid = (uint8_t)code;
++		radio_req_ysf_quick(&s, RADIO_YSF_QUICK_DGID);
++		return true;
++	}
++#endif
++	(void)code;
++	return false;
++}
++
++bool ui_svc_air_target(uint32_t id)
++{
++	if (id == 0 || id > 0xFFFFu)
++		return false;
++	radio_get_view(&ui_svc_view);
++	if (ui_svc_view.hotspot)
++		return false;
++#if CONFIG_P25
++	if (ui_svc_view.ch.mode == RADIO_MODE_P25) {
++		if (ui_svc_view.ch.kind == CODEPLUG_KIND_P25_TRUNK)
++			return false;
++		radio_p25_settings_t s;
++		if (!radio_p25_in_force(&s)) {
++			if (ui_svc_view.ch.kind != CODEPLUG_KIND_NONE)
++				return false;
++			radio_p25_settings(&s);
++		}
++		s.unit_call = false;
++		s.tx_dst = id;
++		radio_req_p25_quick(&s, RADIO_P25_QUICK_TG);
++		return true;
++	}
++#endif
++#if CONFIG_NXDN
++	if (ui_svc_view.ch.mode == RADIO_MODE_NXDN) {
++		radio_nxdn_settings_t s;
++		if (!radio_nxdn_in_force(&s)) {
++			if (ui_svc_view.ch.kind != CODEPLUG_KIND_NONE)
++				return false;
++			radio_nxdn_settings(&s);
++		}
++		s.unit_call = false;
++		s.tx_dst = (uint16_t)id;
++		radio_req_nxdn_quick(&s, RADIO_NXDN_QUICK_TG);
++		return true;
++	}
++#endif
++	return false;
++}
++
++bool ui_svc_ysf_destination(const char *dest)
++{
++#if CONFIG_YSF
++	if (dest == NULL)
++		return false;
++	radio_get_view(&ui_svc_view);
++	if (ui_svc_view.hotspot || ui_svc_view.ch.mode != RADIO_MODE_YSF)
++		return false;
++	radio_ysf_settings_t s;
++	if (!radio_ysf_in_force(&s)) {
++		if (ui_svc_view.ch.kind != CODEPLUG_KIND_NONE)
++			return false;
++		radio_ysf_settings(&s);
++	}
++	strncpy(s.dest, dest, YSF_CALLSIGN_LEN);
++	s.dest[YSF_CALLSIGN_LEN] = 0;
++	if (s.dest[0] == '\0')
++		strcpy(s.dest, YSF_CP_DEST_ALL);
++	radio_req_ysf_quick(&s, RADIO_YSF_QUICK_DEST);
++	return true;
++#else
++	(void)dest;
++	return false;
++#endif
++}
++
+ bool ui_svc_vfo_sfr(uint8_t a)
+ {
+ #if CONFIG_SFR
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+index 895cbed..2e4215e 100644
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -753,7 +753,7 @@ static void save_failed(tr_id_t why)
+ // talk target for a permanent one. Only the UI task fills it, and only while no job is pending
+ static struct {
+ 	uint16_t channel;
+-	uint8_t temp;
++	uint16_t temp;
+ 	uint8_t power;
+ 	uint8_t squelch;
+ 	uint8_t held;		// a write held for the foreign codeplug question: cp_jobs[held - 1], 0 none (in padding)
+@@ -773,6 +773,18 @@ static struct {
+ 	bool air_set;		// write_channel_job: air is the channel's block
+ 	bool air_own;		// ... and the channel's talk target and talkaround are its own, not the radio's settings
+ 	ui_air_conv_t air;
++	uint8_t air_quick_mask;
++	union {
++#if CONFIG_P25
++		radio_p25_settings_t p25;
++#endif
++#if CONFIG_NXDN
++		radio_nxdn_settings_t nxdn;
++#endif
++#if CONFIG_YSF
++		radio_ysf_settings_t ysf;
++#endif
++	} air_quick;
+ #endif
+ } job;
+ 
+@@ -1085,6 +1097,117 @@ static bool air_save_now(uint16_t number, const channel_t *ch, bool *ok)
+ 	return false;
+ }
+ 
++// Quick's masked digital fields into the channel's block. The block and every field Quick didn't touch stay as read.
++// P25/NXDN targets are contacts in this codeplug format: an unknown TG remains temporary, never silently becomes TG 1.
++static bool air_quick_save(bool *ok, bool *missing)
++{
++	*ok = false;
++	*missing = false;
++	if (job.air_quick_mask == 0)
++		return false;
++#if CONFIG_P25
++	if (job_ch.kind == CODEPLUG_KIND_P25 ||
++	    (job_ch.kind == CODEPLUG_KIND_NONE && job_ch.mode == RADIO_MODE_P25)) {
++		p25_conv_t conv;
++		if (job_ch.kind == CODEPLUG_KIND_P25) {
++			p25_conv_cfg_t cc;
++			if (!p25_conv_load(job.channel, &job_ch, &cc))
++				return true;
++			conv = cc.conv;
++		} else {
++			radio_p25_settings_t base;
++			radio_p25_settings(&base);
++			conv = (p25_conv_t){ .rx_nac = base.rx_nac, .tx_nac = base.tx_nac,
++				.squelch = base.rx_tgid != 0 ? P25_SQUELCH_SELECTIVE : P25_SQUELCH_NORMAL,
++				.aes = (job_ch.vfo_digital & VFO_DIG_P25_AES) != 0, .kid = job_ch.vfo_p25_kid };
++			job_ch.contact = codeplug_contact_find_index(base.tx_dst, !base.unit_call, NULL);
++			job_ch.dmo = base.talkaround == RADIO_P25_TA_ON;
++		}
++		if (job.air_quick_mask & RADIO_P25_QUICK_NAC) {
++			conv.rx_nac = job.air_quick.p25.rx_nac;
++			conv.tx_nac = job.air_quick.p25.tx_nac;
++		}
++		if (job.air_quick_mask & RADIO_P25_QUICK_TG) {
++			uint16_t contact = codeplug_contact_find_index(job.air_quick.p25.tx_dst, true, NULL);
++			if (contact == 0) {
++				*missing = true;
++				return true;
++			}
++			job_ch.contact = contact;
++		}
++		*ok = p25_conv_save(job.channel, &job_ch, &conv);
++		return true;
++	}
++#endif
++#if CONFIG_NXDN
++	if (job_ch.kind == CODEPLUG_KIND_NXDN ||
++	    (job_ch.kind == CODEPLUG_KIND_NONE && job_ch.mode == RADIO_MODE_NXDN)) {
++		nxdn_conv_t conv;
++		if (job_ch.kind == CODEPLUG_KIND_NXDN) {
++			nxdn_conv_cfg_t cc;
++			if (!nxdn_conv_load(job.channel, &job_ch, &cc))
++				return true;
++			conv = cc.conv;
++		} else {
++			radio_nxdn_settings_t base;
++			radio_nxdn_settings(&base);
++			conv = (nxdn_conv_t){ .rate9600 = base.rate9600, .rx_ran = base.rx_ran, .tx_ran = base.tx_ran,
++				.squelch = base.rx_gid != 0 ? NXDN_SQUELCH_SELECTIVE : NXDN_SQUELCH_RAN,
++				.aes = job_ch.vfo_nxdn_key != 0,
++				.kid = job_ch.vfo_nxdn_key == 0 ? 0 : job_ch.vfo_nxdn_key - 1u };
++			uint8_t variant = job_ch.vfo_digital & VFO_DIG_NXDN_MASK;
++			if (variant != 0)
++				conv.rate9600 = variant == VFO_VARIANT_SECOND;
++			job_ch.contact = codeplug_contact_find_index(base.tx_dst, !base.unit_call, NULL);
++		}
++		if (job.air_quick_mask & RADIO_NXDN_QUICK_RAN) {
++			conv.rx_ran = job.air_quick.nxdn.rx_ran;
++			conv.tx_ran = job.air_quick.nxdn.tx_ran;
++		}
++		if (job.air_quick_mask & RADIO_NXDN_QUICK_TG) {
++			uint16_t contact = codeplug_contact_find_index(job.air_quick.nxdn.tx_dst, true, NULL);
++			if (contact == 0) {
++				*missing = true;
++				return true;
++			}
++			job_ch.contact = contact;
++		}
++		*ok = nxdn_conv_save(job.channel, &job_ch, &conv);
++		return true;
++	}
++#endif
++#if CONFIG_YSF
++	if (job_ch.kind == CODEPLUG_KIND_YSF ||
++	    (job_ch.kind == CODEPLUG_KIND_NONE && job_ch.mode == RADIO_MODE_YSF)) {
++		ysf_conv_t conv;
++		if (job_ch.kind == CODEPLUG_KIND_YSF) {
++			ysf_conv_cfg_t cc;
++			if (!ysf_conv_load(job.channel, &job_ch, &cc))
++				return true;
++			conv = cc.conv;
++		} else {
++			radio_ysf_settings_t base;
++			radio_ysf_settings(&base);
++			conv = (ysf_conv_t){ .dt = base.dt, .narrow = base.narrow,
++				.rx_dgid = base.rx_dgid, .tx_dgid = base.tx_dgid };
++			uint8_t variant = (job_ch.vfo_digital & VFO_DIG_YSF_MASK) >> 2;
++			if (variant != 0)
++				conv.narrow = variant == VFO_VARIANT_SECOND;
++			strcpy(conv.dest, base.dest);
++		}
++		if (job.air_quick_mask & RADIO_YSF_QUICK_DGID) {
++			conv.rx_dgid = job.air_quick.ysf.rx_dgid;
++			conv.tx_dgid = job.air_quick.ysf.tx_dgid;
++		}
++		if (job.air_quick_mask & RADIO_YSF_QUICK_DEST)
++			strcpy(conv.dest, job.air_quick.ysf.dest);
++		*ok = ysf_conv_save(job.channel, &job_ch, &conv);
++		return true;
++	}
++#endif
++	return false;
++}
++
+ // Power, bandwidth, tones, mode, color code and timeslot go into the channel; the squelch is radio-wide (the default
+ // squelch preference). The radio core re-reads the channel (codeplug_serial), and the clear makes the remaining
+ // flags follow the new values
+@@ -1109,11 +1232,17 @@ static void save_channel_job(void *ctx)
+ 		job_ch.color_code = job.now.color_code;
+ 	if (job.temp & RADIO_TEMP_TS)
+ 		job_ch.timeslot = job.now.timeslot;
+-	bool ok;
+-	if (!air_save_now(job.channel, &job_ch, &ok))
++	bool ok = false, missing = false;
++	bool done = false;
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++	if (job.temp & RADIO_TEMP_AIR)
++		done = air_quick_save(&ok, &missing);
++#endif
++	if (!done && !air_save_now(job.channel, &job_ch, &ok))
+ 		ok = codeplug_set_channel(job.channel, &job_ch);
+ 	if (!ok) {
+-		save_failed(TRN(STORE_ERR_CODEPLUG_WRITE, "Couldn't write the codeplug: not saved"));
++		save_failed(missing ? TRN(STORE_ERR_TARGET_NOT_STORED, "Not a stored contact: for now only") :
++			TRN(STORE_ERR_CODEPLUG_WRITE, "Couldn't write the codeplug: not saved"));
+ 		return;
+ 	}
+ 	if (job.temp & RADIO_TEMP_SQUELCH) {
+@@ -1136,6 +1265,23 @@ static bool take_channel(void)
+ 	}
+ 	job.channel = ui_svc_view.channel_number;
+ 	job.temp = ui_svc_view.temp;
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++	job.air_quick_mask = 0;
++	if (job.temp & RADIO_TEMP_AIR) {
++#if CONFIG_P25
++		if (ui_svc_view.ch.mode == RADIO_MODE_P25)
++			job.air_quick_mask = radio_p25_quick_settings(&job.air_quick.p25);
++#endif
++#if CONFIG_NXDN
++		if (ui_svc_view.ch.mode == RADIO_MODE_NXDN)
++			job.air_quick_mask = radio_nxdn_quick_settings(&job.air_quick.nxdn);
++#endif
++#if CONFIG_YSF
++		if (ui_svc_view.ch.mode == RADIO_MODE_YSF)
++			job.air_quick_mask = radio_ysf_quick_settings(&job.air_quick.ysf);
++#endif
++	}
++#endif
+ 	job.power = ui_svc_view.power;
+ 	job.squelch = ui_svc_view.squelch;
+ 	job.now = ui_svc_view.ch;
+diff --git a/core/ui/ui_svc_stub.c b/core/ui/ui_svc_stub.c
+index 05bbeaf..1668992 100644
+--- a/core/ui/ui_svc_stub.c
++++ b/core/ui/ui_svc_stub.c
+@@ -29,6 +29,9 @@ WEAK void ui_svc_focus_target(uint32_t id, bool private_call) { (void)id; (void)
+ 
+ WEAK bool ui_svc_dmr_timeslot(uint8_t ts) { (void)ts; return false; }
+ WEAK bool ui_svc_dmr_color_code(uint8_t cc) { (void)cc; return false; }
++WEAK bool ui_svc_air_code(uint32_t code) { (void)code; return false; }
++WEAK bool ui_svc_air_target(uint32_t id) { (void)id; return false; }
++WEAK bool ui_svc_ysf_destination(const char *dest) { (void)dest; return false; }
+ WEAK bool ui_svc_vfo_sfr(uint8_t a) { (void)a; return false; }
+ WEAK bool ui_svc_mode(uint8_t mode) { (void)mode; return false; }
+ WEAK bool ui_svc_vfo_mode(uint8_t mode, uint8_t variant) { (void)mode; (void)variant; return false; }
+diff --git a/docs/ux/information-architecture.md b/docs/ux/information-architecture.md
+index 547d98d..d8cee04 100644
+--- a/docs/ux/information-architecture.md
++++ b/docs/ux/information-architecture.md
+@@ -141,8 +141,15 @@ Contacts, Recent and Messages are the "people" side, Zones, Channels and Tools t
+ | 9 | Brightness | Brightness |
+ | 0 | All settings | All settings |
+ 
+-- Toggle tiles change on one press; cycle tiles (power, timeslot, bandwidth) advance one value per press; value tiles (CC, squelch, tone, brightness) open an inline editor (`NAV_UP`/`NAV_DOWN` or digits, `SELECT` or `QUICK` to close).
+-- Every change is temporary on a channel (dot on Home). Long `SELECT` on a tile makes it permanent. In VFO, changes apply to the VFO directly.
++On a P25, NXDN or YSF channel the grid is the FM one, with the mode's selectors in place of Squelch (2) and Bandwidth (8); a P25 trunked channel has neither (the system assigns them):
++
++| Key | P25 | NXDN | YSF |
++|---|---|---|---|
++| 2 | NAC (3 hex digits; F7E hears every NAC, a repeater's F7F is refused) | RAN (0-63, 0 hears every RAN) | DG-ID (00-99, 00 hears every DG-ID) |
++| 8 | Talk group | Talk group | Destination call sign (empty: ALL) |
++
++- Toggle tiles change on one press; cycle tiles (power, timeslot, bandwidth) advance one value per press; value tiles (CC, squelch, tone, brightness, NAC, RAN, DG-ID, talk group) open an inline editor (`NAV_UP`/`NAV_DOWN` or digits, `SELECT` or `QUICK` to close). A digit starts a new value; on the NAC tile Up/Down steps the last digit through A-F. The YSF destination opens the text entry screen.
++- Every change is temporary on a channel (dot on Home). Long `SELECT` on a tile makes it permanent. In VFO, changes apply to the VFO directly. A digital selector changes only what it says: the NAC/RAN/DG-ID in both directions, the talk group or destination only what PTT calls (the receive filter is the channel's own). A talk group that is no stored contact stays temporary when made permanent ("Not a stored contact: for now only") rather than silently becoming TG 1.
+ - Tile 4 depends on where you are. On a channel it is "To VFO": the channel's settings in effect now (temporary changes included) become the VFO's own and the VFO opens ("Copied to VFO"); the channel is unchanged, and a channel the VFO can't hold is refused with a toast. In the VFO, tile 4 is Mode (FM / DMR), kept like the VFO's other settings. A channel has no temporary mode change.
+ - In the VFO, the tile that is Monitor on FM (5) and Privacy on DMR (6) is TX freq ("TXFreq" on a tile): the VFO's split, its TX frequency against RX ("Off", "+600k", "-5M"). Up / Down walk a line out from Off at once, Up +, Down -, through the band's usual offsets most common first and stopping at the ends (2 m 600 kHz, then 1 MHz; 1.25 m 1.6 MHz; 70 cm 5, 7.6, then 1.6 MHz, from the ARRL, IARU Region 1, RSGB and WIA band plans), skipping a TX outside RX's transmit band; a typed split goes to the first offset its way. While it edits, the hint row says what Up / Down and the digits do, and while digits are typed shows the whole TX frequency so far ("TX 147.02___"; the tile says "TX"). Any other split is typed: digits type a TX frequency, OK sets it (refused outside the transmit bands: "Can't transmit there"), BACK takes a digit back. Monitor stays on its key; privacy is for channels.
+ - Home shows a split VFO's TX frequency: on FM after PTT→; on DMR in the top row ("VFO  TX 147.120"), or as the offset among the chips on displays without that row. While transmitting, the large frequency is the TX frequency, in the TX color; the DMR call screen has a "TX 147.120 MHz" line under the target.
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 8fce21c..78f8fef 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -652,6 +652,9 @@ static bool kv_set(uint16_t key, const uint8_t *v, uint16_t len)
+ 	} else if (key == CODEPLUG_KEY_ARS_SERVER && len == 4) {
+ 		kv_ars_present = true;
+ 		kv_ars = v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
++	} else if (key >= 0x100u) {
++		kv_t3_set(key, v, (uint8_t)len);	// record keys, including the conventional digital channel tags
++		return true;
+ 	} else {
+ 		return false;
+ 	}
+@@ -659,9 +662,26 @@ static bool kv_set(uint16_t key, const uint8_t *v, uint16_t len)
+ 	return true;
+ }
+ uint8_t codeplug_kv_serial(void) { return kv_serial; }
+-// The tag layer's writes (codeplug_tag.c): none in these tests
+-bool codeplug_kv_set(uint16_t key, const void *value, uint16_t len) { (void)key; (void)value; (void)len; return false; }
+-bool codeplug_kv_remove(uint16_t key) { (void)key; return false; }
++// The tag layer's writes (codeplug_tag.c): record keys only
++bool codeplug_kv_set(uint16_t key, const void *value, uint16_t len)
++{
++	return !kv_held && kv_set(key, value, len);
++}
++bool codeplug_kv_remove(uint16_t key)
++{
++	if (kv_held) {
++		return false;
++	}
++	for (uint8_t i = 0; i < kv_t3_n; i++) {
++		if (kv_t3[i].key == key) {
++			memmove(&kv_t3[i], &kv_t3[i + 1], (kv_t3_n - i - 1u) * sizeof(kv_t3[0]));
++			kv_t3_n--;
++			kv_serial++;
++			return true;
++		}
++	}
++	return false;
++}
+ // The walk: c->at the next single key to try, up to CODEPLUG_KEY_TX_DENY_TONE, then the Tier III keys in order
+ void codeplug_kv_begin(codeplug_kv_cursor_t *c, uint16_t lo, uint16_t hi)
+ {
+@@ -3783,6 +3803,11 @@ void radio_req_nxdn_settings(const radio_nxdn_settings_t *s)
+ 	radio_nxdn_set_settings(s);
+ 	req(RREQ_NXDN_SET, 0);
+ }
++void radio_req_nxdn_quick(const radio_nxdn_settings_t *s, uint8_t mask)
++{
++	radio_nxdn_set_quick(s, mask, sm.view.vfo);
++	req(RREQ_NXDN_SET, mask);
++}
+ #endif
+ #if CONFIG_YSF
+ // As radio_task.c does it: the settings to the module, the request to the state machine
+@@ -3791,6 +3816,11 @@ void radio_req_ysf_settings(const radio_ysf_settings_t *s)
+ 	radio_ysf_set_settings(s);
+ 	req(RREQ_YSF_SET, 0);
+ }
++void radio_req_ysf_quick(const radio_ysf_settings_t *s, uint8_t mask)
++{
++	radio_ysf_set_quick(s, mask, sm.view.vfo);
++	req(RREQ_YSF_SET, mask);
++}
+ #endif
+ // Not under test here: debuglink_view_radio.c, linked for the volume operation, refers to them
+ void radio_req_scan_dual(uint16_t pos) { (void)pos; }
+@@ -3855,6 +3885,11 @@ void radio_req_vfo_aes(uint8_t mode, int32_t kid)
+ #if CONFIG_P25
+ // As radio_task.c: the settings copied in, then the request
+ void radio_req_p25_settings(const radio_p25_settings_t *s) { radio_p25_set_settings(s); req(RREQ_P25_SET, 0); }
++void radio_req_p25_quick(const radio_p25_settings_t *s, uint8_t mask)
++{
++	radio_p25_set_quick(s, mask, sm.view.vfo);
++	req(RREQ_P25_SET, mask);
++}
+ #endif
+ void radio_req_vfo_copy(void) { req(RREQ_VFO_COPY, 0); }
+ radio_vfo_copy_t radio_req_vfo_copy_checked(void)
+@@ -7475,6 +7510,102 @@ static void test_p25_stored(void)
+ 	memset(stored_p25, 0, sizeof(stored_p25));
+ }
+ 
++// Quick's NAC and talk group on a stored P25 channel (information-architecture.md 5): the engine takes them for
++// now, dotted; the block is untouched until a save, which writes only the fields Quick changed. A talk group with
++// no stored contact stays for now, never silently TG 1
++static void test_p25_quick_stored(void)
++{
++	static char buf[4096];
++	const radio_p25_view_t *v = &sm.view.p25;
++
++	setup_codeplug_p25();
++	add(3, "P25 rptr", 446100000, RADIO_MODE_DMR, false, 2);
++	chans[3].tx_hz = 451100000;
++	chans[3].kind = CODEPLUG_KIND_P25;
++	chans[3].system = 0xFF;
++	stored_p25[3] = (p25_conv_cfg_t){ .conv = { 0x2A0, 0x2A1, P25_SQUELCH_SELECTIVE }, .unit_id = 1234567,
++					  .target = 201, .target_unit = false, .talkaround = false };
++	start();
++	p25_defaults();
++	req(RREQ_ZONE_POS, 2);
++	CHECK(sm.view.channel_number == 3 && radio_p25_running() && !(sm.view.temp & RADIO_TEMP_AIR));
++
++	// A NAC for now: both directions of the running engine, the stored block untouched
++	CHECK(ui_svc_air_code(0x293));
++	run(50);
++	CHECK((sm.view.temp & RADIO_TEMP_AIR) != 0 && sm.view.temporary && v->rx_nac == 0x293);
++	p25_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "p25.run.rx_nac=659\n") != NULL && strstr(buf, "p25.run.tx_nac=659\n") != NULL);
++	// A repeater's F7F and more than 12 bits are refused; F7E hears every NAC and keeps the TX NAC
++	CHECK(!ui_svc_air_code(P25_NAC_REPEAT_ANY) && !ui_svc_air_code(0x1000));
++	CHECK(ui_svc_air_code(P25_NAC_ANY));
++	run(50);
++	p25_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "p25.run.rx_nac=3966\n") != NULL && strstr(buf, "p25.run.tx_nac=659\n") != NULL);
++	// A talk group for now: what PTT calls; the receive filter stays the channel's
++	CHECK(ui_svc_air_target(9));
++	run(50);
++	CHECK(v->talk == 9 && !(v->flags & RADIO_P25_TALK_UNIT));
++	p25_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "p25.run.tx_dst=9\n") != NULL && strstr(buf, "p25.run.rx_tgid=201\n") != NULL &&
++	      strstr(buf, "p25.run.unit_call=0\n") != NULL);
++	CHECK(!ui_svc_air_target(0) && !ui_svc_air_target(0x10000));
++
++	// PTT calls the Quick NAC and talk group, our unit ID the channel's
++	far_begin(0x293, 1001, false, 9);
++	run(100);
++	req(RREQ_PTT, 1);
++	CHECK(sm.view.state == RS_TX);
++	run(1000);
++	CHECK(far_heard.starts == 1 && far_heard.call.nac == 0x293 && far_heard.call.lc.src == 1234567 &&
++	      far_heard.call.lc.tgid == 9);
++	req(RREQ_PTT, 0);
++	run(600);
++
++	// Cleared: the channel's own NAC and talk group run again, nothing was written
++	radio_req_clear_temporary();
++	run(100);
++	CHECK(!(sm.view.temp & RADIO_TEMP_AIR) && !sm.view.temporary);
++	p25_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "p25.run.rx_nac=672\n") != NULL && strstr(buf, "p25.run.tx_dst=201\n") != NULL);
++
++	// Set again and saved: only the Quick fields land in the block, the rest of the channel stays
++	CHECK(ui_svc_air_code(0x293) && ui_svc_air_target(9));
++	run(50);
++	memset(&p25_saved, 0, sizeof p25_saved);
++	int w = cp_writes;
++	CHECK(ui_svc_save_channel());
++	storage_job_poll();
++	CHECK(cp_writes > w && p25_saved.number == 3);
++	CHECK(p25_saved.conv.rx_nac == 0x293 && p25_saved.conv.tx_nac == 0x293);
++	CHECK(p25_saved.conv.squelch == P25_SQUELCH_SELECTIVE && p25_saved.ch.kind == CODEPLUG_KIND_P25);
++	CHECK(p25_saved.ch.contact == 3);	// Local, the stored contact of TG 9
++	// (the harness's p25_conv_save records instead of rewriting the tag: what a reload would read)
++	stored_p25[3].conv.rx_nac = stored_p25[3].conv.tx_nac = 0x293;
++	stored_p25[3].target = 9;
++	run(100);
++	CHECK(!sm.view.temporary && v->rx_nac == 0x293 && v->talk == 9);
++
++	// A talk group with no stored contact is not saved: the change stays for now
++	CHECK(ui_svc_air_target(77));
++	run(50);
++	n_ev = 0;
++	w = cp_writes;
++	CHECK(ui_svc_save_channel());
++	storage_job_poll();
++	CHECK(cp_writes == w && n_ev == 1 && last_ev.kind == UI_EV_SAVE_FAILED &&
++	      strstr(tr_en(last_ev.why), "Not a stored contact") != NULL);
++	CHECK((sm.view.temp & RADIO_TEMP_AIR) != 0 && v->talk == 77);
++	radio_req_clear_temporary();
++	run(100);
++	CHECK(!sm.view.temporary && v->talk == 9);
++	p25_defaults();
++	req(RREQ_MODE, RADIO_MODE_FM);
++	req(RREQ_VFO, 0);
++	far_stop();
++	memset(stored_p25, 0, sizeof(stored_p25));
++}
++
+ #if CONFIG_P25_TRUNK
+ // ---- P25 trunked (docs/spec/p25-trunking.md 7): a site on the fake air (site above), the far radio its voice ----
+ #define TS_WACN		0xBEE00u
+@@ -7971,6 +8102,7 @@ static void test_p25(void)
+ 	test_p25_aes();
+ #endif
+ 	test_p25_stored();
++	test_p25_quick_stored();
+ #if CONFIG_SCAN
+ 	test_p25_scan();
+ #if CONFIG_DUAL_WATCH
+@@ -8931,6 +9063,101 @@ static void test_nxdn_stored(void)
+ 	memset(stored_nxdn, 0, sizeof(stored_nxdn));
+ }
+ 
++// Quick's RAN and talk group on a stored NXDN channel, as P25's: for now and dotted until a save, which writes
++// only the fields Quick changed
++static void test_nxdn_quick_stored(void)
++{
++	static char buf[4096];
++	const radio_nxdn_view_t *v = &sm.view.nxdn;
++
++	setup_codeplug_nxdn();
++	add(3, "NXDN rptr", 446100000, RADIO_MODE_DMR, false, 2);
++	chans[3].tx_hz = 451100000;
++	chans[3].kind = CODEPLUG_KIND_NXDN;
++	chans[3].system = 0xFF;
++	stored_nxdn[3] = (nxdn_conv_cfg_t){ .conv = { .rate9600 = true, .rx_ran = 7, .tx_ran = 8,
++					      .squelch = NXDN_SQUELCH_SELECTIVE },
++				    .unit_id = 4321, .target = 20, .target_unit = false };
++	start();
++	nxdn_defaults();
++	aud.feed = true;
++	req(RREQ_ZONE_POS, 2);
++	CHECK(sm.view.channel_number == 3 && radio_nxdn_running() && !(sm.view.temp & RADIO_TEMP_AIR));
++
++	// A RAN for now: both directions of the running engine (0 hears every RAN and keeps the TX RAN), 64 refused
++	CHECK(ui_svc_air_code(42));
++	run(50);
++	CHECK((sm.view.temp & RADIO_TEMP_AIR) != 0 && sm.view.temporary && v->rx_ran == 42 && v->tx_ran == 42);
++	nxdn_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "nxdn.run.rx_ran=42\n") != NULL && strstr(buf, "nxdn.run.tx_ran=42\n") != NULL);
++	CHECK(!ui_svc_air_code(64));
++	CHECK(ui_svc_air_code(0));
++	run(50);
++	nxdn_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "nxdn.run.rx_ran=0\n") != NULL && strstr(buf, "nxdn.run.tx_ran=42\n") != NULL);
++	// A talk group for now: what PTT calls; the receive filter stays the channel's
++	CHECK(ui_svc_air_target(9));
++	run(50);
++	CHECK(v->talk == 9 && !(v->flags & RADIO_NXDN_TALK_UNIT));
++	nxdn_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "nxdn.run.tx_dst=9\n") != NULL && strstr(buf, "nxdn.run.rx_gid=20\n") != NULL &&
++	      strstr(buf, "nxdn.run.unit_call=0\n") != NULL);
++	CHECK(!ui_svc_air_target(0) && !ui_svc_air_target(0x10000));
++
++	// PTT calls the Quick RAN and group, our unit ID the channel's
++	nfar_begin(true, 42, 2001, false, 9);
++	run(100);
++	req(RREQ_PTT, 1);
++	CHECK(sm.view.state == RS_TX);
++	run(1500);
++	CHECK(nfar_heard.starts == 1 && nfar_heard.call.ran == 42 && nfar_heard.call.vcall.src == 4321 &&
++	      nfar_heard.call.vcall.dst == 9 && nfar_heard.call.vcall.call_type == NXDN_CALL_GROUP);
++	req(RREQ_PTT, 0);
++	run(500);
++
++	// Cleared: the channel's own RAN and group run again, nothing was written
++	radio_req_clear_temporary();
++	run(100);
++	CHECK(!(sm.view.temp & RADIO_TEMP_AIR) && !sm.view.temporary);
++	nxdn_view_text(buf, sizeof buf);
++	CHECK(strstr(buf, "nxdn.run.rx_ran=7\n") != NULL && strstr(buf, "nxdn.run.tx_dst=20\n") != NULL);
++
++	// Set again and saved: only the Quick fields land in the block, the rest of the channel stays
++	CHECK(ui_svc_air_code(42) && ui_svc_air_target(9));
++	run(50);
++	memset(&nxdn_saved, 0, sizeof nxdn_saved);
++	int w = cp_writes;
++	CHECK(ui_svc_save_channel());
++	storage_job_poll();
++	CHECK(cp_writes > w && nxdn_saved.number == 3);
++	CHECK(nxdn_saved.conv.rx_ran == 42 && nxdn_saved.conv.tx_ran == 42 && nxdn_saved.conv.rate9600);
++	CHECK(nxdn_saved.conv.squelch == NXDN_SQUELCH_SELECTIVE && nxdn_saved.ch.kind == CODEPLUG_KIND_NXDN);
++	CHECK(nxdn_saved.ch.contact == 3);	// Local, the stored contact of TG 9
++	// (the harness's nxdn_conv_save records instead of rewriting the tag: what a reload would read)
++	stored_nxdn[3].conv.rx_ran = stored_nxdn[3].conv.tx_ran = 42;
++	stored_nxdn[3].target = 9;
++	run(100);
++	CHECK(!sm.view.temporary && v->rx_ran == 42 && v->talk == 9);
++
++	// A talk group with no stored contact is not saved: the change stays for now
++	CHECK(ui_svc_air_target(77));
++	run(50);
++	n_ev = 0;
++	w = cp_writes;
++	CHECK(ui_svc_save_channel());
++	storage_job_poll();
++	CHECK(cp_writes == w && n_ev == 1 && last_ev.kind == UI_EV_SAVE_FAILED &&
++	      strstr(tr_en(last_ev.why), "Not a stored contact") != NULL);
++	CHECK((sm.view.temp & RADIO_TEMP_AIR) != 0 && v->talk == 77);
++	radio_req_clear_temporary();
++	run(100);
++	CHECK(!sm.view.temporary && v->talk == 9);
++	nxdn_defaults();
++	nfar_stop();
++	aud.feed = false;
++	memset(stored_nxdn, 0, sizeof(stored_nxdn));
++}
++
+ static void test_nxdn(void)
+ {
+ 	test_nxdn_rx();
+@@ -8941,6 +9168,7 @@ static void test_nxdn(void)
+ 	test_nxdn_tx();
+ 	test_nxdn_mode();
+ 	test_nxdn_stored();
++	test_nxdn_quick_stored();
+ #if CONFIG_SCAN
+ 	test_nxdn_scan();
+ #if CONFIG_DUAL_WATCH
+@@ -10576,6 +10804,67 @@ static void test_ysf_pcm_handoff(void)
+ 	aud.feed = false;
+ 	kv_t3_clear();
+ }
++
++// Quick's DG-ID and destination on a stored YSF channel, as P25's: for now and dotted until a save, which writes
++// only those fields. The tag layer is the real one here: a saved channel reads back with them
++static void test_ysf_quick(void)
++{
++	radio_ysf_settings_t s;
++
++	setup_codeplug();
++	cp_radio_name = "xe1abc";
++	add(3, "YSF rptr", 446100000, RADIO_MODE_DMR, false, 2);	// the safe stand-in, zone Local position 2
++	chans[3].tx_hz = 451100000;
++	ysf_conv_t conv = { .dt = YSF_DT_VD_MODE2, .narrow = true, .rx_dgid = 7, .tx_dgid = 7 };
++	strcpy(conv.dest, "CQ");
++	CHECK(ysf_conv_save(3, &chans[3], &conv));
++	start();
++	req(RREQ_ZONE_POS, 2);
++	run(100);
++	CHECK(sm.view.channel_number == 3 && sm.view.ch.mode == RADIO_MODE_YSF && radio_ysf_running());
++	CHECK(radio_ysf_in_force(&s) && s.rx_dgid == 7 && s.tx_dgid == 7 && strcmp(s.dest, "CQ") == 0);
++	CHECK(!(sm.view.temp & RADIO_TEMP_AIR));
++
++	// A DG-ID for now: 00 to 99 as on a Yaesu (100 is refused), both directions; 00 hears every DG-ID
++	CHECK(ui_svc_air_code(42));
++	run(50);
++	CHECK((sm.view.temp & RADIO_TEMP_AIR) != 0 && sm.view.temporary);
++	CHECK(radio_ysf_in_force(&s) && s.rx_dgid == 42 && s.tx_dgid == 42);
++	CHECK(!ui_svc_air_code(100));
++	CHECK(ui_svc_air_code(0));
++	run(50);
++	CHECK(radio_ysf_in_force(&s) && s.rx_dgid == 0 && s.tx_dgid == 42);
++	// A destination for now: what PTT calls; an empty one is ALL
++	CHECK(ui_svc_ysf_destination("XE1XYZ"));
++	run(50);
++	CHECK(radio_ysf_in_force(&s) && strcmp(s.dest, "XE1XYZ") == 0);
++	CHECK(ui_svc_ysf_destination(""));
++	run(50);
++	CHECK(radio_ysf_in_force(&s) && strcmp(s.dest, "ALL") == 0);
++
++	// Cleared: the channel's own DG-ID and destination run again, nothing was written
++	radio_req_clear_temporary();
++	run(100);
++	CHECK(!(sm.view.temp & RADIO_TEMP_AIR) && !sm.view.temporary);
++	CHECK(radio_ysf_in_force(&s) && s.rx_dgid == 7 && strcmp(s.dest, "CQ") == 0);
++
++	// Set again and saved: only the Quick fields land in the block, and the re-read channel has them
++	CHECK(ui_svc_air_code(42) && ui_svc_ysf_destination("XE1XYZ"));
++	run(50);
++	int w = cp_writes;
++	CHECK(ui_svc_save_channel());
++	storage_job_poll();
++	CHECK(cp_writes > w);
++	run(100);	// the radio core re-reads the channel (codeplug serial)
++	CHECK(!sm.view.temporary);
++	CHECK(radio_ysf_in_force(&s) && s.rx_dgid == 42 && s.tx_dgid == 42 && strcmp(s.dest, "XE1XYZ") == 0);
++	// ... and the fields Quick didn't touch kept theirs
++	ysf_conv_cfg_t cc;
++	CHECK(ysf_conv_load(3, &chans[3], &cc) && cc.conv.dt == YSF_DT_VD_MODE2 && cc.conv.narrow);
++	CHECK(strcmp(cc.id.src, "XE1ABC") == 0);
++	kv_t3_clear();
++	cp_radio_name = "";
++}
+ #endif
+ 
+ #if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
+@@ -10793,6 +11082,7 @@ int main(int argc, char **argv)
+ 	test_volume_step_of();
+ #if CONFIG_YSF
+ 	test_ysf_pcm_handoff();
++	test_ysf_quick();
+ #endif
+ #if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
+ 	test_air_interop();
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index ba2c067..23d6df3 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -1391,7 +1391,7 @@ void sim_worst(bool on)
+ 	}
+ }
+ 
+-static void set_temp(uint8_t bit)
++static void set_temp(uint16_t bit)
+ {
+ 	view.temp |= bit;
+ 	view.temporary = true;
+@@ -1898,6 +1898,98 @@ bool ui_svc_dmr_color_code(uint8_t cc)
+ 	}
+ 	return true;
+ }
++
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
++static void air_quick_changed(void)
++{
++	retune();
++	if (view.vfo)
++		changed();
++	else
++		set_temp(RADIO_TEMP_AIR);
++}
++#endif
++
++bool ui_svc_air_code(uint32_t code)
++{
++	to_selected();
++#if CONFIG_P25
++	if (view.ch.mode == RADIO_MODE_P25) {
++		if (code > 0xFFFu || code == P25_NAC_REPEAT_ANY || view.ch.kind == CODEPLUG_KIND_P25_TRUNK)
++			return false;
++		view.p25.rx_nac = (uint16_t)code;
++		if (code != P25_NAC_ANY)
++			view.p25.tx_nac = (uint16_t)code;
++		air_quick_changed();
++		return true;
++	}
++#endif
++#if CONFIG_NXDN
++	if (view.ch.mode == RADIO_MODE_NXDN) {
++		if (code > RADIO_NXDN_RAN_MAX)
++			return false;
++		view.nxdn.rx_ran = (uint8_t)code;
++		if (code != 0)
++			view.nxdn.tx_ran = (uint8_t)code;
++		air_quick_changed();
++		return true;
++	}
++#endif
++#if CONFIG_YSF
++	if (view.ch.mode == RADIO_MODE_YSF) {
++		if (code > RADIO_YSF_DGID_USER_MAX)
++			return false;
++		view.ysf.rx_dgid = view.ysf.tx_dgid = (uint8_t)code;
++		air_quick_changed();
++		return true;
++	}
++#endif
++	(void)code;
++	return false;
++}
++
++bool ui_svc_air_target(uint32_t id)
++{
++	to_selected();
++	if (id == 0 || id > 0xFFFFu)
++		return false;
++#if CONFIG_P25
++	if (view.ch.mode == RADIO_MODE_P25) {
++		if (view.ch.kind == CODEPLUG_KIND_P25_TRUNK)
++			return false;
++		view.p25.talk = id;
++		view.p25.flags &= (uint8_t)~RADIO_P25_TALK_UNIT;
++		air_quick_changed();
++		return true;
++	}
++#endif
++#if CONFIG_NXDN
++	if (view.ch.mode == RADIO_MODE_NXDN) {
++		view.nxdn.talk = (uint16_t)id;
++		view.nxdn.flags &= (uint8_t)~RADIO_NXDN_TALK_UNIT;
++		air_quick_changed();
++		return true;
++	}
++#endif
++	return false;
++}
++
++bool ui_svc_ysf_destination(const char *dest)
++{
++#if CONFIG_YSF
++	if (dest == NULL || view.ch.mode != RADIO_MODE_YSF)
++		return false;
++	to_selected();
++	strncpy(view.ysf.talk, dest[0] == '\0' ? YSF_CP_DEST_ALL : dest, YSF_CALLSIGN_LEN);
++	view.ysf.talk[YSF_CALLSIGN_LEN] = '\0';
++	air_quick_changed();
++	return true;
++#else
++	(void)dest;
++	return false;
++#endif
++}
++
+ // The VFO's SFR role, as the radio core takes it (radio_sfr_channel): in force in DMR on one frequency
+ bool ui_svc_vfo_sfr(uint8_t a)
+ {
+@@ -2712,6 +2804,37 @@ static bool check(const char *kv, char *err, size_t len)
+ 	else if (strcmp(key, "sq") == 0) snprintf(got, sizeof got, "%u", view.squelch);
+ 	else if (strcmp(key, "ts") == 0) snprintf(got, sizeof got, "%u", view.dmr.ts);
+ 	else if (strcmp(key, "cc") == 0) snprintf(got, sizeof got, "%u", view.dmr.cc);
++	else if (strcmp(key, "aircode") == 0) {
++		uint32_t code = 0;
++		bool hex = false;
++#if CONFIG_P25
++		if (view.ch.mode == RADIO_MODE_P25) { code = view.p25.rx_nac; hex = true; }
++#endif
++#if CONFIG_NXDN
++		if (view.ch.mode == RADIO_MODE_NXDN) code = view.nxdn.rx_ran;
++#endif
++#if CONFIG_YSF
++		if (view.ch.mode == RADIO_MODE_YSF) code = view.ysf.rx_dgid;
++#endif
++		snprintf(got, sizeof got, hex ? "%03X" : "%u", (unsigned)code);
++	}
++	else if (strcmp(key, "airtalk") == 0) {
++		uint32_t id = 0;
++#if CONFIG_P25
++		if (view.ch.mode == RADIO_MODE_P25) id = view.p25.talk;
++#endif
++#if CONFIG_NXDN
++		if (view.ch.mode == RADIO_MODE_NXDN) id = view.nxdn.talk;
++#endif
++		snprintf(got, sizeof got, "%u", (unsigned)id);
++	}
++	else if (strcmp(key, "airdest") == 0) {
++#if CONFIG_YSF
++		snprintf(got, sizeof got, "%s", view.ysf.talk);
++#else
++		got[0] = 0;
++#endif
++	}
+ 	else if (strcmp(key, "temporary") == 0) snprintf(got, sizeof got, "%u", view.temporary);
+ 	else if (strcmp(key, "writes") == 0) snprintf(got, sizeof got, "%u", (unsigned)sim_rec.codeplug_writes);
+ 	else if (strcmp(key, "checks") == 0) snprintf(got, sizeof got, "%u", (unsigned)sim_rec.radio_checks);
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 1796ac1..9cd2f78 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -68,11 +68,28 @@ static const flow_t flows[] = {
+ #if CONFIG_NXDN
+ 	// NXDN the same way: the power, the RAN sent and the rate in the chips, the group PTT calls on the talk line
+ 	{ "NXDN channel shows its mode", "dlmode:nxdn", "", "mode=nxdn screen=home shows=NXDN shows=RAN_1_9600 shows=TG_1 hides=No_tone hides=SQ5", 0, false },
+-	{ "NXDN channel: bandwidth is FM only", "dlmode:nxdn", "quick 8", "mode=nxdn toast=FM_only:_this_is_NXDN", 2, false },
++	{ "NXDN channel: bandwidth is FM only", "dlmode:nxdn", "quick 3", "mode=nxdn toast=FM_only:_this_is_NXDN", 2, false },
++	{ "NXDN Quick: RAN", "dlmode:nxdn", "quick 2 4 2 ok", "screen=quick shows=RAN aircode=42 temporary=1", 5, false },
++	{ "NXDN Quick: TG", "dlmode:nxdn", "quick 8 2 0 ok", "screen=quick shows=TG airtalk=20 temporary=1", 5, false },
+ #endif
+-	{ "P25 channel: bandwidth is FM only", "dlmode:p25", "quick 8", "mode=p25 toast=FM_only:_this_is_a_P25_channel",
++#if CONFIG_YSF
++	{ "YSF Quick: two-digit DG-ID 99", "dlmode:ysf", "quick 2 9 9 ok", "screen=quick shows=DG-ID aircode=99 temporary=1", 5, false },
++	{ "YSF Quick: DG-ID 00", "dlmode:ysf", "quick 2 0 0 ok", "screen=quick shows=00 aircode=0 temporary=1", 5, false },
++	{ "YSF Quick: destination", "dlmode:ysf", "quick 8 back back back back back back ok",
++	  "screen=quick airdest=ALL temporary=1", 9, false },
++	{ "YSF VFO Quick: DG-ID stays in RAM", "vfokey dlmode:ysf", "quick 2 9 9 ok",
++	  "screen=quick aircode=99 temporary=0 vfo=1", 5, false },
++#endif
++	{ "P25 channel: bandwidth is FM only", "dlmode:p25", "quick 3", "mode=p25 toast=FM_only:_this_is_a_P25_channel",
+ 	  2, false },
+ #if CONFIG_P25
++	{ "P25 Quick: hexadecimal NAC", "dlmode:p25", "quick 2 1 9 up 5 ok", "screen=quick shows=NAC aircode=1A5 temporary=1", 7, false },
++	{ "P25 Quick: TG", "dlmode:p25", "quick 8 3 1 0 0 ok", "screen=quick shows=TG airtalk=3100 temporary=1", 7, false },
++	{ "P25 Quick: repeater NAC refused", "dlmode:p25",
++	  "quick 2 7 up up up up up up up up 7 7 up up up up up up up up ok",
++	  "screen=quick toast=F7F_is_for_repeaters shows=F7F_", 22, false },
++	{ "P25 VFO Quick: RAM, not temporary", "p25 vfokey dlmode:p25", "quick 2 1 2 3 ok",
++	  "screen=quick aircode=123 temporary=0 vfo=1", 6, false },
+ 	// P25 on Home: what PTT calls on the talk line, the NAC in the chips, the caller while a call comes in
+ 	{ "P25 home: talk group and NAC", "dlmode:p25", "", "screen=home shows=TG_1 shows=NAC_293", 0, false },
+ 	{ "P25 home: the caller", "dlmode:p25", "p25rx:3101234,7", "screen=home shows=ID_3101234 shows=TG_7", 0, false },
