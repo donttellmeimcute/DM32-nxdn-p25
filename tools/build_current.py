@@ -40,6 +40,8 @@ PATCHES = (
 	'rxonly-bulk-edit.patch',
 	# Quick menu: NAC/RAN/DG-ID and talk group/destination selectors on P25, NXDN and YSF channels
 	'quick-digital-selectors.patch',
+	# Host tests: the VFO AES flows need CONFIG_AIR_AES (the NoColor build has no air modes)
+	'nocolor-aes-flows.patch',
 )
 
 

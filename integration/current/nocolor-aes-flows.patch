@@ -1,0 +1,16 @@
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index d422776..1796ac1 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -801,9 +801,11 @@ static const flow_t flows[] = {
+ 	  2, false },
+ 	{ "S VFO mode: NXDN48 to NXDN96", "nxdn ok 4 up ok quick 4 4 back", "quick 4", "toast=VFO:_NXDN96 mode=nxdn", 2, false },
+ 	{ "S VFO mode: YSF Wide to Narrow", "ok 4 up ok quick 4 4 back", "quick 4", "toast=VFO:_YSF_N mode=ysf", 2, false },
++#if CONFIG_AIR_AES	// the AES tile needs an air-framed mode (config/features.mk)
+ 	{ "S VFO P25: select a CPS AES key", "p25 vfokey quick 4 4 back", "quick 3 up ok", "vfoaes=4660", 4, false },
+ 	{ "S VFO NXDN96: select KID zero", "nxdn vfokey quick 4 4 4 back", "quick 3 up ok", "vfoaes=0", 4, false },
+ 	{ "S VFO DMR: select a CPS AES key", "vfokey quick 4 back", "quick 5 up up ok", "vfoaes=7", 5, false },
++#endif
+ 	{ "S VFO mode: NXDN back to FM", "nxdn ok 4 up ok quick 4 back quick 4 back", "quick 4 4 4 4", "toast=VFO:_FM mode=fm",
+ 	  5, false },
+ 	{ "S VFO mode: P25 shows on the strip", "p25 ok 4 up ok quick 4 back quick 4 back", "", "mode=p25 screen=home shows=P25",
