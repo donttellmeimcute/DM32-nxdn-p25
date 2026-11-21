@@ -1,0 +1,577 @@
+diff --git a/core/codeplug/codeplug.c b/core/codeplug/codeplug.c
+index b5b096e..7291d51 100644
+--- a/core/codeplug/codeplug.c
++++ b/core/codeplug/codeplug.c
+@@ -62,6 +62,7 @@ static uint32_t fl_base = DEFAULT_FLASH_BASE;
+ #define CH_FLAG1	0x30u	// bits 0-1 talker alias on TS1, 2-3 on TS2: 0 off, 1 APRS, 2 text, 3 both
+ #define CH_FLAG2	0x31u
+ #define CH_FLAG4	0x33u
++#define CH_SQUELCH	0x37u
+ // Named DMR memory only. AES retains its original marker; adjacent markers
+ // identify other channel overrides. VFO records use these bytes for offset/step.
+ #define CH_DMR_PRIV	0x34u
+@@ -664,6 +665,7 @@ bool codeplug_openfw_decode(const uint8_t *r, channel_t *out)
+ 	out->rx_tone = tone(le16(&r[CH_RX_TONE]));
+ 	out->tx_tone = tone(le16(&r[CH_TX_TONE]));
+ 	out->power = r[CH_POWER] == 0 ? CODEPLUG_POWER_DEFAULT : power_from_byte(r[CH_POWER]);
++	out->squelch = r[CH_SQUELCH] <= CODEPLUG_SQUELCH_OPEN ? r[CH_SQUELCH] : 10u;
+ 	out->rx_only = (r[CH_FLAG4] & FLAG4_RX_ONLY) != 0;
+ 	out->color_code = r[CH_CC] & 0x0Fu;
+ 	out->timeslot = (r[CH_FLAG2] & FLAG2_TS2) ? 2 : 1;
+@@ -724,6 +726,7 @@ void codeplug_openfw_encode(const channel_t *ch, uint8_t *r)
+ 	put_freq(&r[CH_TX], ch->tx_hz);
+ 	r[CH_MODE] = ch->mode == RADIO_MODE_DMR ? 1 : 0;
+ 	r[CH_POWER] = ch->power == CODEPLUG_POWER_DEFAULT ? 0 : power_to_byte(ch->power);
++	r[CH_SQUELCH] = ch->squelch <= CODEPLUG_SQUELCH_OPEN ? ch->squelch : 10u;
+ 	put16(&r[CH_RX_TONE], tone_word(&ch->rx_tone));
+ 	put16(&r[CH_TX_TONE], tone_word(&ch->tx_tone));
+ 	r[CH_FLAG4] = (uint8_t)((r[CH_FLAG4] & ~(FLAG4_VOX | FLAG4_ZONE_SKIP | FLAG4_RX_ONLY | FLAG4_25K)) |
+diff --git a/core/codeplug/codeplug.h b/core/codeplug/codeplug.h
+index 54c32a1..24c1eac 100644
+--- a/core/codeplug/codeplug.h
++++ b/core/codeplug/codeplug.h
+@@ -27,6 +27,7 @@ typedef struct {
+ 	subtone_t rx_tone;
+ 	subtone_t tx_tone;
+ 	uint8_t power;		// board power level index, or CODEPLUG_POWER_DEFAULT
++	uint8_t squelch;	// FM: codeplug level, CODEPLUG_SQUELCH_DEFAULT or CODEPLUG_SQUELCH_OPEN
+ 	bool rx_only;
+ 	// DMR (unused by FM)
+ 	uint8_t color_code;
+@@ -91,6 +92,10 @@ enum { VFO_VARIANT_DEFAULT, VFO_VARIANT_FIRST, VFO_VARIANT_SECOND };
+ #define CODEPLUG_ALIAS_TS2_GPS	0x08u
+ 
+ #define CODEPLUG_POWER_DEFAULT	0xFF
++// Channel byte 0x37: 0 remains the radio default; 1-21 are the codeplug's scale. RadioFoundry adds 22 for an
++// explicitly open squelch (the radio's level 0); other values above 21 retain the legacy fallback to 10.
++#define CODEPLUG_SQUELCH_DEFAULT	0u
++#define CODEPLUG_SQUELCH_OPEN		22u
+ 
+ typedef struct {
+ 	char name[CODEPLUG_NAME_LEN + 1];
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index f6ca296..40d68f1 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -341,6 +341,20 @@ uint8_t radio_sm_squelch_open_below(uint8_t level)
+ 	return (uint8_t)(RADIO_SQL_OPEN_L1 - (level - 1) * RADIO_SQL_DB_PER_STEP);
+ }
+ 
++// The channel's stored FM squelch, or the radio default where it has none. The codeplug's 1-21 scale is qdmr's
++// 1-10 doubled; this radio's control stops at 9. CODEPLUG_SQUELCH_OPEN is deliberately level 0, not the default.
++static uint8_t channel_squelch(const radio_sm_t *sm, const channel_t *ch)
++{
++	if (sm->view.vfo || ch->mode != RADIO_MODE_FM || ch->squelch == CODEPLUG_SQUELCH_DEFAULT) {
++		return sm->base_squelch;
++	}
++	if (ch->squelch == CODEPLUG_SQUELCH_OPEN) {
++		return 0;
++	}
++	uint8_t level = (uint8_t)((ch->squelch + 1u) / 2u);
++	return level > RADIO_SQUELCH_MAX ? RADIO_SQUELCH_MAX : level;
++}
++
+ bool radio_view_wakes(const radio_view_t *v)
+ {
+ 	if (v->hotspot) {
+@@ -429,7 +443,7 @@ static bool clear_temporary(radio_sm_t *sm)
+ 	sm->temp_ts = 0;
+ 	sm->ts_pending = 0;
+ 	sm->view.power = channel_power(&sm->view.ch);
+-	sm->view.squelch = sm->base_squelch;
++	sm->view.squelch = channel_squelch(sm, &sm->view.ch);
+ 	if (!sm->view.vfo) {
+ 		sm->view.ch.bw = sm->base_bw;
+ 		sm->view.ch.rx_tone = sm->base_rx_tone;
+@@ -7061,7 +7075,7 @@ static void apply_prefs(radio_sm_t *sm, const settings_t *st)
+ 	if (st->squelch <= RADIO_SQUELCH_MAX && sm->base_squelch != st->squelch) {
+ 		sm->base_squelch = st->squelch;
+ 		if (!sm->temp_squelch) {
+-			sm->view.squelch = st->squelch;
++			sm->view.squelch = channel_squelch(sm, &sm->view.ch);
+ 		}
+ 	}
+ 	if (!sm->temp_power) {
+@@ -8186,7 +8200,7 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ 				sm->base_squelch = sm->view.squelch;
+ 				sm->squelch_save = true;
+ 			}
+-			sm->temp_squelch = sm->view.squelch != sm->base_squelch;
++			sm->temp_squelch = sm->view.squelch != channel_squelch(sm, &sm->view.ch);
+ 			set_temporary(sm);
+ 			changed(sm);
+ 		}
+diff --git a/docs/spec/open-firmware-cps.md b/docs/spec/open-firmware-cps.md
+index e5c6ddd..5851e99 100644
+--- a/docs/spec/open-firmware-cps.md
++++ b/docs/spec/open-firmware-cps.md
+@@ -447,7 +447,7 @@ assuming 500 ms steps (`codeplug.c` `GEN_HANG_UNIT_MS`, `dmr-voice.md` 7); that
+ | 0x33 | 1 | flag4: bit 7 power (vendor; superseded by 0x19), bit 6 VOX, bit 5 zone scan skip, bit 4 all-channel scan skip, bit 3 talkaround (unused), bit 2 RX only, bit 1 bandwidth 25 kHz (clear = 12.5 kHz), bit 0 squelch (vendor) |
+ | 0x34 | 2 | VFO offset frequency (vendor; qdmr uses it as the VFO TX offset) |
+ | 0x36 | 1 | VFO flags: bits 4-7 step index (2.5, 5, 6.25, 10, 12.5, 25, 30, 50 kHz); bits 2-3 offset mode (qdmr) |
+-| 0x37 | 1 | Squelch: 0 = the radio's default, 1-21 = level. Values above 21 are read as 10 |
++| 0x37 | 1 | FM squelch: 0 = the radio's default, 1-21 = level (qdmr's 1-10 doubled; the radio maps this to its 1-9 control), 22 = always open (RadioFoundry; the radio's level 0). Other values above 21 are read as 10 |
+ 
+ Location: each coordinate is 24 bits, assembled from its high, middle and low bytes. Bit 23 is the sign (1 = south or
+ west). Bits 22-15 are whole degrees. Bits 14-0 are the fraction in 1/10000 degree (0..9999). The location is used for
+diff --git a/docs/spec/qdmr-yaml.md b/docs/spec/qdmr-yaml.md
+index be11218..6fc100f 100644
+--- a/docs/spec/qdmr-yaml.md
++++ b/docs/spec/qdmr-yaml.md
+@@ -158,7 +158,7 @@ FM channels:
+ |---|---|---|
+ | `bandwidth`: `Narrow`, `Wide` | 12.5 or 25 kHz | |
+ | `rxTone`, `txTone` | Tones | |
+-| `squelch` | Squelch level | qdmr's 1-10 is doubled onto the record's 1-21; `0` and `!default` are the radio's default. The export halves it |
++| `squelch` | Squelch level | qdmr's 1-10 is doubled onto the record's 1-21; `0` and `!default` are the radio's default. The export halves it. RadioFoundry's per-channel always-open value (record byte 22) has no qdmr equivalent and exports as `!default`, with a conversion note |
+ | `extended.reverseBurst` | Dropped | |
+ 
+ The SFR settings (flag, bytes A and B) have no qdmr counterpart; the export leaves them out and says so.
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index e5ab627..1375782 100644
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -276,7 +276,13 @@ The Quick VOX tile (FM) turns the `vox` setting to all or off; `vox_on` in the v
+ the current channel. On a board without the hook the tile refuses to turn it on ("VOX: not on this radio yet")
+ rather than show "VOX on" for a VOX that never keys.
+ 
+-### 3.5 Squelch tail elimination
++### 3.5 Channel squelch and tail elimination
++
++An FM channel's byte 0x37 selects its squelch: 0 follows the radio default, 1-21 maps to the radio's 1-9 control
++(the codeplug scale is qdmr's 1-10 doubled), and RadioFoundry's 22 selects level 0, always open. Other values above
++21 read as 10, as before. A channel load, Clear changes and a restart restore this stored value; a temporary change
++that returns to it clears the temporary flag. Digital channels and the VFO continue to use the radio default. An
++always-open channel does not make a scan stop on noise alone: the scan still needs a carrier.
+ 
+ No reverse burst or tone-loss signal from the other station is acted on yet; closing early on CTCSS loss conflicts
+ with the tone debounce (8 polls) that keeps fades from chopping audio.
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index 4f9cc50..e75097a 100644
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -190,8 +190,9 @@ zone's list ([Editing a zone](#editing-a-zone)), or use **Copy here** there to m
+ ## Saving changes to a channel
+ 
+ Change power, squelch, tone, bandwidth, timeslot, color code or mode with quick settings. Then hold **OK** on Home or
+-in quick settings. The radio writes the channel in the background and shows "Saved to channel". The squelch is saved
+-as the radio's default squelch, not in the channel.
++in quick settings. The radio writes the channel in the background and shows "Saved to channel". A quick-settings
++squelch change is saved as the radio's default squelch, not in the channel. To store a squelch level or always-open
++squelch on one channel, use the codeplug editor's channel **Squelch** field.
+ 
+ A save that fails shows "Couldn't save: ..." and the change stays for now only.
+ 
+diff --git a/docs/user/08-fm.md b/docs/user/08-fm.md
+index 03c133e..558ddc8 100644
+--- a/docs/user/08-fm.md
++++ b/docs/user/08-fm.md
+@@ -38,6 +38,11 @@ radio's levels.
+ The squelch level shows on Home as "SQ" and a number. The radio-wide default is in **Settings > Talk & listen >
+ Default squelch** (5 unless changed).
+ 
++The codeplug editor can also set an FM channel's squelch once: **Radio Default**, a numbered level, or **0 — always
++open**. The last choice keeps that channel's squelch open even with no signal, so continuous noise is expected. A
++quick-settings change is still temporary; **Clear changes**, another channel selection, or a restart returns to the
++channel's stored setting. Channels set to **Radio Default** keep following the radio-wide setting.
++
+ <img src="../ux/screens/160x120i5/quick_fm_squelch.png" width="200" alt="Editing the squelch">
+ 
+ ## Monitor
+diff --git a/site/i18n/en.json b/site/i18n/en.json
+index 0a0b44a..cd677e8 100644
+--- a/site/i18n/en.json
++++ b/site/i18n/en.json
+@@ -1516,6 +1516,7 @@
+  "editor.qdmr.note.location_rounded": "{n} channel locations were written as 6-character grid locators (about 5 km).",
+  "editor.qdmr.note.sfr": "{n} channels' SFR settings.",
+  "editor.qdmr.note.tone_burst": "{n} channels' 1750 Hz tone burst setting.",
++ "editor.qdmr.note.squelch_open": "{n} always-open channel squelch settings; qdmr has no equivalent, so they use the radio default.",
+  "editor.qdmr.note.power_level": "{n} channels' power levels that qdmr does not name; they were saved as the radio's default power.",
+  "editor.qdmr.note.aprs_no_channel": "{n} APRS frequencies with no FM channel on that frequency to name as the APRS channel.",
+  "editor.qdmr.note.settings_area": "Zones and RX group lists the original firmware kept where RadioFoundry now keeps its settings; they are gone from the radio. The backup made when RadioFoundry was installed still has them.",
+@@ -1644,6 +1645,8 @@
+  "editor.power.max": "Maximum",
+  "editor.power.level": "Level {n}",
+  "editor.squelch.default": "Radio Default",
++ "editor.squelch.open": "0 — always open",
++ "editor.squelch.open_help": "The squelch stays open on this channel; continuous noise is expected when there is no signal.",
+  "editor.tot.default": "Radio Default",
+  "editor.alias.off": "Off",
+  "editor.alias.text": "Text",
+diff --git a/site/i18n/es.json b/site/i18n/es.json
+index 0bd898e..3cf10b3 100644
+--- a/site/i18n/es.json
++++ b/site/i18n/es.json
+@@ -1516,6 +1516,7 @@
+  "editor.qdmr.note.location_rounded": "{n} ubicaciones de canal se escribieron como localizadores de cuadrícula de 6 caracteres (unos 5 km).",
+  "editor.qdmr.note.sfr": "Ajustes SFR de {n} canales.",
+  "editor.qdmr.note.tone_burst": "Ráfaga de tono 1750 Hz de {n} canales.",
++ "editor.qdmr.note.squelch_open": "Silenciamiento siempre abierto en {n} canales; qdmr no tiene un equivalente, así que usan el predeterminado de la radio.",
+  "editor.qdmr.note.power_level": "Niveles de potencia de {n} canales que qdmr no nombra; se guardaron como la potencia predeterminada de la radio.",
+  "editor.qdmr.note.aprs_no_channel": "{n} frecuencias APRS sin un canal FM en esa frecuencia que designar como canal APRS.",
+  "editor.qdmr.note.settings_area": "Zonas y listas de grupos RX que el firmware original guardaba donde RadioFoundry guarda ahora los ajustes; ya no están en la radio. La copia de seguridad hecha al instalar RadioFoundry aún las contiene.",
+@@ -1644,6 +1645,8 @@
+  "editor.power.max": "Máxima",
+  "editor.power.level": "Nivel {n}",
+  "editor.squelch.default": "Predeterminado de la radio",
++ "editor.squelch.open": "0 — siempre abierto",
++ "editor.squelch.open_help": "El silenciamiento permanece abierto en este canal; es normal escuchar ruido continuo cuando no hay señal.",
+  "editor.tot.default": "Predeterminado de la radio",
+  "editor.alias.off": "Desactivado",
+  "editor.alias.text": "Texto",
+diff --git a/site/i18n/it.json b/site/i18n/it.json
+index 606386f..1e3fa68 100644
+--- a/site/i18n/it.json
++++ b/site/i18n/it.json
+@@ -1516,6 +1516,7 @@
+  "editor.qdmr.note.location_rounded": "{n} posizioni dei canali sono state scritte come localizzatori a griglia di 6 caratteri (circa 5 km).",
+  "editor.qdmr.note.sfr": "Impostazioni SFR di {n} canali.",
+  "editor.qdmr.note.tone_burst": "Tono di apertura 1750 Hz di {n} canali.",
++ "editor.qdmr.note.squelch_open": "Squelch sempre aperto su {n} canali; qdmr non ha un equivalente, quindi usano il valore predefinito della radio.",
+  "editor.qdmr.note.power_level": "Livelli di potenza di {n} canali che qdmr non nomina; sono stati salvati come potenza predefinita della radio.",
+  "editor.qdmr.note.aprs_no_channel": "{n} frequenze APRS senza un canale FM su quella frequenza da indicare come canale APRS.",
+  "editor.qdmr.note.settings_area": "Zone e liste gruppi RX che il firmware originale conservava dove ora RadioFoundry conserva le impostazioni; non sono più nella radio. Il backup fatto all'installazione di RadioFoundry le contiene ancora.",
+@@ -1644,6 +1645,8 @@
+  "editor.power.max": "Massima",
+  "editor.power.level": "Livello {n}",
+  "editor.squelch.default": "Predefinito della radio",
++ "editor.squelch.open": "0 — sempre aperto",
++ "editor.squelch.open_help": "Lo squelch resta aperto su questo canale; senza segnale è normale sentire rumore continuo.",
+  "editor.tot.default": "Predefinito della radio",
+  "editor.alias.off": "Off",
+  "editor.alias.text": "Testo",
+diff --git a/site/i18n/zh.json b/site/i18n/zh.json
+index 2dcb55b..7bb9713 100644
+--- a/site/i18n/zh.json
++++ b/site/i18n/zh.json
+@@ -1516,6 +1516,7 @@
+  "editor.qdmr.note.location_rounded": "{n} 个信道位置被写成 6 字符网格定位符（约 5 公里）。",
+  "editor.qdmr.note.sfr": "{n} 个信道的单频中继设置。",
+  "editor.qdmr.note.tone_burst": "{n} 个信道的 1750 Hz 突发音设置。",
++ "editor.qdmr.note.squelch_open": "{n} 个信道的静噪设为始终打开；qdmr 没有等效设置，因此改为使用电台默认值。",
+  "editor.qdmr.note.power_level": "{n} 个信道的功率级别 qdmr 无法命名；已保存为电台的默认功率。",
+  "editor.qdmr.note.aprs_no_channel": "{n} 个 APRS 频率上没有该频率的 FM 信道可作为 APRS 信道。",
+  "editor.qdmr.note.settings_area": "原始固件曾把区域和接收组列表存放在 RadioFoundry 现在存放设置的位置；它们已从电台中消失。安装 RadioFoundry 时所做的备份中仍有它们。",
+@@ -1644,6 +1645,8 @@
+  "editor.power.max": "最高",
+  "editor.power.level": "级别 {n}",
+  "editor.squelch.default": "电台默认",
++ "editor.squelch.open": "0 — 始终打开",
++ "editor.squelch.open_help": "此信道的静噪始终打开；无信号时听到持续噪声属于正常现象。",
+  "editor.tot.default": "电台默认",
+  "editor.alias.off": "关闭",
+  "editor.alias.text": "文本",
+diff --git a/site/static/js/codeplug/csv.js b/site/static/js/codeplug/csv.js
+index 654dd6b..50f865c 100644
+--- a/site/static/js/codeplug/csv.js
++++ b/site/static/js/codeplug/csv.js
+@@ -7,7 +7,7 @@
+ // {row, column, code, params}, and the page words them.
+ 
+ import { parseFreq, parseTone, mhz } from "./fields.js";
+-import { LIMITS, POWER_NAMES, CALL_TYPES, validDtmf } from "./records.js";
++import { LIMITS, POWER_NAMES, CALL_TYPES, SQUELCH_OPEN, validDtmf } from "./records.js";
+ import { newChannel, newContact, remove, assignNumbers } from "./model.js";
+ 
+ // --- RFC 4180 ---
+@@ -326,7 +326,7 @@ export const TABLES = {
+ 			}, undefined, ["Bandwidth", "BW"]),
+ 			c("RX Tone", "rxTone", asTone, undefined, ["RX CTCSS/DCS", "Decode", "RX CTCSS"]),
+ 			c("TX Tone", "txTone", asTone, undefined, ["TX CTCSS/DCS", "Encode", "TX CTCSS"]),
+-			c("Squelch", "squelch", asInt(0, 21, 0)),
++			c("Squelch", "squelch", asInt(0, SQUELCH_OPEN, 0)),
+ 			c("Color Code", "colorCode", asInt(0, 15, 1), undefined, ["CC", "Colour Code"]),
+ 			c("Timeslot", "timeslot", asInt(1, 2, 1), undefined, ["TS", "Time Slot", "Slot"]),
+ 			ref("TX Contact", "contact", "contacts", ["Contact"]),
+diff --git a/site/static/js/codeplug/qdmr.js b/site/static/js/codeplug/qdmr.js
+index 182ae35..0b46210 100644
+--- a/site/static/js/codeplug/qdmr.js
++++ b/site/static/js/codeplug/qdmr.js
+@@ -6,7 +6,7 @@
+ // was left out. The mapping was learned from qdmr's manual and from files qdmr writes and reads, never its source.
+ 
+ import { parse, stringify, flow, Tag } from "./yaml.js";
+-import { LIMITS } from "./records.js";
++import { LIMITS, SQUELCH_OPEN } from "./records.js";
+ import { parseTone } from "./fields.js";
+ 
+ export class QdmrError extends Error {
+@@ -414,6 +414,7 @@ export function exportQdmr(m) {
+ 		if (c.useLocation) note("location_rounded");
+ 		if (c.sfr || c.sfrA || c.sfrB) note("sfr");
+ 		if (c.toneBurst && c.mode !== "dmr") note("tone_burst");
++		if (c.mode === "fm" && c.squelch === SQUELCH_OPEN) note("squelch_open");
+ 		const powerName = Object.keys(POWER).find((k) => POWER[k] === c.power);
+ 		if (c.power && !powerName) note("power_level");
+ 		const common = {
+@@ -435,7 +436,8 @@ export function exportQdmr(m) {
+ 		}
+ 		return {
+ 			fm: {
+-				...common, squelch: c.squelch ? Math.min(Math.max(Math.round(c.squelch / 2), 1), 10) : new Tag("!default", ""),
++				...common, squelch: c.squelch && c.squelch !== SQUELCH_OPEN ?
++					Math.min(Math.max(Math.round(c.squelch / 2), 1), 10) : new Tag("!default", ""),
+ 				admit: "Always", rxTone: subTone(c.rxTone), txTone: subTone(c.txTone), bandwidth: c.bw === 25 ? "Wide" : "Narrow",
+ 				aprs: aprsRef, power,
+ 			},
+diff --git a/site/static/js/codeplug/records.js b/site/static/js/codeplug/records.js
+index 1e2bd27..b0dba0a 100644
+--- a/site/static/js/codeplug/records.js
++++ b/site/static/js/codeplug/records.js
+@@ -19,6 +19,8 @@ export const LIMITS = {
+ // --- Layout ---
+ 
+ export const CH_SIZE = 56;
++// 0 keeps the established "radio default" meaning; 22 is RadioFoundry's explicit always-open level 0.
++export const SQUELCH_OPEN = 22;
+ export const DMR_PRIV = { default: 0, aes: 1, basic: 2, enhanced: 3, off: 4 };
+ const DMR_PRIV_BASE = 0x5AA4;
+ const CH_PER_BANK = 128;
+@@ -91,7 +93,7 @@ export function decodeChannel(r, memory = false) {
+ 		allSkip: (f4 & 0x10) !== 0,
+ 		zoneSkip: (f4 & 0x20) !== 0,
+ 		vox: (f4 & 0x40) !== 0,
+-		squelch: r[0x37] <= 21 ? r[0x37] : 10,
++		squelch: r[0x37] <= SQUELCH_OPEN ? r[0x37] : 10,
+ 		colorCode: r[0x2C] & 0x0F,
+ 		timeslot: r[0x31] & 0x40 ? 2 : 1,
+ 		contact: u16(r, 0x2E),
+@@ -141,7 +143,7 @@ export function encodeChannel(c, r, memory = false) {
+ 	putTone(r, 0x22, c.txTone);
+ 	r[0x33] = (r[0x33] & ~0x76) | (c.bw === 25 ? 0x02 : 0) | (c.rxOnly ? 0x04 : 0) | (c.allSkip ? 0x10 : 0) |
+ 		(c.zoneSkip ? 0x20 : 0) | (c.vox ? 0x40 : 0);
+-	r[0x37] = clamp(c.squelch, 0, 21);
++	r[0x37] = clamp(c.squelch, 0, SQUELCH_OPEN);
+ 	r[0x2C] = (r[0x2C] & 0xF0) | (c.colorCode & 0x0F);
+ 	r[0x31] = (r[0x31] & ~0x40) | (c.timeslot === 2 ? 0x40 : 0);
+ 	put16(r, 0x2E, c.contact || 0);
+diff --git a/site/static/js/editor/views.js b/site/static/js/editor/views.js
+index ab8173b..6edb366 100644
+--- a/site/static/js/editor/views.js
++++ b/site/static/js/editor/views.js
+@@ -6,7 +6,7 @@
+ 
+ import { h, button } from "../flasher/dom.js";
+ import { parseFreq, parseTone, mhz } from "../codeplug/fields.js";
+-import { LIMITS, POWER_NAMES, DMR_PRIV } from "../codeplug/records.js";
++import { LIMITS, POWER_NAMES, DMR_PRIV, SQUELCH_OPEN } from "../codeplug/records.js";
+ import { refNumber, listenBand } from "../codeplug/model.js";
+ import { keyValid } from "../codeplug/kv.js";
+ import { kindRow, kindName, offeredKinds } from "../codeplug/modes.js";
+@@ -373,7 +373,9 @@ export function channelForm(m, t, { features = null } = {}) {
+ 		fm(sel("bw", "editor.col.bw", () => [[12.5, "12.5 kHz"], [25, "25 kHz"]])),
+ 		fm(txt("rxTone", "editor.col.rx_tone", tone(t), (v) => v)),
+ 		fm(txt("txTone", "editor.col.tx_tone", tone(t), (v) => v)),
+-		fm(sel("squelch", "editor.col.squelch", () => [[0, t("editor.squelch.default")], ...[...Array(21).keys()].map((n) => [n + 1, String(n + 1)])])),
++		fm(sel("squelch", "editor.col.squelch", () => [[0, t("editor.squelch.default")], [SQUELCH_OPEN, t("editor.squelch.open")],
++			...[...Array(21).keys()].map((n) => [n + 1, String(n + 1)])])),
++		fm({ type: "note", key: "squelchOpen", text: (value, w) => w.squelch === SQUELCH_OPEN ? t("editor.squelch.open_help") : "" }),
+ 		fm(chk("vox", "editor.col.vox")),
+ 		fm(chk("toneBurst", "editor.col.tone_burst")),
+ 		// the signaling ID the channel sends (MDC-1200 PTT ID); when and which ID once a type is chosen
+diff --git a/site/tests/codeplug.test.mjs b/site/tests/codeplug.test.mjs
+index ea5e69b..487dc09 100644
+--- a/site/tests/codeplug.test.mjs
++++ b/site/tests/codeplug.test.mjs
+@@ -155,6 +155,19 @@ function rich() {
+ 	return m;
+ }
+ 
++test("channel squelch 0, levels and always-open survive the binary record unchanged", () => {
++	const c = newChannel({ name: "Monitor" });
++	for (let sq = 0; sq <= 22; sq++) {
++		c.squelch = sq;
++		const r = encodeChannel(c, blankChannel());
++		assert.equal(r[0x37], sq);
++		assert.equal(decodeChannel(r).squelch, sq);
++	}
++	const r = encodeChannel(c, blankChannel());
++	r[0x37] = 23;
++	assert.equal(decodeChannel(r).squelch, 10);
++});
++
+ test("an edited codeplug is read by the radio as written", () => {
+ 	const m = rich();
+ 	const img = encode(m);
+diff --git a/site/tests/csv.test.mjs b/site/tests/csv.test.mjs
+index bc902cb..e0ae710 100644
+--- a/site/tests/csv.test.mjs
++++ b/site/tests/csv.test.mjs
+@@ -65,6 +65,15 @@ test("all tables into a blank codeplug give the same records", () => {
+ 	assert.deepEqual(strip(view(decode(encode(n)))), strip(view(m)));
+ });
+ 
++test("CSV carries the per-channel always-open squelch sentinel", () => {
++	const m = empty();
++	const r = importTable(m, "Name,RX Frequency,Squelch\nMonitor,146.52,22\n", "channels");
++	assert.deepEqual(r.problems, []);
++	assert.equal(m.channels[0].squelch, 22);
++	const row = parse(exportTable(m, "channels"))[1];
++	assert.equal(row[parse(exportTable(m, "channels"))[0].indexOf("Squelch")], "22");
++});
++
+ test("rows match records by number, then name; a renamed contact keeps its channels", () => {
+ 	const m = empty();
+ 	const tg = newContact({ number: 1, name: "TG 91", id: 91 });
+diff --git a/site/tests/editor.test.mjs b/site/tests/editor.test.mjs
+index 946cb53..2397425 100644
+--- a/site/tests/editor.test.mjs
++++ b/site/tests/editor.test.mjs
+@@ -14,6 +14,17 @@ import { Grid } from "../static/js/editor/grid.js";
+ const t = (k) => (k === "editor.tot.default" ? "Radio Default" : k);
+ const field = (key) => channelForm(empty(), t).find((f) => f.key === key);
+ 
++test("channel squelch: explicit zero is distinct from the radio default and carries a noise warning", () => {
++	const f = field("squelch");
++	const opts = f.options({});
++	assert.deepEqual(opts.slice(0, 3).map(([v]) => v), [0, 22, 1]);
++	assert.equal(opts.at(-1)[0], 21);
++	assert.equal(opts[1][1], "editor.squelch.open");
++	const note = channelForm(empty(), t).find((x) => x.key === "squelchOpen");
++	assert.equal(note.text(null, { squelch: 22 }), "editor.squelch.open_help");
++	assert.equal(note.text(null, { squelch: 0 }), "");
++});
++
+ test("channel TX timeout: 0 shows as the radio default, the rest in the 15 s steps the record stores", () => {
+ 	const f = field("tot");
+ 	assert.equal(f.format(0), "Radio Default");
+diff --git a/site/tests/qdmr.test.mjs b/site/tests/qdmr.test.mjs
+index 7b08ed3..04d530a 100644
+--- a/site/tests/qdmr.test.mjs
++++ b/site/tests/qdmr.test.mjs
+@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
+ import { execFileSync, spawnSync } from "node:child_process";
+ 
+ import { CodeplugImage, CODEPLUG_SPAN } from "../static/js/codeplug/image.js";
+-import { decode, encode, empty } from "../static/js/codeplug/model.js";
++import { decode, encode, empty, newChannel } from "../static/js/codeplug/model.js";
+ import { parse, stringify, flow, Tag, YamlError } from "../static/js/codeplug/yaml.js";
+ import { importQdmr, exportQdmr, QdmrError, parseFrequency, parseDuration, fromLocator, toLocator } from "../static/js/codeplug/qdmr.js";
+ import { convertersFor } from "../static/js/flasher/codeplug.js";
+@@ -303,6 +303,17 @@ test("export: model to YAML to model keeps every field qdmr has", () => {
+ 	assert.deepEqual(m2.general, m.general);
+ });
+ 
++test("export: always-open squelch becomes qdmr's default with an explicit conversion note", () => {
++	const m = empty();
++	m.channels.push(newChannel({ name: "Monitor", squelch: 22 }));
++	const { text, notes } = exportQdmr(m);
++	assert.match(text, /squelch: !default ""/);
++	assert.deepEqual(notes, [{ code: "squelch_open", n: 1 }]);
++	const back = empty();
++	importQdmr(back, text);
++	assert.equal(back.channels[0].squelch, 0);
++});
++
+ test("export: cpsSim's codeplug round-trips through YAML", () => {
+ 	const m = sim();
+ 	const { text, notes } = exportQdmr(m);
+diff --git a/tests/host/codeplugTest.c b/tests/host/codeplugTest.c
+index 2b501a7..124fa56 100644
+--- a/tests/host/codeplugTest.c
++++ b/tests/host/codeplugTest.c
+@@ -1021,6 +1021,32 @@ static void test_channel_names(void)
+ 	CHECK(codeplug_zone_name(0, name) && strcmp(name, "All channels") == 0 && !codeplug_zone_name(1, name));
+ }
+ 
++// The FM channel's squelch byte: the established default and levels round-trip, 22 is always open, and unknown
++// values retain the old fallback (open-firmware-cps.md 7.3.3)
++static void test_channel_squelch(void)
++{
++	uint8_t rec[CODEPLUG_OPENFW_CHANNEL_SIZE];
++	channel_t ch, back;
++	memset(rec, 0xFF, sizeof(rec));
++	memset(&ch, 0, sizeof(ch));
++	strcpy(ch.name, "Monitor");
++	ch.rx_hz = ch.tx_hz = 146520000;
++	ch.mode = RADIO_MODE_FM;
++	ch.timeslot = 1;
++	ch.power = CODEPLUG_POWER_DEFAULT;
++	for (uint8_t sq = 0; sq <= CODEPLUG_SQUELCH_OPEN; sq++) {
++		ch.squelch = sq;
++		codeplug_openfw_encode(&ch, rec);
++		CHECK(rec[0x37] == sq);
++		CHECK(codeplug_openfw_decode(rec, &back) && back.squelch == sq);
++	}
++	rec[0x37] = CODEPLUG_SQUELCH_OPEN + 1u;
++	CHECK(codeplug_openfw_decode(rec, &back) && back.squelch == 10);
++	ch.squelch = CODEPLUG_SQUELCH_OPEN + 1u;
++	codeplug_openfw_encode(&ch, rec);
++	CHECK(rec[0x37] == 10);
++}
++
+ // An FM channel's signaling ID in the per-channel DMR ID bytes (open-firmware-cps.md 7.3.3.2)
+ static void test_fm_signaling_id(void)
+ {
+@@ -1088,6 +1114,7 @@ int main(void)
+ 		return 1;
+ 	}
+ 	test_openfw();
++	test_channel_squelch();
+ 	test_fm_signaling_id();
+ #if CONFIG_APRS
+ 	test_aprs_records();
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 9896354..8fce21c 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -1125,6 +1125,50 @@ static void test_squelch(void)
+ 	CHECK(sm.view.state == RS_IDLE && !hw.audio);
+ }
+ 
++// A stored channel squelch wins over the radio default. Zero is explicitly always open, temporary changes clear
++// back to it, and the codeplug's 1-21 scale maps onto the radio's 1-9 control.
++static void test_channel_squelch(void)
++{
++	setup_codeplug();
++	chans[1].squelch = CODEPLUG_SQUELCH_OPEN;
++	start();
++	CHECK(sm.view.squelch == 0 && !sm.view.temporary);
++	rx_signal(UINT8_MAX, true);
++	poll_for(RADIO_POLL_MS);
++	CHECK(sm.view.state == RS_RX && hw.audio);
++	boot();
++	CHECK(sm.view.squelch == 0 && !sm.view.temporary);
++
++	req(RREQ_ZONE_POS, 1);		// a default channel still follows the radio setting
++	CHECK(sm.view.squelch == RADIO_SQUELCH_DEFAULT);
++	req(RREQ_ZONE_POS, 0);
++	CHECK(sm.view.squelch == 0);
++	req(RREQ_SQUELCH, 1);
++	CHECK(sm.view.squelch == 1 && sm.view.temporary);
++	req(RREQ_SQUELCH, -1);		// back at the channel's own zero: no temporary change left
++	CHECK(sm.view.squelch == 0 && !sm.view.temporary);
++	req(RREQ_SQUELCH, 1);
++	req(RREQ_CLEAR_TEMP, 0);
++	CHECK(sm.view.squelch == 0 && !sm.view.temporary);
++
++	chans[1].squelch = 4;
++	req(RREQ_ZONE_POS, 1);
++	req(RREQ_ZONE_POS, 0);
++	CHECK(sm.view.squelch == 2);
++	chans[1].squelch = 21;
++	req(RREQ_ZONE_POS, 1);
++	req(RREQ_ZONE_POS, 0);
++	CHECK(sm.view.squelch == RADIO_SQUELCH_MAX);
++	chans[1].squelch = CODEPLUG_SQUELCH_DEFAULT;
++	req(RREQ_ZONE_POS, 1);
++	req(RREQ_ZONE_POS, 0);
++	CHECK(sm.view.squelch == RADIO_SQUELCH_DEFAULT && !sm.view.temporary);
++	chans[4].squelch = CODEPLUG_SQUELCH_OPEN;	// an unused byte on a digital channel changes nothing
++	req(RREQ_ZONE_POS, 3);
++	CHECK(sm.view.ch.mode == RADIO_MODE_DMR && sm.view.squelch == RADIO_SQUELCH_DEFAULT);
++	setup_codeplug();
++}
++
+ static void test_tx(void)
+ {
+ 	setup_codeplug();
+@@ -10634,6 +10678,7 @@ int main(int argc, char **argv)
+ 	test_channel_step();
+ 	test_vfo_step_auto();
+ 	test_squelch();
++	test_channel_squelch();
+ 	test_parked_kind();
+ 	test_tx();
+ 	test_deny_flash_then_tx();

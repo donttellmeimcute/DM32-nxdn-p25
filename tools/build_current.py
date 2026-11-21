@@ -34,6 +34,8 @@ PATCHES = (
 	'mdc1200-ptt-id.patch',
 	'mdc1200-decode.patch',
 	'mdc1200-editor.patch',
+	# Per-channel FM squelch, including an explicit always-open level 0
+	'channel-squelch.patch',
 )
 
 
