@@ -1,0 +1,32 @@
+diff --git a/site/static/js/editor/app.js b/site/static/js/editor/app.js
+index b4bd25f..fcd9edf 100644
+--- a/site/static/js/editor/app.js
++++ b/site/static/js/editor/app.js
+@@ -323,8 +323,8 @@ function bulkSet(tab, g) {
+ 	const rows = g.selection();
+ 	const cols = bulkColumns(tab, S.model, t, { features: features() });
+ 	if (!cols.length) return;
+-	const pickCol = h("select", {}, ...cols.map((c, i) => h("option", { value: String(i) }, c.label)));
+-	const slot = h("div");
++	const pickCol = h("select", { id: "bulk-field" }, ...cols.map((c, i) => h("option", { value: String(i) }, c.label)));
++	const slot = h("div", { class: "form-row" });
+ 	const errs = h("p", { class: "notice bad", hidden: true });
+ 	let input;
+ 	const fill = () => {
+@@ -336,11 +336,14 @@ function bulkSet(tab, g) {
+ 		} else if (c.type === "bool") {
+ 			input = h("select", {}, h("option", { value: "1" }, t("editor.yes")), h("option", { value: "0" }, t("editor.no")));
+ 		} else input = h("input", { type: "text" });
+-		slot.replaceChildren(h("label", {}, t("editor.value"), input));
++		input.id = "bulk-value";
++		slot.replaceChildren(h("label", { for: "bulk-value" }, t("editor.value")), input);
+ 	};
+ 	pickCol.addEventListener("change", fill);
+ 	fill();
+-	dialog(t("editor.bulk_edit_n", { n: rows.length }), [h("label", {}, t("editor.field"), pickCol), slot, errs], t("editor.apply"), (close) => {
++	const fields = h("div", { class: "form-grid form-list" },
++		h("div", { class: "form-row" }, h("label", { for: "bulk-field" }, t("editor.field")), pickCol), slot);
++	dialog(t("editor.bulk_edit_n", { n: rows.length }), [fields, errs], t("editor.apply"), (close) => {
+ 		const c = cols[pickCol.selectedIndex];
+ 		const v = c.type === "select" ? input._opts[input.selectedIndex][0] : c.type === "bool" ? input.value === "1" : input.value;
+ 		let err = null;

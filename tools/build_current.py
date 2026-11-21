@@ -38,6 +38,8 @@ PATCHES = (
 	'channel-squelch.patch',
 	# Bulk Edit RX Only: apply to every selected row and close without a false Boolean error
 	'rxonly-bulk-edit.patch',
+	# Bulk Edit: keep Field and Value in labelled form rows, not underneath their selectors
+	'bulk-edit-dialog.patch',
 	# Quick menu: NAC/RAN/DG-ID and talk group/destination selectors on P25, NXDN and YSF channels
 	'quick-digital-selectors.patch',
 	# Host tests: the VFO AES flows need CONFIG_AIR_AES (the NoColor build has no air modes)
