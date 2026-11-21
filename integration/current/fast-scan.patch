@@ -1,0 +1,180 @@
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -82,7 +82,8 @@
+ #define RADIO_RSSI_HOLD_POLLS	((RADIO_RSSI_HOLD_MS + RADIO_POLL_MS - 1) / RADIO_POLL_MS)
+ 
+ // Scan defaults and per-stop timing (docs/spec/radio-features.md 2)
+-#define RADIO_SCAN_DWELL_MS	150	// listen per channel (from the retune) with nothing heard
++#define RADIO_SCAN_DWELL_MS	75	// empty-channel dwell after the receiver settle
++#define RADIO_SCAN_DUAL_MIN_DWELL_MS 150	// dual watch keeps a full receiver visit on each channel
+ #define RADIO_SCAN_FM_PROBE_MS	350	// FM: a carrier without the RX tone yet (CTCSS detection takes 100-250 ms)
+ #define RADIO_SCAN_DMR_PROBE_MS	700	// DMR: a carrier, waiting for bursts with the channel's color code (they come
+ 					// within a superframe of the modem's lock)
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -4428,6 +4428,8 @@
+ 		cfg->resume = SCAN_RESUME_CARRIER;	// a signal holds dual watch; it doesn't end it
+ 	}
+ 	if (kind == SCAN_DUAL) {
++		if (cfg->dwell_ms < RADIO_SCAN_DUAL_MIN_DWELL_MS)
++			cfg->dwell_ms = RADIO_SCAN_DUAL_MIN_DWELL_MS;
+ 		cfg->delay_ms = sm->set.dual_delay_ms;
+ 	}
+ }
+@@ -7443,6 +7445,10 @@
+ 	s->scan_hold_s = st->rs_scan_hold_s;
+ 	s->scan_delay_ms = st->rs_scan_delay_ms;
+ 	s->scan_dwell_ms = st->rs_scan_dwell_ms;
++	// Records written before the fast-scan default have no marker. Migrate
++	// only their legacy default; every other saved value is the user's choice.
++	if (!(st->rs_flags & SETTINGS_RS_SCAN_DWELL_SET) && s->scan_dwell_ms == 150u)
++		s->scan_dwell_ms = RADIO_SCAN_DWELL_MS;
+ 	s->beep_level = st->rs_beep_level;
+ 	s->vox = st->rs_vox;
+ 	s->vox_level = st->rs_vox_level;
+@@ -7465,7 +7471,7 @@
+ 	st->rs_flags = (uint8_t)((s->roger_beep ? SETTINGS_RS_ROGER_BEEP : 0) | (s->tx_inhibit ? SETTINGS_RS_TX_INHIBIT : 0) |
+ 				 (s->scan_priority ? SETTINGS_RS_SCAN_PRIORITY : 0) |
+ 				 (s->scan_beep ? SETTINGS_RS_SCAN_BEEP : 0) | (s->key_beep ? SETTINGS_RS_KEY_BEEP : 0) |
+-				 (s->talk_permit ? 0 : SETTINGS_RS_NO_TALK_PERMIT));
++				 (s->talk_permit ? 0 : SETTINGS_RS_NO_TALK_PERMIT) | SETTINGS_RS_SCAN_DWELL_SET);
+ 	st->rs_scan_resume = s->scan_resume;
+ 	st->rs_scan_hold_s = s->scan_hold_s;
+ 	st->rs_scan_delay_ms = s->scan_delay_ms;
+--- a/core/settings/settings.h
++++ b/core/settings/settings.h
+@@ -411,6 +411,7 @@
+ #define SETTINGS_RS_SCAN_BEEP		0x08u
+ #define SETTINGS_RS_KEY_BEEP		0x10u
+ #define SETTINGS_RS_NO_TALK_PERMIT	0x20u	// the talk permit tone off (0 = on, as before)
++#define SETTINGS_RS_SCAN_DWELL_SET	0x40u	// dwell saved explicitly; old records migrate the legacy 150 ms default
+ // settings_t.rpt_beacon (taken with the roam_ fields)
+ #define SETTINGS_RPT_BEACON		0x01u	// our repeater roles key an idle beacon
+ #define SETTINGS_RPT_SFR_RX		0x06u	// an SFR user channel hears: 0 the repeat, 1 both (first), 2 both (dual-path RX)
+--- a/tests/host/radioFeaturesTest.c
++++ b/tests/host/radioFeaturesTest.c
+@@ -1182,9 +1182,15 @@
+ static void test_scan_ptt_and_modes(void)
+ {
+ 	start();
+-	// PTT while still searching: back to the start channel, transmit there
++	// Empty channels use the fast 75 ms default: three polls after the retune,
++	// the scan is already on the next stop. Signal probes are tested below.
+ 	req(RREQ_SCAN, RSCAN_ZONE);
+-	run(300);
++	run(50);
++	CHECK(sm.view.zone_pos == 1);
++	run(25);
++	CHECK(sm.view.zone_pos == 4);
++	// PTT while still searching: back to the start channel, transmit there
++	run(25);
+ 	CHECK(sm.view.zone_pos != 0);
+ 	req(RREQ_PTT, 1);
+ 	CHECK(sm.view.scan == SCAN_OFF && sm.view.zone_pos == 0 && sm.view.state == RS_TX && hw.tx_hz == 146520000);
+@@ -1425,7 +1431,9 @@
+ 	CHECK(sm.view.zone_pos == 5);
+ 	run(1000);
+ 	CHECK(sm.view.scan_phase == SCAN_PH_RESUME);
+-	run(1500);
++	run(900);
++	CHECK(sm.view.zone_pos == 5 && sm.view.scan_phase == SCAN_PH_RESUME);
++	run(150);
+ 	CHECK(sm.view.zone_pos != 5);
+ 	req(RREQ_SCAN, RSCAN_STOP);
+ 	hw.sig[0].hz = 0;
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -2935,13 +2935,28 @@
+ 	radio_sm_set_settings(&sm, &rs, now);
+ 	settings_t cur;
+ 	settings_read(&cur);
+-	CHECK(cur.rs_stored == 1 && cur.rs_tot_s == 45 && cur.rs_vox_level == 10);
++	CHECK(cur.rs_stored == 1 && cur.rs_tot_s == 45 && cur.rs_vox_level == 10 &&
++	      (cur.rs_flags & SETTINGS_RS_SCAN_DWELL_SET));
+ 	boot();
+ 	CHECK(sm.set.tot_s == 45 && !sm.set.key_beep && sm.set.roger_beep && sm.set.vox_level == 10);
++	// An old record's legacy 150 ms default migrates to the fast default;
++	// explicitly saving 150 ms after that keeps the user's choice.
++	st = settings_begin();
++	st->rs_flags &= (uint8_t)~SETTINGS_RS_SCAN_DWELL_SET;
++	st->rs_scan_dwell_ms = 150;
++	settings_end(now);
++	boot();
++	CHECK(sm.set.scan_dwell_ms == RADIO_SCAN_DWELL_MS && RADIO_SCAN_DWELL_MS == 75);
++	rs = sm.set;
++	rs.scan_dwell_ms = 150;
++	radio_sm_set_settings(&sm, &rs, now);
++	boot();
++	CHECK(sm.set.scan_dwell_ms == 150);
+ 	settings_begin()->rs_stored = 0;	// never set: the defaults
+ 	settings_end(now);
+ 	boot();
+-	CHECK(sm.set.tot_s == RADIO_TOT_DEFAULT_S && sm.set.key_beep && !sm.set.roger_beep);
++	CHECK(sm.set.tot_s == RADIO_TOT_DEFAULT_S && sm.set.key_beep && !sm.set.roger_beep &&
++	      sm.set.scan_dwell_ms == RADIO_SCAN_DWELL_MS);
+ 
+ 	// The DMR data service's settings: saved when they change, back after a reboot
+ 	dmrDataSettings_t ds;
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -636,7 +636,7 @@
+ 	wait_idle();
+ 	CHECK(sm.scan.kind == SCAN_DUAL && sm.scan.phase == SCAN_PH_LISTEN &&
+ 	      sm.dual_at == 1 && hw.rx_hz == CH2_HZ && !hw.keyed);
+-	run(RADIO_SCAN_DWELL_MS + RADIO_POLL_MS);
++	run(RADIO_SCAN_DUAL_MIN_DWELL_MS + RADIO_POLL_MS);
+ 	CHECK(sm.dual_at == 0 && hw.rx_hz == CH_HZ);
+ 	run(5000);
+ 	CHECK(sm.scan.kind == SCAN_DUAL && sm.scan.steps > steps);
+@@ -696,7 +696,7 @@
+ 	req(RREQ_POWER, 1);	// abort without ending the watch or keying PTT
+ 	CHECK(sm.aprs_phase == 0 && sm.scan.kind == SCAN_DUAL && sm.scan.phase == SCAN_PH_LISTEN && !hw.keyed);
+ 	CHECK(hw.rx_hz == (at == 0 ? CH_HZ : CH2_HZ));
+-	run(RADIO_SCAN_DWELL_MS + RADIO_POLL_MS);
++	run(RADIO_SCAN_DUAL_MIN_DWELL_MS + RADIO_POLL_MS);
+ 	CHECK(sm.dual_at != at);
+ }
+ #endif
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -31,7 +31,7 @@
+ | `scan_resume` | carrier | time (move on after `scan_hold_s` on a signal, or when it ends), carrier (move on `scan_delay_ms` after it ends), stop (the scan ends on the first signal) |
+ | `scan_hold_s` | 5 | time mode's hold |
+ | `scan_delay_ms` | 2000 | wait after a signal ends before moving on (a pause between overs) |
+-| `scan_dwell_ms` | 150 | listen time per channel with nothing heard (at least 50) |
++| `scan_dwell_ms` | 75 | listen time per channel with nothing heard (at least 50) |
+ | `scan_priority` | off | zone scan: the start channel again after every 2 others |
+ | `scan_beep` | off | a short beep when the scan stops on a signal |
+ | `dual_delay_ms` | 1000 | dual watch on one receiver: its wait after a signal ends, in place of `scan_delay_ms` (0-10000; section 2.1) |
+@@ -100,7 +100,8 @@
+ ### 2.1 Dual watch
+ 
+ On a radio with one receiver, dual watch alternates it between two channels with the scan's timing (a pseudo dual
+-watch). A radio with a second receiver (2.2) hears both at once. `radio_req_dual(ref, sel)` names the two, A and B: each a
++watch), but keeps at least 150 ms per receiver visit when the scan dwell is faster. A radio with a second receiver
++(2.2) hears both at once. `radio_req_dual(ref, sel)` names the two, A and B: each a
+ channel (zone index and position, any zone) or a VFO with its own settings. `ref[sel]` is the selected channel.
+ `NULL` stops the watch on the selected channel. The view shows `scan=dual`, and the tuned channel as usual: its
+ `zone_index`, `zone_pos` and zone name, or `vfo=1` and `vfo_index`, so the screens can tell which of the two the
+--- a/docs/spec/settings-store.md
++++ b/docs/spec/settings-store.md
+@@ -138,7 +138,7 @@
+ | preferences | `brightness`, `backlight_s`, `beeps` (0 or 1), `hotspot_allowed`, `master_power`, `usb_mode` (the USB personality at power-on: 0 serial, 1 network; `usb-network.md` 1), `accent` (in the old `reserved1`'s first byte: bits 0-2 the highlight color, 0 the theme's own, 1 red, 2 orange, 3 yellow, 4 teal, 5 light blue, 6 purple, 7 pink; bit 3 set: the status strip not filled; bits 4-5 the crash report mode; bits 6-7 the vocoder's mic options, bit 6 noise reduction off and bit 7 AGC on (`dmr-voice.md` 6), so a record from before them reads as noise reduction on and AGC off; 0 = the defaults, the theme's highlight and the strip filled with it; `ui.md` 8) |
+ | identity | `unused_dmr_id` (was an own DMR ID override; ignored: the own ID is the codeplug's, which Settings > My radio writes), `radio_name[16]` ("" = the codeplug's callsign) |
+ | privacy keys | `privacy_key[4]`, `privacy_type[4]`, `privacy_active` (appended for dmr-voice) |
+-| radio core settings | `rs_tot_s rs_tot_warn_s rs_bcl rs_flags` (roger beep, TX inhibit, scan priority, scan beep, key beep, no talk permit tone: 0 = on, as before) `rs_scan_resume rs_scan_hold_s rs_beep_level rs_scan_delay_ms rs_scan_dwell_ms rs_vox rs_vox_level rs_vox_tail_ms rs_rx_save rs_stored rs_rx_save_idle_s rs_battery_off_s rs_backlight_dim_s rs_backlight_off_s` (appended for radio-features) |
++| radio core settings | `rs_tot_s rs_tot_warn_s rs_bcl rs_flags` (roger beep, TX inhibit, scan priority, scan beep, key beep, no talk permit tone: 0 = on, as before; bit 6 `SETTINGS_RS_SCAN_DWELL_SET`: the dwell was saved with the fast-scan firmware, so an old record without it migrates only the legacy 150 ms default to 75 ms) `rs_scan_resume rs_scan_hold_s rs_beep_level rs_scan_delay_ms rs_scan_dwell_ms rs_vox rs_vox_level rs_vox_tail_ms rs_rx_save rs_stored rs_rx_save_idle_s rs_battery_off_s rs_backlight_dim_s rs_backlight_off_s` (appended for radio-features) |
+ | DMR data settings | `ds_ars_server ds_flags` (radio check reply, call alert ACK, LRRP reply, SMS format ETSI short data, radio check ETSI form, UDP compression off, UDP compression all, SMS format ETSI IP text) `ds_stored` (appended for dmr-data; the ETSI bits for dmr-ext and dispatch, 0 = as before: a record with neither SMS format bit sends TMS, while the default without a record is ETSI IP text, `dmr-data.md` 8), `ds_ip_cnf` (in the old reserved4: confirmed IP tries in bits 0-3, 0 = the default 4; bits 4-5 0 rules, 1 off, 2 all; bit 6 set: the radio check reply bit is the user's choice, clear: a record from before the reply default became On, which answers) and `ds_ip_rule[2]` (appended at the end for sap3: 0 unused, a radio ID, or 0x80000000 \| a UDP port); the two compression bits 0 = auto ([dmr-data.md](dmr-data.md) 11, 12). Page 1: `ds_ip_gateway`, the IP gateway's off-net route (`ipGatewayId`: a gateway radio's DMR ID in bits 0-23, 0 = off-net packets dropped; a record without it reads 0, as before; [usb-network.md](usb-network.md) 3.1) |
+ | UI settings | `rs_reply_s` (the reply window in s, 0..30; `SETTINGS_UNSET8` = the codeplug's hang times; a radio core setting), `mic_gain` (0..10, default 5 = the board's levels; `radio_set_mic_gain`, radio-features.md 3.6), `auto_lock_s` (0 = off), `long_press_ms`, `repeat_ms` (0 = the input layer's defaults), `gps` (Settings > Location > GPS: `ui_svc_apply` hands it to `board_gps_enable` and `position_gps_enable`, at start-up and on each change, see position.md 2), `pos_format`, `pos_send_s` (stored for a GPS owner, act on nothing yet) (appended for glue) |
+ | DMR emergency | `em_dst em_mode em_flags` (target is a radio, ETSI alarm FID, no alert tone) `em_alarm_tries em_hot_mic_s em_stored` (appended for dmr-ext, `dmr-emergency.md` 5) |
+--- a/docs/user/12-scan.md
++++ b/docs/user/12-scan.md
+@@ -22,7 +22,7 @@
+ 
+ - The scan visits the zone's channels in order, from the one it started on. It skips empty positions and channels
+   the codeplug marks to skip. FM, DMR, P25 and NXDN channels can be mixed. P25 trunked channels are skipped.
+-- On each channel it listens for 150 ms. An FM channel stops the scan when the squelch opens (with the channel's tone,
++- On each empty channel it listens for 75 ms. An FM channel stops the scan when the squelch opens (with the channel's tone,
+   if it needs one). A DMR, P25 or NXDN channel stops it when the radio plays a call. On a signal it listens up to
+   1.5 s for a call it would play.
+ - Turn on [digital monitor](09-dmr.md) before you start the scan to stop on a call to any talkgroup, not only
