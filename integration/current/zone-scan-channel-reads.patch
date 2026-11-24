@@ -1,0 +1,107 @@
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index cdc124e..b17b6cd 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -4335,12 +4335,17 @@ static bool scan_listens(const channel_t *ch, uint16_t number)
+ 	return true;
+ }
+ 
++typedef struct {
++	const radio_sm_t *sm;
++	channel_t ch;
++} scan_zone_channel_t;
++
+ static bool scan_usable(uint16_t pos, void *ctx)
+ {
+-	const radio_sm_t *sm = ctx;
+-	channel_t ch;
+-	return pos < sm->zone.count && channel_read(sm->zone.channels[pos], &ch) && !ch.scan_skip &&
+-	       scan_listens(&ch, sm->zone.channels[pos]);
++	scan_zone_channel_t *candidate = ctx;
++	const zone_t *zone = &candidate->sm->zone;
++	return pos < zone->count && channel_read(zone->channels[pos], &candidate->ch) && !candidate->ch.scan_skip &&
++	       scan_listens(&candidate->ch, zone->channels[pos]);
+ }
+ 
+ // Dual watch (SCAN_DUAL): the receiver alternates between two channels, dual[0] and dual[1], skip flags ignored. With
+@@ -4789,13 +4794,13 @@ static bool scan_step(radio_sm_t *sm, uint32_t now_ms)
+ 		vfo_set_hz(sm, hz);
+ 		tune(sm, now_ms);
+ 	} else {
+-		int pos = scan_next_pos(sc, sm->zone.count, scan_usable, sm);
+-		channel_t ch;
+-		if (pos < 0 || !channel_read(sm->zone.channels[pos], &ch)) {
++		scan_zone_channel_t candidate = { .sm = sm };
++		int pos = scan_next_pos(sc, sm->zone.count, scan_usable, &candidate);
++		if (pos < 0) {
+ 			scan_stop(sm, false, now_ms);
+ 			return false;
+ 		}
+-		set_channel(sm, (uint16_t)pos, &ch);
++		set_channel(sm, (uint16_t)pos, &candidate.ch);
+ 		tune(sm, now_ms);
+ 	}
+ 	scan_tuned(sc, now_ms);
+@@ -4895,7 +4900,8 @@ static void scan_start(radio_sm_t *sm, uint8_t kind, uint32_t lo_hz, uint32_t hi
+ 	if (kind != SCAN_VFO) {
+ 		// Nothing to scan when no other channel qualifies
+ 		scan_t probe = *sc;
+-		int next = scan_next_pos(&probe, sm->zone.count, scan_usable, sm);
++		scan_zone_channel_t candidate = { .sm = sm };
++		int next = scan_next_pos(&probe, sm->zone.count, scan_usable, &candidate);
+ 		if (next < 0 || next == sm->view.zone_pos) {
+ 			scan_end(sc);
+ 			return;
+diff --git a/core/radio/scan.c b/core/radio/scan.c
+index d8d5b91..796d360 100644
+--- a/core/radio/scan.c
++++ b/core/radio/scan.c
+@@ -216,8 +216,8 @@ int scan_next_pos(scan_t *s, uint16_t count, scan_usable_fn usable, void *ctx)
+ 	if (count == 0) {
+ 		return -1;
+ 	}
+-	bool origin_ok = s->origin_pos < count && pos_ok(s, s->origin_pos, usable, ctx);
+-	if (s->cfg.priority && origin_ok && s->since_priority >= SCAN_PRIORITY_EVERY) {
++	bool priority_due = s->cfg.priority && s->since_priority >= SCAN_PRIORITY_EVERY;
++	if (priority_due && s->origin_pos < count && pos_ok(s, s->origin_pos, usable, ctx)) {
+ 		s->since_priority = 0;
+ 		return s->origin_pos;
+ 	}
+@@ -234,7 +234,7 @@ int scan_next_pos(scan_t *s, uint16_t count, scan_usable_fn usable, void *ctx)
+ 			return p;
+ 		}
+ 	}
+-	if (origin_ok) {
++	if (s->cfg.priority && !priority_due && s->origin_pos < count && pos_ok(s, s->origin_pos, usable, ctx)) {
+ 		s->since_priority = 0;
+ 		return s->origin_pos;	// priority on and the start channel is the only one left
+ 	}
+diff --git a/tests/host/radioFeaturesTest.c b/tests/host/radioFeaturesTest.c
+index d365416..c07bff9 100644
+--- a/tests/host/radioFeaturesTest.c
++++ b/tests/host/radioFeaturesTest.c
+@@ -526,6 +526,13 @@ static void set_tot(radio_settings_t *s);
+ 
+ static bool all_usable(uint16_t pos, void *ctx) { (void)ctx; return pos != 3; }
+ 
++static bool count_usable(uint16_t pos, void *ctx)
++{
++	unsigned *reads = ctx;
++	reads[pos]++;
++	return true;
++}
++
+ static void test_scan_engine(void)
+ {
+ 	scan_t s;
+@@ -537,7 +544,9 @@ static void test_scan_engine(void)
+ 	CHECK(scan_on(&s) && s.phase == SCAN_PH_LISTEN && s.sweep_pos == 1);
+ 
+ 	// Positions: 3 is unusable; the sweep wraps
+-	CHECK(scan_next_pos(&s, 6, all_usable, NULL) == 2);
++	unsigned reads[6] = {0};
++	CHECK(scan_next_pos(&s, 6, count_usable, reads) == 2);
++	CHECK(reads[1] == 0 && reads[2] == 1);
+ 	CHECK(scan_next_pos(&s, 6, all_usable, NULL) == 4);
+ 	CHECK(scan_next_pos(&s, 6, all_usable, NULL) == 5);
+ 	CHECK(scan_next_pos(&s, 6, all_usable, NULL) == 0);

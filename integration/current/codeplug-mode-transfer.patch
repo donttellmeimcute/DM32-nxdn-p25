@@ -1,0 +1,182 @@
+diff --git a/docs/spec/codeplug-settings.md b/docs/spec/codeplug-settings.md
+index 79473ae..625df15 100644
+--- a/docs/spec/codeplug-settings.md
++++ b/docs/spec/codeplug-settings.md
+@@ -315,6 +315,7 @@ to a radio it sends (`areaForWrite`):
+ | The edit changed no key | The radio's own. A file opened before the radio's menu changed a key doesn't put the old value back |
+ | The edit changed keys and the radio has a valid area | The radio's area with only those keys set or removed. Every other key keeps the radio's value |
+ | The edit changed keys and the radio has no valid area | The file's area |
++| A saved codeplug with channel modes or systems is written to another radio | Its channel tags, systems and associated records follow the channels. Mode settings supplied by the file follow them. Unrelated keys on the radio are kept. A newer settings area stops the write |
+ 
+ ## 8. The native codeplug
+ 
+diff --git a/site/static/js/codeplug/channelmodes.js b/site/static/js/codeplug/channelmodes.js
+index 0d27554..5f38814 100644
+--- a/site/static/js/codeplug/channelmodes.js
++++ b/site/static/js/codeplug/channelmodes.js
+@@ -34,6 +34,16 @@ const TAG_HDR = 5, TAG_FB = 4, SYS_HDR = 28, ENTRY_HDR = 4;
+ const inFamily = (key, base, count) => key >= base && key < base + count;
+ const find = (list, n) => list.find((x) => x.number === n) || n;
+ 
++// Tags and their systems travel with a codeplug opened from a file. Apply mode settings
++// supplied by the file too, while keeping the destination settings the file omits.
++export function channelModeRecord(key, value) {
++	return inFamily(key, MODE_KEY.tag, MODE_LIMITS.tags) ||
++		inFamily(key, MODE_KEY.system, MODE_LIMITS.systems) ||
++		inFamily(key, MODE_KEY.entry, MODE_LIMITS.entries) ||
++		inFamily(key, MODE_KEY.secret, MODE_LIMITS.systems) ||
++		(value != null && KINDS.some((kind) => kind.module.settings && key === MODE_KEY.setting + kind.id));
++}
++
+ // --- Bytes ---
+ 
+ // A tag (2.1): {kind, system, check, flags, fbChan, fbCheck, params}; null when the value is no tag
+diff --git a/site/static/js/codeplug/kv.js b/site/static/js/codeplug/kv.js
+index 319a265..a2a7b42 100644
+--- a/site/static/js/codeplug/kv.js
++++ b/site/static/js/codeplug/kv.js
+@@ -186,21 +186,25 @@ const sameBytes = (a, b) => a === b || (a != null && b != null && a.length === b
+ // - The edit changed it and the radio has a valid area: the radio's area with only the keys the edit changed, set or
+ //   removed. A key the radio's menu or debug link changed since the file was read keeps the radio's value.
+ // - The radio has no valid area, or no base is given (a file sent as it is): the file's.
++// copyRecord identifies file-owned records to apply even when unchanged from base.
+ // Throws RangeError when the radio's keys and the edit's don't fit together
+-export function areaForWrite(file, radio, base = null) {
++export function areaForWrite(file, radio, base = null, copyRecord = null) {
+ 	const sector = (b) => b.subarray(KV_ADDR, KV_ADDR + KV_SIZE);
+ 	const f = decodeArea(file), r = decodeArea(radio);
+ 	const edited = !base || !sector(file).every((x, i) => x === sector(base)[i]);
+-	if (r.state === "newer" || !edited || f.state !== "valid") {
++	if (r.state === "newer" && copyRecord) {
++		throw new RangeError("The radio's codeplug settings format is newer and cannot store the selected channel modes.");
++	}
++	if (r.state === "newer" || (!edited && !copyRecord) || f.state !== "valid") {
+ 		sector(file).set(sector(radio));
+ 		return;
+ 	}
+ 	if (!base || r.state !== "valid") return;
+ 	const was = decodeArea(base).entries;
+ 	let entries = dedupe(r.entries);
+-	for (const key of new Set([...was, ...f.entries].map((e) => e.key))) {
++	for (const key of new Set([...was, ...f.entries, ...(copyRecord ? r.entries : [])].map((e) => e.key))) {
+ 		const now = getValue(f.entries, key);
+-		if (sameBytes(getValue(was, key), now)) continue;
++		if (!copyRecord?.(key, now) && sameBytes(getValue(was, key), now)) continue;
+ 		entries = now == null ? deleteValue(entries, key) : setValue(entries, key, now);
+ 	}
+ 	sector(file).set(encodeArea(entries, sector(radio)));
+diff --git a/site/static/js/editor/app.js b/site/static/js/editor/app.js
+index 5a6beca..0008267 100644
+--- a/site/static/js/editor/app.js
++++ b/site/static/js/editor/app.js
+@@ -23,7 +23,7 @@ import { Grid } from "./grid.js";
+ import { History } from "./undo.js";
+ import { bulkColumns, columns, channelForm, formDialog, membersDialog, refLabel, parseAreaKey } from "./views.js";
+ import { systemsTab, systemsShown, modeSettingsPart, keyringPart } from "./modesview.js";
+-import { syncModes, withoutSecrets } from "../codeplug/channelmodes.js";
++import { channelModeRecord, syncModes, withoutSecrets } from "../codeplug/channelmodes.js";
+ import { openFile, saveBytes, secretFreeBytes, stockAesAreaForWrite, tftpBytes, datedName, FileError, imageFrom, saveDraft, loadDraft, clearDraft } from "./files.js";
+ import { extensions } from "./extensions.js";
+ import "./parts.js";
+@@ -61,6 +61,7 @@ const messages = h("div", { class: "ed-messages", "aria-live": "polite" });
+ 
+ function load(model, name, { fromRadio = false, stockAes = false } = {}) {
+ 	S.model = model;
++	S.modelSource = fromRadio ? { connection: S.conn, uid: S.conn.uid } : null;
+ 	S.stockAes = stockAes;
+ 	S.fileName = name;
+ 	S.history.reset();
+@@ -953,11 +954,14 @@ async function planWrite() {
+ 		// the same codeplug with this radio's own name, ID and boot text kept, and what each would send
+ 		// (compared byte for byte: two plans can send the same number of bytes. The second is planned only when there
+ 		// is something to keep: each plan is a pass over every block's CRC)
++		const hasModes = S.model.channels.some((channel) => channel.kind) || S.model.systems.length > 0;
++		const sameRadio = S.modelSource?.connection === c && S.modelSource.uid === c.uid;
++		const copyRecord = hasModes && !sameRadio ? channelModeRecord : null;
+ 		if (S.stockAes) {
+-			const problem = stockAesAreaForWrite(file.bytes, c.image.bytes, S.model.base?.bytes);
++			const problem = stockAesAreaForWrite(file.bytes, c.image.bytes, S.model.base?.bytes, copyRecord);
+ 			if (problem) return say(t(`editor.stock_aes.${problem.code}`, { id: problem.id }), "bad");
+ 		} else {
+-			areaForWrite(file.bytes, c.image.bytes, S.model.base?.bytes);
++			areaForWrite(file.bytes, c.image.bytes, S.model.base?.bytes, copyRecord);
+ 		}
+ 		const kept = keepIdentity(file, c.image);
+ 		const differs = IDENTITY.some(([a, b]) => kept.bytes.subarray(a, b).some((x, i) => x !== file.bytes[a + i]));
+@@ -1043,6 +1047,7 @@ function writeChosen(c, { want }, iddb, prepared) {
+ 			if (iddb) c.dbKnown = true;
+ 			S.iddbChanged = false;
+ 			S.model.base = want;
++		S.modelSource = { connection: c, uid: c.uid };
+ 			S.model.iddb = dbHeader(want.bytes);	// format N when it went to a radio that reads only that
+ 			S.dirty = false;
+ 			refresh();
+diff --git a/site/static/js/editor/files.js b/site/static/js/editor/files.js
+index 4211a2b..e1216c8 100644
+--- a/site/static/js/editor/files.js
++++ b/site/static/js/editor/files.js
+@@ -113,13 +113,13 @@ export function secretFreeBytes(image) {
+ 
+ // Imported keys need to follow their on-air IDs, not the ring slots a fresh file happened to use. Preserve the
+ // destination's unrelated keys and reject a conflicting ID before any write. The file isn't changed on a failure.
+-export function stockAesAreaForWrite(file, radio, base) {
++export function stockAesAreaForWrite(file, radio, base, copyRecord = null) {
+ 	const entries = decodeArea(file).entries;
+ 	const isAes = ({ key, value }) => key >= KEY_BASE && key < KEY_BASE + KEY_MAX &&
+ 		value.length >= 5 && value[0] === 0xFF && value[1] === 0x25;
+ 	const incoming = entries.filter(isAes);
+ 	if (!incoming.length) {
+-		areaForWrite(file, radio, base);
++		areaForWrite(file, radio, base, copyRecord);
+ 		return null;
+ 	}
+ 	const existing = decodeArea(radio);
+@@ -139,7 +139,7 @@ export function stockAesAreaForWrite(file, radio, base) {
+ 	const prior = base?.slice(0, KV_ADDR + KV_SIZE);
+ 	const priorArea = prior && decodeArea(prior);
+ 	if (priorArea?.state === "valid") putArea(prior, priorArea.entries.filter((e) => !isAes(e)));
+-	areaForWrite(staged, radio, prior);
++	areaForWrite(staged, radio, prior, copyRecord);
+ 	const merged = decodeArea(staged).entries;
+ 	for (const e of current) {
+ 		const kept = merged.find((k) => k.key === e.key);
+diff --git a/site/tests/modes.test.mjs b/site/tests/modes.test.mjs
+index fd981f2..ac6d309 100644
+--- a/site/tests/modes.test.mjs
++++ b/site/tests/modes.test.mjs
+@@ -10,9 +10,9 @@ import assert from "node:assert/strict";
+ import { readFileSync } from "node:fs";
+ 
+ import { CodeplugImage } from "../static/js/codeplug/image.js";
+-import { decodeArea, getValue, setValue, putArea, KV_ADDR, KV_SIZE } from "../static/js/codeplug/kv.js";
++import { decodeArea, getValue, setValue, putArea, KV_ADDR, KV_SIZE, areaForWrite } from "../static/js/codeplug/kv.js";
+ import { decode, encode, empty, newChannel, newContact, remove, validate, numberAll } from "../static/js/codeplug/model.js";
+-import { MODE_KEY, decodeTag, encodeTag, newSystem, setKind, syncModes, decodeSystemRecord, identityKey, countSecrets } from "../static/js/codeplug/channelmodes.js";
++import { MODE_KEY, channelModeRecord, decodeTag, encodeTag, newSystem, setKind, syncModes, decodeSystemRecord, identityKey, countSecrets } from "../static/js/codeplug/channelmodes.js";
+ import { KINDS, SYSTEM_TYPES, offeredKinds, offeredTypes, kindName } from "../static/js/codeplug/modes.js";
+ import { nameCheck } from "../static/js/codeplug/modebytes.js";
+ import { decodeConv, encodeConv, decodeUnit, decodeTsys, p25System, NAC_ANY } from "../static/js/codeplug/mode_p25.js";
+@@ -528,6 +528,23 @@ test("YSF: channel and the call signs round-trip; unknown bytes are kept", () =>
+ 	assert.equal(getValue(area(encode(d2)), MODE_KEY.setting + 6), null);
+ });
+ 
++test("YSF: writing an unchanged saved codeplug carries the channel tag and source callsign", () => {
++	const base = encode(ysfSample().m);
++	const file = encode(decode(base));
++	const radio = CodeplugImage.blank();
++	putArea(radio.bytes, [
++		{ key: 0x7001, value: Uint8Array.of(0xAB) },
++		{ key: MODE_KEY.tag + 2, value: Uint8Array.of(6, 0xFF, 0, 0, 0) },
++	]);
++	areaForWrite(file.bytes, radio.bytes, base.bytes, channelModeRecord);
++	const restored = decode(file);
++	assert.equal(restored.channels[0].kind, 6);
++	assert.equal(restored.channels[0].params.txDgid, 5);
++	assert.equal(restored.modeSettings[6].src, "XE1ARS");
++	assert.deepEqual(getValue(area(file), 0x7001), Uint8Array.of(0xAB));
++	assert.equal(getValue(area(file), MODE_KEY.tag + 2), null);
++});
++
+ test("YSF: offered with the radio's feature", () => {
+ 	assert.deepEqual(offeredKinds(empty(), "FM,DMR,YSF").map((k) => k.id), [6]);
+ 	assert.equal(kindName(6), "YSF");
