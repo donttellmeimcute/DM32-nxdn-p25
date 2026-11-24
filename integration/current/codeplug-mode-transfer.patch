@@ -144,22 +144,13 @@ diff --git a/site/tests/modes.test.mjs b/site/tests/modes.test.mjs
 index fd981f2..ac6d309 100644
 --- a/site/tests/modes.test.mjs
 +++ b/site/tests/modes.test.mjs
-@@ -10,9 +10,9 @@ import assert from "node:assert/strict";
- import { readFileSync } from "node:fs";
- 
- import { CodeplugImage } from "../static/js/codeplug/image.js";
--import { decodeArea, getValue, setValue, putArea, KV_ADDR, KV_SIZE } from "../static/js/codeplug/kv.js";
-+import { decodeArea, getValue, setValue, putArea, KV_ADDR, KV_SIZE, areaForWrite } from "../static/js/codeplug/kv.js";
- import { decode, encode, empty, newChannel, newContact, remove, validate, numberAll } from "../static/js/codeplug/model.js";
--import { MODE_KEY, decodeTag, encodeTag, newSystem, setKind, syncModes, decodeSystemRecord, identityKey, countSecrets } from "../static/js/codeplug/channelmodes.js";
-+import { MODE_KEY, channelModeRecord, decodeTag, encodeTag, newSystem, setKind, syncModes, decodeSystemRecord, identityKey, countSecrets } from "../static/js/codeplug/channelmodes.js";
- import { KINDS, SYSTEM_TYPES, offeredKinds, offeredTypes, kindName } from "../static/js/codeplug/modes.js";
- import { nameCheck } from "../static/js/codeplug/modebytes.js";
- import { decodeConv, encodeConv, decodeUnit, decodeTsys, p25System, NAC_ANY } from "../static/js/codeplug/mode_p25.js";
-@@ -528,6 +528,23 @@ test("YSF: channel and the call signs round-trip; unknown bytes are kept", () =>
+@@ -528,6 +528,26 @@ test("YSF: channel and the call signs round-trip; unknown bytes are kept", () =>
  	assert.equal(getValue(area(encode(d2)), MODE_KEY.setting + 6), null);
  });
  
++import { areaForWrite } from "../static/js/codeplug/kv.js";
++import { channelModeRecord } from "../static/js/codeplug/channelmodes.js";
++
 +test("YSF: writing an unchanged saved codeplug carries the channel tag and source callsign", () => {
 +	const base = encode(ysfSample().m);
 +	const file = encode(decode(base));
