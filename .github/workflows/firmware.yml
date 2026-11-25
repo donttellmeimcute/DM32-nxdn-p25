@@ -149,6 +149,8 @@ jobs:
                 --git "$GITHUB_SHA" --out "$GITHUB_WORKSPACE/dist"
             )
           done
+          python3 tools/build_mode_presets.py --tree "$TREE" --out dist --version "$VERSION" \
+            --git "$GITHUB_SHA" --cross "$GITHUB_WORKSPACE/toolchain/bin/csky-elf-" --jobs 4
           ls -l dist
           cat dist/SHA256SUMS
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
