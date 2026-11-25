@@ -89,7 +89,7 @@ index ce11cbb..ecb09c4 100644
  		[QT_AIR_TG] = TRX(QUICK_LABEL_TG, "TG"),
  		[QT_YSF_DEST] = TRN(QUICK_LABEL_DEST, TEXT_ALT_OPEN "Destination" TEXT_ALT_NEXT "Dest" TEXT_ALT_CLOSE),
  		[QT_NXDN_TRUNK] = TRN(QUICK_LABEL_TRUNK, "Trunk"),
-+		[QT_YSF_DT] = TRN(CHAN_LABEL_DATA_TYPE, "Data type"),
++		[QT_YSF_DT] = TRX(QUICK_LABEL_YSF_DT, "DT"),
  	};
  	uint8_t kind = ui_quick_kind(tile, v);
  	bool editing = s->quick_edit && s->quick_focus == tile;
@@ -180,7 +180,7 @@ index 4e79acd..994ebd6 100644
 -controls the deviation independently of the data type. The debug link can set
 -a different data type, including V/D mode 1. Stored YSF channels use the data
 -type and deviation from their own parameter block.
-+controls deviation independently of the data type. Quick's Data type tile
++controls deviation independently of the data type. Quick's DT (data type) tile
 +cycles V/D-1, DN and VW (with full-rate voice in the build). This radio-wide
 +VFO setting is held in RAM, along with the other live YSF parameters. Stored
 +YSF channels use the data type and deviation from their own parameter block.
@@ -197,7 +197,7 @@ index ef322da..3b1093c 100644
    calls and where, or why the call isn't played. FM's tone and width tiles say "FM only: this is YSF".
 -- The data type, the DG-IDs, the deviation and the call signs can be changed only from a computer for now
 -  (`rfoundry_debug.py radio ysf`), and the change lasts until the radio is switched off.
-+- **Quick → 3 Data type** cycles **V/D-1**, **DN** and **VW**. VW is offered when full-rate voice is built in.
++- **Quick → 3 DT** cycles **V/D-1**, **DN** and **VW**. VW is offered when full-rate voice is built in.
 +  The selection stays in memory until the radio is switched off. **Quick → 4 Mode** selects the YSF W/N deviation.
  - Some radios only transmit YSF or only receive it ([feature matrix](../feature-matrix.md)). One that only receives
    says "This mode: receive only" on PTT.
@@ -270,7 +270,7 @@ index 58e9939..d982834 100644
  	  "screen=quick airdest=ALL temporary=1", 9, false },
 +#if CONFIG_P25 && CONFIG_IMBE
 +	{ "YSF VFO Quick: DN to VW", "vfokey dlmode:ysf ysfdt:2", "quick 3",
-+	  "screen=quick shows=Data_type shows=VW", 2, false },
++	  "screen=quick shows=DT shows=VW", 2, false },
 +	{ "YSF VFO Quick: VW to V/D-1", "vfokey dlmode:ysf ysfdt:2", "quick 3 3",
 +	  "screen=quick shows=V/D-1", 3, false },
 +	{ "YSF VFO Quick: V/D-1 to DN", "vfokey dlmode:ysf ysfdt:0", "quick 3",
