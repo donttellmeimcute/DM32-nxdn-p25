@@ -6,10 +6,10 @@ index 1e1af46..551cf58 100644
  // tests/hil/test_task_stacks.py asks for, and gives the rest to main RAM (the air MTU's 64-burst lists took the last
  // 1 KB from 34, the talk permit before keying 0.5 KB from 33). The debug link's tasks view reports the least free since
  // start (tasks.heap_min_free)
-+#if CONFIG_AIR
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
  #define configTOTAL_HEAP_SIZE	(32 * 1024 + 512)
 +#else
-+// The DMR/FM call graph uses larger task frames with the additional digital modes omitted.
++// Smaller digital-mode sets can use larger task frames after LTO.
 +// Add space for those stacks while keeping the same heap headroom.
 +#define configTOTAL_HEAP_SIZE	(32 * 1024 + 512 + 1280)
 +#define START_TASK_STACK	704

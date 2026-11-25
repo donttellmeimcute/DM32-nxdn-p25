@@ -35,11 +35,14 @@ def main():
     parser.add_argument("--git", required=True)
     parser.add_argument("--cross", required=True)
     parser.add_argument("--jobs", type=int, default=4)
+    variants = dict(mode_variants())
+    parser.add_argument("--only", action="append", choices=tuple(variants), help="build a specific combination")
     args = parser.parse_args()
     tree = args.tree.resolve()
     output = args.out.resolve()
     commit_time = subprocess.check_output(["git", "show", "-s", "--format=%ct", args.git], cwd=tree, text=True).strip()
-    for variant, modes in mode_variants():
+    for variant in args.only or variants:
+        modes = variants[variant]
         config = ["# SPDX-License-Identifier: GPL-3.0-or-later", "# Copyright (c) 2026 lyra XE1POC"]
         config.extend(f"CONFIG_{mode.upper()} ?= {'y' if mode in modes else 'n'}" for mode in MODES)
         config.extend(("CONFIG_NET_HTTP ?= n", "CONFIG_SFR ?= n", "CONFIG_MDC1200 ?= y"))
