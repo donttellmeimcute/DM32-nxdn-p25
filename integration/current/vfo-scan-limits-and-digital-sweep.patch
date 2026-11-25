@@ -1,0 +1,182 @@
+diff --git a/core/radio/scan.h b/core/radio/scan.h
+--- a/core/radio/scan.h
++++ b/core/radio/scan.h
+@@ -22,7 +22,7 @@
+ 
+ #define SCAN_SETTLE_MS		50	// readings right after a retune belong to the last stop
+ #define SCAN_PRIORITY_EVERY	2	// with priority on: the start channel again after this many others
+-#define SCAN_VFO_NUISANCE_MAX	8	// frequencies a VFO scan can skip
++#define SCAN_VFO_NUISANCE_MAX	32	// frequencies a VFO scan can skip
+ #define SCAN_FLOOR_STOPS	8	// the signal strength floor: the lowest reading of the last this many stops
+ 
+ typedef struct {
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -5196,9 +5196,9 @@
+ 	bool dmr = sm->view.ch.mode == RADIO_MODE_DMR;
+ 	bool air = air_mode(sm->view.ch.mode);
+ 	bool carrier = scan_carrier_heard(sm, st, now_ms);
+-	bool active, sync = false;
+-#if CONFIG_BCAST_FM
+-	if (sm->view.bcast && sc->kind == SCAN_VFO) {
++	bool active, sync = false, rejected = false;
++#if CONFIG_BCAST_FM
++	if (sm->view.bcast && sc->kind == SCAN_VFO) {
+ 		if (!sm->view.bcast_fault && sm->view.bcast_khz == 0 &&
+ 		    now_ms - sc->tuned_ms < RADIO_BCAST_SCAN_TUNE_MS)
+ 			return;
+@@ -5215,9 +5215,10 @@
+ 		uint32_t heard_ms;
+ 		sync = dmr_call_last_activity(&heard_ms) && (int32_t)(heard_ms - sc->tuned_ms) >= sc->cfg.settle_ms &&
+ 		       now_ms - heard_ms <= RADIO_SCAN_DMR_SYNC_AGE_MS;
+-		if (sm->view.dmr.state == RDMR_RX_OTHER) {
+-			carrier = sync = false;
+-		}
++		if (sm->view.dmr.state == RDMR_RX_OTHER) {
++			carrier = sync = false;
++			rejected = true;
++		}
+ #if CONFIG_DUAL_WATCH
+ 		// Dual watch: the reply window holds the selected channel (PTT talks there)
+ 		active = active || (dual_running(sm) && sm->dual_at == sm->dual_sel && sm->view.dmr.reply_active);
+@@ -5233,15 +5234,19 @@
+ 		scan_level(sc, now_ms, st->rssi_dbm);
+ 		active = h == AIR_HEARD_PLAYED;
+ 		sync = h == AIR_HEARD_PENDING;
+-		if (h == AIR_HEARD_OTHER) {
+-			carrier = false;
+-		}
++		if (h == AIR_HEARD_OTHER) {
++			carrier = false;
++			rejected = true;
++		}
+ 	} else
+ #endif
+ 	{
+-		active = sm->view.state == RS_RX && (sm->view.squelch != 0 || carrier);
+-	}
+-	if (sc->kind != SCAN_DUAL) {
++		active = sm->view.state == RS_RX && (sm->view.squelch != 0 || carrier);
++	}
++	if (sc->kind != SCAN_DUAL) {
++		// A rejected call's earlier carrier must not keep the scanner probing this stop.
++		if (rejected)
++			sc->heard = false;
+ 		uint16_t dwell = sc->kind == SCAN_ZONE ? sm->set.zone_scan_dwell_ms : sm->set.scan_dwell_ms;
+ 		// DMR's idle slot lasts 30 ms. Two 25 ms polls can both fall in it; three polls cannot.
+ 		if (dmr && dwell < RADIO_SCAN_DMR_DWELL_MS)
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -7216,7 +7216,9 @@
+ 		if (!v->vfo || v->scan != 0)
+ 			break;
+ 		uint8_t id = tool == T_VFO_SCAN_LOW ? UI_SET_VFO_SCAN_LOW : UI_SET_VFO_SCAN_HIGH;
+-		ui_svc_setting_set(id, hold ? 0 : (int32_t)v->ch.rx_hz);
++		int32_t value = hold ? 0 : (int32_t)v->ch.rx_hz;
++		if (ui_svc_setting_set(id, value))
++			ui_svc_apply(id, value);
+ 		break;
+ 	}
+ 	case T_RX_EXT:
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -90,7 +90,8 @@
+ next complete superframe at best and the one after it when the modem's sticky LC equals this call's (about 1.1 s from
+ the retune). Each DMR stop on a new frequency restarts the modem's receiver, so it searches from the retune and not on the
+ last transmitter's slot timing ([gotchas](gotchas.md) 17.2). A call known not to be for us (another talkgroup) ends
+-the probe. P25, NXDN and YSF stops read a carrier as DMR does, probe up to 700 ms for a call of the channel's NAC, RAN or DG-ID,
++the probe on the next status poll, without waiting for the earlier carrier to expire. P25, NXDN and YSF stops read a
++carrier as DMR does, probe up to 700 ms for a call of the channel's NAC, RAN or DG-ID,
+ up to 1.5 s while its squelch waits for a field (a late entry's talk group or group), hold on a call that plays and
+ move on from one that doesn't ([p25.md](p25.md) 7.1). Digital monitor on when a zone or VFO scan starts (the hear-all latch, [dmr-voice.md](dmr-voice.md) 1) stays on
+ at every stop (`hear_all_latch` in the view), so a call to any talkgroup is played and holds the scan; the channel the
+@@ -106,7 +107,7 @@
+ Stopping: STOP stays where the scan is. CANCEL goes back to the starting channel or frequency. PTT on a held signal
+ stops there and talks back on it; PTT while still searching goes back to the start channel and transmits there. A
+ channel, zone, VFO or frequency change by the user ends the scan where the user put it. **Nuisance delete** skips
+-the current channel (VFO: frequency, up to 8) until the scan ends, and moves on (not in dual watch). A scan starts
++the current channel (VFO: frequency, up to 32) until the scan ends, and moves on (not in dual watch). A scan starts
+ only when there is another channel to go to; it does not run in hotspot mode or while transmitting.
+ 
+ ### 2.1 Dual watch
+diff --git a/docs/user/12-scan.md b/docs/user/12-scan.md
+--- a/docs/user/12-scan.md
++++ b/docs/user/12-scan.md
+@@ -30,7 +30,7 @@
+ - **Tools > Zone scan speed** sets the wait on empty channels from 25 to 500 ms. Each DMR channel still gets at
+   least 75 ms so the scan can hear a TDMA burst. An FM channel stops the scan when the squelch opens, with the
+   channel's tone if it needs one. DMR, P25 and NXDN channels stop it when the radio plays a call. On a signal
+-  the radio can listen up to 1.5 s for a call it would play.
++  the radio can listen up to 1.5 s for a call it would play. It advances as soon as it identifies a call it would skip.
+ - Turn on [digital monitor](09-dmr.md) before you start the scan to stop on a call to any talkgroup, not only
+   the channel's talkgroup and RX group list. It stays on at every channel and on the one the scan ends on. Pressing
+   **Monitor** on a DMR channel during the scan turns it off or on for the rest of the scan.
+diff --git a/tests/host/radioFeaturesTest.c b/tests/host/radioFeaturesTest.c
+--- a/tests/host/radioFeaturesTest.c
++++ b/tests/host/radioFeaturesTest.c
+@@ -672,8 +672,19 @@
+ 	for (uint32_t hz = 146000000; hz <= 146100000; hz += 25000) {
+ 		scan_nuisance_hz(&s, hz);
+ 	}
+-	CHECK(scan_next_hz(&s, 146000000, 25000) == 0);
+-}
++	CHECK(scan_next_hz(&s, 146000000, 25000) == 0);
++
++	// A new sweep can remove 32 frequencies and still visit the next available stop.
++	s.hi_hz = 147000000;
++	scan_begin(&s, SCAN_VFO, &cfg, 0);
++	for (uint32_t i = 0; i < 32; i++) {
++		CHECK(scan_nuisance_hz(&s, 146000000u + i * 25000u));
++	}
++	CHECK(s.skipped == 32 && !scan_nuisance_hz(&s, 146800000));
++	CHECK(scan_next_hz(&s, 145000000, 25000) == 146800000);
++	scan_end(&s);
++	CHECK(s.skipped == 0 && scan_next_hz(&s, 145000000, 25000) == 146000000);
++}
+ 
+ // ---- the battery monitor on its own ----
+ 
+@@ -1682,7 +1693,19 @@
+ 	}
+ 	CHECK(sm.view.zone_pos != 5 && !sim.started);	// back on FM: the stack let go of the modem
+ 	CHECK(now - arrived == RADIO_SCAN_DMR_DWELL_MS + RADIO_SCAN_DMR_PROBE_MS);
+-	// Next time round a call is on: the scan holds on it
++	// The same carrier is now a call to another group. Once decoded, leave before the carrier hang expires.
++	for (int i = 0; i < 200 && sm.view.zone_pos != 5; i++) {
++		run(RADIO_POLL_MS);
++	}
++	run(RADIO_SCAN_DMR_DWELL_MS);
++	CHECK(sm.view.zone_pos == 5 && sm.view.scan_phase == SCAN_PH_PROBE && sm.scan.heard);
++	uint8_t other_lc[9];
++	mk_lc(other_lc, 999u, 9995555);
++	burst_lc(other_lc, 1, false);
++	run(2 * RADIO_POLL_MS);
++	CHECK(sm.view.zone_pos != 5);
++
++	// Next time round a call is on: the scan holds on it
+ 	for (int i = 0; i < 200 && sm.view.zone_pos != 5; i++) {
+ 		run(25);
+ 	}
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -311,7 +311,15 @@
+ 	{ "11 scan resume delay is saved", TOOLS_LAST_EXISTING " ok down ok",
+ 	  "reboot " TOOLS_LAST_EXISTING " ok", "screen=group shows=Resume_after_call shows=3_s",
+ 	  4 + CONFIG_RSSI_GRAPH, false },
+-	{ "11 nuisance skip", "ok 6 1", "ctx 1", "pos=4 scanning=1", 2, false },
++#if CONFIG_VFO && CONFIG_SCAN
++	{ "11 VFO scan low uses the tuned frequency", "ok 4 up ok " TOOLS_LAST_EXISTING " up", "ok",
++	  "screen=tools focus=Scan_low shows=146.520", 1, false },
++	{ "11 VFO scan high uses the tuned frequency", "ok 4 up ok " TOOLS_LAST_EXISTING, "ok",
++	  "screen=tools focus=Scan_high shows=146.520", 1, false },
++	{ "11 VFO scan high can be cleared", "ok 4 up ok " TOOLS_LAST_EXISTING " ok", "long:ok",
++	  "screen=tools focus=Scan_high shows=Auto hides=146.520", 1, false },
++#endif
++	{ "11 nuisance skip", "ok 6 1", "ctx 1", "pos=4 scanning=1", 2, false },
+ 	{ "11 scan stop", "ok 6 1", "back", "scanning=0", 1, false },
+ 	// Dual watch (docs/ux/dual-watch.md): on in a few presses, PTT on the selected channel, the other one press away
+ 	{ "11 dual watch: start, B the next channel", "", "quick 7", "dual=1 sel=A pos=3 bpos=4 screen=home", 2, false },
