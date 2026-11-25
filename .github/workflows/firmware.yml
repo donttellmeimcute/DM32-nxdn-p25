@@ -139,6 +139,16 @@ jobs:
               raise SystemExit("release manifest is missing broadcast FM")
           print("Manifest features verified: M17=y MDC1200=y AIR_RAW=n BCAST_FM=y")
           PY
+          for PRESET in multimode dmr-fm; do
+            (
+              cd "$TREE"
+              export MAKEFLAGS="CROSS=$GITHUB_WORKSPACE/toolchain/bin/csky-elf- CONFIG_MDC1200=y"
+              make -j4 BOARD=dm32 VARIANT="$PRESET" RFOUNDRY_PRESET="$PRESET" GITVERSION="${GITHUB_SHA::8}" GITDIRTY= \
+                RFOUNDRY_GIT_TIME="$(git show -s --format=%ct "$GITHUB_SHA")" all stack-check
+              python3 tools/release.py --board dm32 --variant "$PRESET" --version "$VERSION" \
+                --git "$GITHUB_SHA" --out "$GITHUB_WORKSPACE/dist"
+            )
+          done
           ls -l dist
           cat dist/SHA256SUMS
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

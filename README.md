@@ -136,12 +136,23 @@ make -C build/current/tests/host voiceCipherTest nxdnEngineTestAes p25EngineTest
 
 La imagen queda en `build/current/build/dm32/rfoundry_dm32.bin`. Detalle del cifrado: `docs/spec/air-encryption.md` dentro del árbol `build/current`.
 
+El flasher ofrece **Completa**, **Multimodo** (FM, DMR, P25, NXDN y YSF) y **DMR + FM**. Las tres conservan APRS.
+Para compilar una de ellas, usa `--variant full`, `--variant multimode` o `--variant dmr-fm`. Las variantes reducidas
+quedan en `build/current/build/dm32-<variante>/rfoundry_dm32.bin`.
+
+Para una combinación propia, repite `--without` con los módulos que quieras omitir. Por ejemplo,
+`python3 tools/build_current.py --without m17 --without dstar`. Los módulos disponibles aparecen con `--help`.
+Si omites P25, también se omite D-STAR. Si omites P25, NXDN y YSF, también se omite M17.
+Instala la imagen con **Usar mi propia compilación del firmware** en el flasher.
+
 La compilación predeterminada del DM-32UV desactiva el servidor de estado HTTP y el repetidor DMR SFR para recuperar RAM.
 
 Si usas `--tree`, elige un directorio dedicado y vacío la primera vez. Al volver a compilar en ese directorio,
 la herramienta restablece el commit base y elimina los archivos sin seguimiento fuera de `build/`.
 
-**Compilación y release automáticas:** cada commit a `main` hace que la acción `Firmware` (`.github/workflows/firmware.yml`) compile la imagen sin códec, pase las pruebas host y publique una release `v<AAAA.MM.DD>-<commit>` con `rfoundry-dm32-<versión>.bin`, su manifiesto `.json` y `SHA256SUMS`. Después solicita la sincronización inmediata del web flasher (o la deja para su sincronización programada si no está configurado el secreto correspondiente). Nunca descarga el firmware de fábrica ni el AMBE.
+**Compilación y release automáticas:** cada commit a `main` pasa las pruebas host y publica las tres imágenes sin
+códec, sus manifiestos y `SHA256SUMS` en la misma release. Después solicita la sincronización del flasher si
+`FLASHER_TOKEN` está configurado. El workflow usa código fuente y la toolchain C-SKY.
 
 ## Apoya el proyecto
 

@@ -19,6 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 PIN = 'e89121e97a314f0ddd0475f848713ba10710d7db'
 UPSTREAM = 'https://github.com/RadioFoundry/RadioFoundry.git'
 PATCH_DIR = ROOT / 'integration/current'
+VARIANT_DIR = ROOT / 'integration/variants'
+RELEASE_VARIANTS = ('full', 'multimode', 'dmr-fm')
+OPTIONAL_MODULES = {
+	'aprs': 'APRS', 'dstar': 'DSTAR', 'm17': 'M17', 'mdc1200': 'MDC1200',
+	'nxdn': 'NXDN', 'p25': 'P25', 'rssi-graph': 'RSSI_GRAPH', 'ysf': 'YSF',
+}
 PATCHES = (
 	'base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch', 'ysf-tx-pcm.patch',
 	'ysf-vfo-identity.patch',
@@ -187,6 +193,11 @@ def prepare(tree, dstar=False):
 		run('git', 'apply', '--binary', PATCH_DIR / 'dstar-gmsk-rx.patch', cwd=tree)
 		shutil.copytree(ROOT / 'src/dstar', tree / 'core/dstar')
 	run('git', 'apply', '--binary', PATCH_DIR / 'rssi-graph.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'scan-delay-monitor-fields.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'dmr-roger.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'scan-monitor-roger-tests.patch', cwd=tree)
+	for name in RELEASE_VARIANTS[1:]:
+		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
 
 
@@ -196,22 +207,38 @@ def main():
 	                help='dedicated build directory (must be empty on first use)')
 	ap.add_argument('--cross', default=os.environ.get('CROSS', str(ROOT / 'toolchain/bin/csky-elf-')))
 	ap.add_argument('--jobs', type=int, default=min(os.cpu_count() or 2, 8))
+	ap.add_argument('--variant', choices=RELEASE_VARIANTS, default='full', help='firmware preset')
+	ap.add_argument('--without', action='append', choices=OPTIONAL_MODULES, default=[], metavar='MODULE',
+	                help='omit a module (repeatable): ' + ', '.join(OPTIONAL_MODULES))
 	ap.add_argument('--dstar', action=argparse.BooleanOptionalAction, default=True,
 	                help='build experimental D-STAR DV for the VFO and stored channels (RF unverified)')
 	ap.add_argument('--no-m17', action='store_true', help='build with CONFIG_M17=n (M17 voice; Codec 2 real time on the MCU unverified)')
 	ap.add_argument('--no-mdc1200', action='store_true', help='build with CONFIG_MDC1200=n (MDC-1200 ID on FM channels)')
 	args = ap.parse_args()
 	tree = args.tree.resolve()
-	prepare(tree, args.dstar)
+	disabled = set(args.without)
+	if not args.dstar or args.variant != 'full' or 'p25' in disabled:
+		disabled.add('dstar')
+	if args.no_m17 or args.variant != 'full' or {'p25', 'nxdn', 'ysf'} <= disabled:
+		disabled.add('m17')
+	if args.no_mdc1200:
+		disabled.add('mdc1200')
+	dstar = 'dstar' not in disabled
+	prepare(tree, dstar)
 	# The version is this repository's commit, the time its commit time: the patched tree is never committed
 	version = out('git', 'rev-parse', '--short=8', 'HEAD', cwd=ROOT)
 	git_time = out('git', 'log', '-1', '--format=%ct', 'HEAD', cwd=ROOT)
 	# Reserve more main RAM for the private D-STAR build while keeping the host link and APRS enabled.
-	dstar_options = ('CONFIG_NET_HTTP=n', 'CONFIG_SFR=n') if args.dstar else ()
-	run('make', '-j%d' % args.jobs, 'BOARD=dm32', 'CROSS=' + args.cross, 'BUILD=build/dm32', 'GITVERSION=' + version,
-	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'CONFIG_DSTAR=' + ('y' if args.dstar else 'n'),
-	    'CONFIG_MDC1200=' + ('n' if args.no_mdc1200 else 'y'), 'CONFIG_M17=' + ('n' if args.no_m17 else 'y'),
-	    *dstar_options, 'all', 'stack-check', cwd=tree)
+	dstar_options = ('CONFIG_NET_HTTP=n', 'CONFIG_SFR=n') if dstar else ()
+	variant = ('VARIANT=' + args.variant,) if args.variant != 'full' else ()
+	preset = 'custom' if args.without or not args.dstar or args.no_m17 or args.no_mdc1200 else args.variant
+	options = {name: 'n' for key, name in OPTIONAL_MODULES.items() if key in disabled}
+	options['M17'] = 'n' if 'm17' in disabled else 'y'
+	options['MDC1200'] = 'n' if 'mdc1200' in disabled else 'y'
+	options['DSTAR'] = 'y' if dstar else 'n'
+	run('make', '-j%d' % args.jobs, 'BOARD=dm32', 'CROSS=' + args.cross, 'GITVERSION=' + version,
+	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'RFOUNDRY_PRESET=' + preset, *variant,
+	    *(f'CONFIG_{name}={value}' for name, value in options.items()), *dstar_options, 'all', 'stack-check', cwd=tree)
 
 
 if __name__ == '__main__':

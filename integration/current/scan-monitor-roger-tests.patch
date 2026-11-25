@@ -1,0 +1,200 @@
+diff --git a/tests/host/radioFeaturesTest.c b/tests/host/radioFeaturesTest.c
+--- a/tests/host/radioFeaturesTest.c
++++ b/tests/host/radioFeaturesTest.c
+@@ -1665,6 +1665,36 @@
+ }
+ #endif
+
++static void test_dmr_scan_reply_delay(void)
++{
++	start();
++	req(RREQ_ZONE_POS, 4);
++	req(RREQ_SCAN, RSCAN_ZONE);
++	CHECK(sm.view.zone_pos == 5 && sm.view.ch.mode == RADIO_MODE_DMR);
++	run(RADIO_POLL_MS);
++	hear_call(9, 1, 1, false);
++	CHECK(sm.view.scan_phase == SCAN_PH_HOLD);
++
++	// Change the delay on a running scan, then hear two overs on the same frequency.
++	radio_settings_t rs = sm.set;
++	rs.scan_delay_ms = 5000;
++	radio_sm_set_settings(&sm, &rs, now);
++	settings_t stored;
++	settings_read(&stored);
++	CHECK(stored.rs_scan_delay_ms == 5000);
++	hear_call(9, 1, 1, true);
++	CHECK(sm.view.scan_phase == SCAN_PH_RESUME && sm.view.zone_pos == 5);
++	run(2900);
++	hear_call(9, 1, 1, true);
++	CHECK(sm.view.scan_phase == SCAN_PH_RESUME && sm.view.zone_pos == 5);
++	uint32_t waited = now - sm.scan.phase_ms;
++	run(5000 - waited - RADIO_POLL_MS);
++	CHECK(sm.view.scan_phase == SCAN_PH_RESUME && sm.view.zone_pos == 5);
++	run(RADIO_POLL_MS);
++	CHECK(sm.view.zone_pos != 5);
++	req(RREQ_SCAN, RSCAN_STOP);
++}
++
+ static void test_mixed_scan(void)
+ {
+ 	start();
+@@ -3731,6 +3761,37 @@
+ 	req(RREQ_ZONE_POS, 5);
+ 	run(10000);
+ 	CHECK(hw.sleeps == s2);
++}
++
++static void test_dmr_roger(void)
++{
++	for (unsigned i = 0; i < 3; i++) {
++		start();
++		chans[6].no_beep = i == 2;
++		req(RREQ_ZONE_POS, 5);
++		radio_settings_t rs = sm.set;
++		rs.dmr_roger = i != 0;
++		rs.talk_permit = false;
++		radio_sm_set_settings(&sm, &rs, now);
++		settings_t stored;
++		settings_read(&stored);
++		CHECK(((stored.rs_flags & SETTINGS_RS_DMR_ROGER) != 0) == rs.dmr_roger);
++		beep_stats_t before, after;
++		beep_get_stats(&before);
++		req(RREQ_PTT, 1);
++		run(600);
++		CHECK(sm.view.dmr.state == RDMR_TX);
++		beep_get_stats(&after);
++		CHECK(after.played == before.played);
++		req(RREQ_PTT, 0);
++		run(1000);
++		beep_get_stats(&after);
++		CHECK(sm.view.state == RS_IDLE && !sm.dmr_keyed);
++		CHECK(after.played == before.played + (i == 1));
++		if (i == 1)
++			CHECK(after.last == BEEP_DMR_ROGER);
++	}
++	chans[6].no_beep = false;
+ }
+
+ static void test_dmr_beeps(void)
+@@ -4259,6 +4320,7 @@
+ 	test_dmr_replay_rf();
+ #endif
+ 	test_mixed_scan();
++	test_dmr_scan_reply_delay();
+ 	test_scan_dmr_mid_call();
+ 	test_scan_dmr_digital_monitor();
+ 	test_scan_dmr_kept_timing();
+@@ -4299,6 +4361,7 @@
+ #endif
+ 	test_battery_save();
+ 	test_dmr_beeps();
++	test_dmr_roger();
+ 	test_dmr_permit_before_key();
+ 	test_tone_keys();
+ 	test_dmr_short_press_wake();
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2788,6 +2788,8 @@
+ 			ui_svc_setting_set(id, id != UI_SET_SCAN_TONE);	// scan stop tone off, the other tones on
+ 	}
+ 	ui_svc_setting_set(UI_SET_ZONE_SCAN_DWELL, RADIO_ZONE_SCAN_DWELL_MS);
++	ui_svc_setting_set(UI_SET_SCAN_DELAY_MS, 2000);
++	ui_svc_setting_set(UI_SET_DMR_ROGER, 0);
+ 	ui_svc_setting_set(UI_SET_HEAR_ALL_DEFAULT, 0);
+ 	ui_svc_setting_set(UI_SET_NOISE_REDUCTION, 1);
+ 	ui_svc_setting_set(UI_SET_MIC_AGC, 0);
+@@ -3555,6 +3557,7 @@
+ 			(kind == 'e' || kind == 'o' ? 0 : RADIO_P25_PLAYED));
+ 		view.p25.src = src;
+ 		view.p25.dst = dst;
++		view.p25.nac = 0x2a7;
+ 		view.state = RS_RX;
+ 		view.rssi_dbm = -84;
+ 		changed();
+@@ -3588,6 +3591,31 @@
+ 		return true;
+ 	}
+ #endif
++#if CONFIG_NXDN
++	if (strcmp(t, "nxdnrx") == 0 && arg != NULL) {
++		unsigned ran, dst;
++		if (sscanf(arg, "%u,%u", &ran, &dst) != 2 || ran > 63)
++			return false;
++		view.nxdn.flags = RADIO_NXDN_ON | RADIO_NXDN_RX | RADIO_NXDN_PLAYED;
++		view.nxdn.ran = (uint8_t)ran;
++		view.nxdn.src = 15;
++		view.nxdn.dst = dst;
++		view.state = RS_RX;
++		changed();
++		advance(300);
++		return true;
++	}
++#endif
++	if (strcmp(t, "rxmeta") == 0 && arg != NULL) {
++		unsigned ts, cc;
++		if (sscanf(arg, "%u,%u", &ts, &cc) != 2 || ts > 2 || cc > 15)
++			return false;
++		view.dmr.rx_ts = (uint8_t)ts;
++		view.dmr.rx_cc = (uint8_t)cc;
++		changed();
++		advance(100);
++		return true;
++	}
+ 	if (strcmp(t, "fmrx") == 0) {		// an FM signal opens the squelch; fmrxend closes it
+ 		view.state = RS_RX;
+ 		view.rssi_dbm = -84;
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -293,9 +293,12 @@
+ 	{ "11 extended RX On choice survives restart", "extended-bands " TOOLS_LAST_EXISTING " ok ok reboot " TOOLS_LAST_EXISTING, "",
+ 	  "screen=tools shows=RX_past_bands shows=On", 7, false },
+ 	{ "11 zone scan speed opens from Tools", "", TOOLS_LAST_EXISTING " ok",
+-	  "screen=group shows=Zone_scan_speed shows=Empty-channel_dwell shows=25_ms", 4 + CONFIG_RSSI_GRAPH, false },
++	  "screen=group shows=Zone_scan_speed shows=Empty-channel_dwell shows=25_ms shows=Resume_after_call", 4 + CONFIG_RSSI_GRAPH, false },
+ 	{ "11 zone scan speed survives a restart", TOOLS_LAST_EXISTING " ok ok", "reboot " TOOLS_LAST_EXISTING,
+ 	  "screen=tools shows=Zone_scan_speed shows=50_ms", 3 + CONFIG_RSSI_GRAPH, false },
++	{ "11 scan resume delay is saved", TOOLS_LAST_EXISTING " ok down ok",
++	  "reboot " TOOLS_LAST_EXISTING " ok", "screen=group shows=Resume_after_call shows=3_s",
++	  4 + CONFIG_RSSI_GRAPH, false },
+ 	{ "11 nuisance skip", "ok 6 1", "ctx 1", "pos=4 scanning=1", 2, false },
+ 	{ "11 scan stop", "ok 6 1", "back", "scanning=0", 1, false },
+ 	// Dual watch (docs/ux/dual-watch.md): on in a few presses, PTT on the selected channel, the other one press away
+@@ -1357,6 +1360,8 @@
+ 	{ "25 add channel: a long list to its end", "channels:full ok 4 ctx 2", "ok up", "screen=zpick focus=1024_Far_1024", 2,
+ 	  false },
+ 	{ "K monitor key on DMR: digital monitor", "", "mon", "hearall=1 toast=Digital_monitor_on", 1, false },
++	{ "K DMR monitor shows received slot and color code", "mon wait:4000 rx:9991234,3100,g",
++	  "rxmeta:2,7", "shows=TS2_CC7 shows=TG_3100", 0, false },
+ 	{ "K monitor key on DMR, again: off", "mon", "mon", "hearall=0 toast=Digital_monitor_off", 1, false },
+ #if CONFIG_P25
+ 	// P25 and NXDN have digital monitor too (every NAC or RAN, every call): the same key, toast, chip and quick tile
+@@ -1365,12 +1370,16 @@
+ 	{ "K P25 digital monitor: the DMon chip", "p25 dlmode:p25 mon wait:4000", "", "hearall=1 shows=DMon", 0, false },
+ 	{ "K monitor key on P25, again: off", "p25 dlmode:p25 mon wait:4000", "mon wait:4000", "hearall=0 hides=DMon", 1,
+ 	  false },
++	{ "K P25 monitor shows received NAC and TG", "p25 dlmode:p25 mon wait:4000",
++	  "p25rx:3101234,3100,e", "shows=NAC_2A7_TG_3100", 0, false },
+ 	{ "K P25 quick tile 5 is digital monitor", "p25 dlmode:p25", "quick 5", "hearall=1 toast=Digital_monitor_on", 2,
+ 	  false },
+ #endif
+ #if CONFIG_NXDN
+ 	{ "K monitor key on NXDN: digital monitor", "nxdn dlmode:nxdn", "mon", "hearall=1 toast=Digital_monitor_on", 1, false },
+ 	{ "K NXDN digital monitor: the DMon chip", "nxdn dlmode:nxdn mon wait:4000", "", "hearall=1 shows=DMon", 0, false },
++	{ "K NXDN monitor shows the received RAN and TG", "nxdn dlmode:nxdn mon wait:4000",
++	  "nxdnrx:22,3100", "shows=RAN_22_TG_3100", 0, false },
+ #endif
+ 	{ "K a key set to key lock", "", "lockkey", "locked=1", 1, false },
+ 	{ "K key lock unlocks too", "lockkey", "lockkey", "locked=0", 1, false },
+diff --git a/docs/user/17-settings.md b/docs/user/17-settings.md
+--- a/docs/user/17-settings.md
++++ b/docs/user/17-settings.md
+@@ -41,6 +41,7 @@
+ | Tone volume | 0 to 10 | 5 | The loudest the radio's beeps get. Beeps follow the speaker volume up to this level, so turning the volume down makes them quieter too | Works |
+ | Talk permit tone | On, Off | On | The tone when a DMR transmission starts (MOTOTRBO-style chirp), and before a P25 or NXDN one (three 910 Hz beeps) ([DMR](09-dmr.md#the-talk-permit-tone)) | Works |
+ | Talk permit sound | Default, Chirp, Triple beep | Default | Pick a local sound for all supported modes. Chirp or Triple beep also enables a tone before the radio keys on FM. | Works |
++| DMR Motorola roger | On, Off | Off | Plays a local three-note chirp after your DMR voice transmission ends | Works |
+ | FM roger beep | On, Off | Off | Send a tone pair over the air when PTT is released on FM. | On radios with an FM transmit tone |
+ | Call end tone | On, Off | On | The two-note beep when a DMR call you heard ends | Works |
+ | TOT warning tone | On, Off | On | The beep a few seconds before the transmit time-out cuts a transmission | Works |

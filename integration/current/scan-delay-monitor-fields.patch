@@ -1,0 +1,195 @@
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -5242,6 +5242,8 @@
+ 			   tone_needed(sm) ? RADIO_SCAN_FM_PROBE_MS : RADIO_POLL_MS;
+ 	sc->cfg.sync_ms = dmr ? RADIO_SCAN_DMR_SYNC_MS : air ? RADIO_SCAN_AIR_SYNC_MS : 0;
+ 	sc->cfg.carrier_hold_ms = dmr || air ? RADIO_SCAN_DMR_CARRIER_MS : 0;
++	if (sc->kind != SCAN_DUAL)
++		sc->cfg.delay_ms = sm->set.scan_delay_ms;
+ 	uint8_t was = sc->phase;
+ 	switch (scan_poll(sc, now_ms, active, carrier, sync)) {
+ 	case SCAN_ACT_NEXT:
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -464,6 +464,7 @@
+ 	UI_SET_HOME_ZONE, UI_SET_HOME_TEXT_COLOR, UI_SET_HOME_COMPACT_DUAL,
+ 	UI_SET_DIGITAL_RX_TRIM,	// decoded digital voice level (Settings > Sound), in dB
+ 	UI_SET_DMR_REPLAY,	// session-only recording opt-in
++	UI_SET_SCAN_DELAY_MS,	// Tools > Zone scan speed: wait after a received call
+ 	UI_SET_COUNT
+ } ui_setting_t;
+
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -342,6 +342,9 @@
+ 	case UI_SET_ZONE_SCAN_DWELL:
+ 		radio_get_settings(&rs);
+ 		return rs.zone_scan_dwell_ms;
++	case UI_SET_SCAN_DELAY_MS:
++		radio_get_settings(&rs);
++		return rs.scan_delay_ms;
+ 	case UI_SET_CALL_END_TONE:
+ 	case UI_SET_TOT_WARN_TONE:
+ 	case UI_SET_BATTERY_TONE:
+@@ -476,6 +479,7 @@
+ 	case UI_SET_VFO_SCAN_LOW:
+ 	case UI_SET_VFO_SCAN_HIGH:
+ 	case UI_SET_ZONE_SCAN_DWELL:
++	case UI_SET_SCAN_DELAY_MS:
+ #if CONFIG_SFR
+ 	case UI_SET_SFR_RX:
+ #endif
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -645,6 +645,9 @@
+ 	case UI_SET_ZONE_SCAN_DWELL:
+ 		rs.zone_scan_dwell_ms = v16;
+ 		break;
++	case UI_SET_SCAN_DELAY_MS:
++		rs.scan_delay_ms = v16;
++		break;
+ 	case UI_SET_VFO_STEP:		// 10 Hz units; 833 is the exact 8.33 kHz grid
+ 		radio_req_vfo_step_size(value == 833 ? 8333u : value > 0 && value <= 100000 ? (uint32_t)value * 10u : 0u);
+ 		return;
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -7583,9 +7583,14 @@
+ 	TRX(ZONE_SCAN_VALUE_75_MS, "75 ms"),
+ 	TRX(ZONE_SCAN_VALUE_100_MS, "100 ms"), TRX(ZONE_SCAN_VALUE_150_MS, "150 ms"),
+ 	TRX(ZONE_SCAN_VALUE_250_MS, "250 ms"), TRX(ZONE_SCAN_VALUE_500_MS, "500 ms") };
++static const int16_t v_scan_delay[] = { 0, 500, 1000, 2000, 3000, 5000, 10000 };
++static const tr_id_t n_scan_delay[] = { TRX(VALUE_0_S, "0 s"), TRX(VALUE_0_5_S, "0.5 s"), TRX(VALUE_1_S, "1 s"),
++	TRX(VALUE_2_S, "2 s"), TRX(VALUE_3_S, "3 s"), TRX(VALUE_5_S, "5 s"), TRX(VALUE_10_S, "10 s") };
+ static const set_item_t s_zone_scan[] = {
+ 	LIST(TRN(SET_LABEL_EMPTY_CHANNEL_DWELL, "Empty-channel dwell"), "zone scan speed delay channel time",
+ 	     UI_SET_ZONE_SCAN_DWELL, v_zone_scan_dwell, n_zone_scan_dwell),
++	LIST(TRN(SET_LABEL_SCAN_RESUME_DELAY, "Resume after call"), "scan delay hang resume hold DMR",
++	     UI_SET_SCAN_DELAY_MS, v_scan_delay, n_scan_delay),
+ };
+
+ static const int16_t v_permit[] = { RADIO_PERMIT_DEFAULT, RADIO_PERMIT_CHIRP, RADIO_PERMIT_TRIPLE };
+@@ -8118,6 +8123,7 @@
+ 		return !CONFIG_BEEP ? TR(WHY_TONES_NOT_IN_BUILD, "Tones: not in this build") : feats() & UI_FEAT_SCAN ?
+ 			NULL : TR(WHY_SCAN_NOT_IN_BUILD, "Scan: not in this build");
+ 	case UI_SET_ZONE_SCAN_DWELL:
++	case UI_SET_SCAN_DELAY_MS:
+ 		return feats() & UI_FEAT_SCAN ? NULL : TR(WHY_SCAN_NOT_IN_BUILD, "Scan: not in this build");
+ 	case UI_SET_EMERGENCY_TONE:
+ 		return !CONFIG_BEEP ? TR(WHY_TONES_NOT_IN_BUILD, "Tones: not in this build") :
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -1647,6 +1647,40 @@
+ 	return x;
+ }
+
++// Put the received access code before the destination and leave the line free until there is a call.
++static bool monitor_air_fields(sbuf_t *b, const radio_view_t *v)
++{
++	if (!v->dmr.hear_all_latch)
++		return false;
++	uint32_t dst;
++	bool unit;
++#if CONFIG_P25
++	if (v->ch.mode == RADIO_MODE_P25 && (v->p25.flags & RADIO_P25_RX)) {
++		sb_str(b, "NAC ");
++		sb_hex(b, v->p25.nac, 3);
++		dst = v->p25.dst;
++		unit = (v->p25.flags & RADIO_P25_UNIT) != 0;
++	} else
++#endif
++#if CONFIG_NXDN
++	if (v->ch.mode == RADIO_MODE_NXDN && (v->nxdn.flags & RADIO_NXDN_RX)) {
++		sb_str(b, "RAN ");
++		sb_u32(b, v->nxdn.ran, 1);
++		dst = v->nxdn.dst;
++		unit = (v->nxdn.flags & RADIO_NXDN_UNIT) != 0;
++	} else
++#endif
++	{
++		(void)b;
++		return false;
++	}
++	if (dst != 0) {
++		sb_str(b, unit ? " ID " : " TG ");
++		sb_u32(b, dst, 1);
++	}
++	return true;
++}
++
+ static void draw_chips(const radio_view_t *v, const ui_state_t *s)
+ {
+ 	const ui_layout_t *L = &ui_layout;
+@@ -1679,6 +1713,14 @@
+ 			if (x + gfx_text_width(f, buf) <= w)
+ 				gfx_text(f, x, y, buf, ui_col.fg);
+ 		}
++		return;
++	}
++	sb_init(&b, buf, sizeof buf);
++	if (monitor_air_fields(&b, v)) {
++		char fit[48];
++		gfx_text_fit(f, buf, w, fit, sizeof fit);
++		x = gfx_text(f, x, y, fit, ui_col.rx) + f->w;
++		draw_chip_dmon(f, x, y, w, v);
+ 		return;
+ 	}
+ 	bool pw_temp = v->power != channel_power(v);
+@@ -2362,8 +2404,11 @@
+ 		sb_chr(&b, ' ');
+ 	}
+ 	sb_str(&b, "TS");
+-	sb_u32(&b, d->rx_ts ? d->rx_ts : d->ts, 1);
+-	if (d->hear_all && d->rx_cc != d->cc) {	// found by digital monitor: the code to set to talk to them
++	if (d->hear_all && !d->rx_ts)
++		sb_chr(&b, '-');
++	else
++		sb_u32(&b, d->rx_ts ? d->rx_ts : d->ts, 1);
++	if (d->hear_all) {
+ 		sb_str(&b, " CC");
+ 		sb_u32(&b, d->rx_cc, 1);
+ 	}
+@@ -2753,6 +2798,12 @@
+ 	gfx_text(f, x, y, fit, tx ? ui_col.tx : ui_col.fg);
+ 	y += room;
+ 	sb_init(&b, buf, sizeof buf);
++	if (monitor_air_fields(&b, v)) {
++		gfx_text_fit(L->small, buf, w, fit, sizeof fit);
++		x = centered_home() ? (w - gfx_text_width(L->small, fit)) / 2 : 0;
++		gfx_text(L->small, x, y, fit, ui_col.rx);
++		return;
++	}
+ #if CONFIG_YSF
+ 	if (v->state == RS_RX && ysf_caller_visible(v))
+ 		sb_str(&b, v->ysf.src);
+diff --git a/docs/user/12-scan.md b/docs/user/12-scan.md
+--- a/docs/user/12-scan.md
++++ b/docs/user/12-scan.md
+@@ -34,7 +34,9 @@
+ - Turn on [digital monitor](09-dmr.md) before you start the scan to stop on a call to any talkgroup, not only
+   the channel's talkgroup and RX group list. It stays on at every channel and on the one the scan ends on. Pressing
+   **Monitor** on a DMR channel during the scan turns it off or on for the rest of the scan.
+-- On a signal the scan holds. It moves on 2 s after the signal ends, and stays if the signal comes back.
++- **Tools > Zone scan speed > Resume after call** sets how long a zone or VFO scan stays after a call ends.
++  Choose 0 to 10 s. The default is 2 s. The delay starts again each time a reply ends on the same channel.
++  Dual watch has its own delay.
+ - Holding **Monitor** pauses the scan.
+
+ ## While scanning
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -72,6 +72,8 @@
+ Each stop: VFO, zone and dual-watch scans use a 25 ms settle to ignore readings from the previous frequency.
+ Tools > Zone scan speed offers 25, 50, 75, 100, 150, 250 and 500 ms for empty channels. The default is 25 ms.
+ The choice is saved and applies during a zone scan. VFO and dual watch use `scan_dwell_ms`.
++**Resume after call** in the same menu edits the existing `scan_delay_ms` setting for zone and VFO scans.
++The new delay applies to a running scan. Dual watch uses its independent delay.
+ FM, P25, NXDN and YSF stops can use 25 ms. DMR needs at least 75 ms so the receiver gets three status readings
+ across the TDMA slots. Dual watch holds each frequency for at least 150 ms.
+ A signal is "active" when FM squelch opens (with the RX tone if the channel needs one) or DMR plays a call

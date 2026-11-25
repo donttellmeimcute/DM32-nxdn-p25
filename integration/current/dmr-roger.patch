@@ -1,0 +1,258 @@
+diff --git a/core/settings/settings.h b/core/settings/settings.h
+--- a/core/settings/settings.h
++++ b/core/settings/settings.h
+@@ -429,6 +429,7 @@
+ #define SETTINGS_RS_KEY_BEEP		0x10u
+ #define SETTINGS_RS_NO_TALK_PERMIT	0x20u	// the talk permit tone off (0 = on, as before)
+ #define SETTINGS_RS_SCAN_DWELL_SET	0x40u	// dwell saved explicitly; old records migrate the legacy 150 ms default
++#define SETTINGS_RS_DMR_ROGER		0x80u	// local DMR PTT release tone (off in older settings)
+ // settings_t.rpt_beacon (taken with the roam_ fields)
+ #define SETTINGS_RPT_BEACON		0x01u	// our repeater roles key an idle beacon
+ #define SETTINGS_RPT_SFR_RX		0x06u	// an SFR user channel hears: 0 the repeat, 1 both (first), 2 both (dual-path RX)
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -64,6 +64,7 @@
+ 	uint16_t tot_s;		// the radio's TX time-out, for channels whose own is 0; 0 = none
+ 	uint8_t tot_warn_s;	// warning beep this long before the time-out, 0 = none
+ 	uint8_t bcl;		// radio_bcl_t
++	bool dmr_roger;		// local DMR voice end tone
+ 	bool roger_beep;	// FM: a short tone pair at the end of each transmission (CONFIG_FM_TX_TONES)
+ 	bool tx_inhibit;	// refuse every transmission
+ 	// Scan (CONFIG_SCAN)
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -310,6 +310,9 @@
+ 	bool vol_hold;			// RREQ_VOLUME_HOLD: the level stays, the knob is ignored
+
+ 	bool ptt;			// PTT held
++#if CONFIG_DMR && CONFIG_BEEP
++	bool dmr_roger_pending;		// local tone after the stack finishes a voice transmission
++#endif
+ #if CONFIG_FM && CONFIG_BEEP
+ 	uint32_t fm_permit_ms;	// PTT is held while the local FM talk-permit tone plays
+ #endif
+diff --git a/core/radio/beep.h b/core/radio/beep.h
+--- a/core/radio/beep.h
++++ b/core/radio/beep.h
+@@ -35,6 +35,7 @@
+ 	BEEP_SYSTEM_BACK,	// a trunked system found again, the radio back on it from its fallback channel
+ 	BEEP_TX_PERMIT_DV,	// P25 / NXDN: talk now, played before keying (Motorola ASTRO 25 style)
+ 	BEEP_CALL_ALERT,	// incoming DMR call alert
++	BEEP_DMR_ROGER,		// local PTT release confirmation
+ 	BEEP_COUNT
+ } beep_t;
+
+diff --git a/core/radio/beep.c b/core/radio/beep.c
+--- a/core/radio/beep.c
++++ b/core/radio/beep.c
+@@ -29,6 +29,10 @@
+ static const beep_seg_t p_permit[] = { { 1568, 40 }, { 1047, 40 }, { 1568, 40 }, { 1319, 40 } };
+ static const beep_seg_t p_permit_dv[] = { { 910, 70 }, { 0, 20 }, { 910, 30 }, { 0, 20 }, { 910, 60 } };
+ static const beep_seg_t p_deny[] = { { 300, 400 } };
++#if CONFIG_DMR
++// A descending chirp for PTT release, using the notes from the DMR permit.
++static const beep_seg_t p_dmr_roger[] = { { 1568, 40 }, { 1319, 40 }, { 1047, 60 } };
++#endif
+ static const beep_seg_t p_call_end[] = { { 1200, 50 }, { 0, 30 }, { 900, 70 } };
+ static const beep_seg_t p_tot[] = { { 1000, 100 }, { 0, 100 }, { 1000, 100 } };
+ static const beep_seg_t p_batt_low[] = { { 800, 150 }, { 0, 100 }, { 600, 200 } };
+@@ -57,6 +61,9 @@
+ 	[BEEP_TX_PERMIT] = PAT(p_permit),
+ 	[BEEP_TX_DENY] = PAT(p_deny),
+ 	[BEEP_CALL_END] = PAT(p_call_end),
++#if CONFIG_DMR
++	[BEEP_DMR_ROGER] = PAT(p_dmr_roger),
++#endif
+ 	[BEEP_TOT_WARN] = PAT(p_tot),
+ 	[BEEP_BATTERY_LOW] = PAT(p_batt_low),
+ 	[BEEP_BATTERY_CRIT] = PAT(p_batt_crit),
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -2181,6 +2181,9 @@
+ 	sfr_rpt_end(sm);
+ #endif
+ 	dmr_call_ptt(false);
++#if CONFIG_BEEP
++	sm->dmr_roger_pending = false;
++#endif
+ 	dmr_call_stop();
+ 	ambeVoiceStop();
+ 	if (sm->dmr_keyed) {
+@@ -2423,6 +2426,11 @@
+ 			sm->ts_pending = 0;	// taken or refused now, never left for a later transmission
+ 			dmr_set_timeslot(sm, ts, sm->hotspot);
+ 		}
++#if CONFIG_BEEP
++		if (sm->dmr_roger_pending && cv->tx_error == DMR_TX_OK && !sm->view.ch.no_beep)
++			beep(sm, BEEP_DMR_ROGER);
++		sm->dmr_roger_pending = false;
++#endif
+ 		if (cv->tx_error == DMR_TX_ERR_NO_REPEATER && !data) {	// a data sender hears about its own failure
+ 			// A short press goes on waking the repeater after the release: its failure still gets the deny tone and
+ 			// the deny flash
+@@ -2598,6 +2606,9 @@
+ 		}
+ 		sm->dmr_keyed = true;
+ 	}
++#if CONFIG_BEEP
++	sm->dmr_roger_pending = false;
++#endif
+ 	one_shot_start(sm);
+ 	sm->view.state = RS_TX;
+ 	sm->view.tx_auto = false;
+@@ -7261,6 +7272,10 @@
+ #endif
+ #if CONFIG_DMR
+ 	if (sm->dmr_running) {
++#if CONFIG_BEEP
++		sm->dmr_roger_pending = roger && sm->set.dmr_roger && !sm->view.tx_auto &&
++				       dmr_call_view()->phase == DMR_CALL_PHASE_TX_VOICE;
++#endif
+ 		dmr_call_ptt(false);
+ 		dmr_call_poll(now_ms);
+ 		if (sm->view.state == RS_TX) {
+@@ -8119,6 +8134,7 @@
+ 	s->tot_warn_s = st->rs_tot_warn_s;
+ 	s->bcl = st->rs_bcl;
+ 	s->roger_beep = (st->rs_flags & SETTINGS_RS_ROGER_BEEP) != 0;
++	s->dmr_roger = (st->rs_flags & SETTINGS_RS_DMR_ROGER) != 0;
+ 	s->tx_inhibit = (st->rs_flags & SETTINGS_RS_TX_INHIBIT) != 0;
+ 	s->scan_priority = (st->rs_flags & SETTINGS_RS_SCAN_PRIORITY) != 0;
+ 	s->scan_beep = (st->rs_flags & SETTINGS_RS_SCAN_BEEP) != 0;
+@@ -8153,7 +8169,8 @@
+ 	st->rs_flags = (uint8_t)((s->roger_beep ? SETTINGS_RS_ROGER_BEEP : 0) | (s->tx_inhibit ? SETTINGS_RS_TX_INHIBIT : 0) |
+ 				 (s->scan_priority ? SETTINGS_RS_SCAN_PRIORITY : 0) |
+ 				 (s->scan_beep ? SETTINGS_RS_SCAN_BEEP : 0) | (s->key_beep ? SETTINGS_RS_KEY_BEEP : 0) |
+-				 (s->talk_permit ? 0 : SETTINGS_RS_NO_TALK_PERMIT) | SETTINGS_RS_SCAN_DWELL_SET);
++				 (s->talk_permit ? 0 : SETTINGS_RS_NO_TALK_PERMIT) | SETTINGS_RS_SCAN_DWELL_SET |
++				 (s->dmr_roger ? SETTINGS_RS_DMR_ROGER : 0));
+ 	st->rs_scan_resume = s->scan_resume;
+ 	st->rs_scan_hold_s = s->scan_hold_s;
+ 	st->rs_scan_delay_ms = s->scan_delay_ms;
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -465,6 +465,7 @@
+ 	UI_SET_DIGITAL_RX_TRIM,	// decoded digital voice level (Settings > Sound), in dB
+ 	UI_SET_DMR_REPLAY,	// session-only recording opt-in
+ 	UI_SET_SCAN_DELAY_MS,	// Tools > Zone scan speed: wait after a received call
++	UI_SET_DMR_ROGER,	// local Motorola-style PTT release tone
+ 	UI_SET_COUNT
+ } ui_setting_t;
+
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -345,6 +345,9 @@
+ 	case UI_SET_SCAN_DELAY_MS:
+ 		radio_get_settings(&rs);
+ 		return rs.scan_delay_ms;
++	case UI_SET_DMR_ROGER:
++		radio_get_settings(&rs);
++		return rs.dmr_roger;
+ 	case UI_SET_CALL_END_TONE:
+ 	case UI_SET_TOT_WARN_TONE:
+ 	case UI_SET_BATTERY_TONE:
+@@ -480,6 +483,7 @@
+ 	case UI_SET_VFO_SCAN_HIGH:
+ 	case UI_SET_ZONE_SCAN_DWELL:
+ 	case UI_SET_SCAN_DELAY_MS:
++	case UI_SET_DMR_ROGER:
+ #if CONFIG_SFR
+ 	case UI_SET_SFR_RX:
+ #endif
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -633,6 +633,9 @@
+ 	case UI_SET_ROGER_BEEP:
+ 		rs.roger_beep = value != 0;
+ 		break;
++	case UI_SET_DMR_ROGER:
++		rs.dmr_roger = value != 0;
++		break;
+ 	case UI_SET_VFO_SCAN_LOW:
+ 		rs.scan_lo_hz = value > 0 ? (uint32_t)value : 0;
+ 		break;
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -7621,6 +7621,7 @@
+ #endif
+ 	LIST(TRN(SET_LABEL_TALK_PERMIT_SOUND, "Talk permit sound"), "FM analog chirp", UI_SET_PERMIT_STYLE, v_permit, n_permit),
+ 	TOGGLE(TRN(SET_LABEL_ROGER_BEEP, "FM roger beep"), "transmit end tone", UI_SET_ROGER_BEEP),
++	TOGGLE(TRN(SET_LABEL_DMR_ROGER, "DMR Motorola roger"), "local PTT release tone", UI_SET_DMR_ROGER),
+ #if CONFIG_DIGITAL_RX_TRIM
+ 	LIST(TRN(SET_LABEL_DIGITAL_RX_LEVEL, "Digital RX level"), "speaker loudness attenuation", UI_SET_DIGITAL_RX_TRIM,
+ 	     v_digital_rx_level, n_digital_rx_level),
+@@ -8111,6 +8112,7 @@
+ 	case UI_SET_ROGER_BEEP:
+ 		return CONFIG_FM_TX_TONES && board.radio != NULL && board.radio->tx_tone != NULL ? NULL :
+ 			TR(WHY_TONES_NOT_IN_BUILD, "Tones: not in this build");
++	case UI_SET_DMR_ROGER:
+ 	case UI_SET_CALL_END_TONE:
+ 		return CONFIG_DMR && CONFIG_BEEP ? NULL : CONFIG_BEEP ?
+ 			TR(WHY_DMR_NOT_IN_BUILD, "DMR: not in this build") :
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -5664,3 +5664,11 @@
+ msgctxt "PIN_READ_OFF"
+ msgid "CPS read PIN is off"
+ msgstr "PIN de lectura CPS desactivado"
++
++msgctxt "SET_LABEL_SCAN_RESUME_DELAY"
++msgid "Resume after call"
++msgstr "Reanudar tras llamada"
++
++msgctxt "SET_LABEL_DMR_ROGER"
++msgid "DMR Motorola roger"
++msgstr "Roger Motorola DMR"
+diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+--- a/core/ui/lang/it.po
++++ b/core/ui/lang/it.po
+@@ -5636,3 +5636,11 @@
+ msgctxt "SHARE_ERR_OFFER_GONE"
+ msgid "The offer is gone"
+ msgstr "L'offerta non c'è più"
++
++msgctxt "SET_LABEL_SCAN_RESUME_DELAY"
++msgid "Resume after call"
++msgstr "Riprendi dopo la chiamata"
++
++msgctxt "SET_LABEL_DMR_ROGER"
++msgid "DMR Motorola roger"
++msgstr "Roger Motorola DMR"
+diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+--- a/core/ui/lang/fr.po
++++ b/core/ui/lang/fr.po
+@@ -5636,3 +5636,11 @@
+ msgctxt "SHARE_ERR_OFFER_GONE"
+ msgid "The offer is gone"
+ msgstr "L'offre a expiré"
++
++msgctxt "SET_LABEL_SCAN_RESUME_DELAY"
++msgid "Resume after call"
++msgstr "Reprendre après l'appel"
++
++msgctxt "SET_LABEL_DMR_ROGER"
++msgid "DMR Motorola roger"
++msgstr "Roger Motorola DMR"
+diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+--- a/core/ui/lang/zh.po
++++ b/core/ui/lang/zh.po
+@@ -5638,3 +5638,11 @@
+ msgctxt "SHARE_ERR_OFFER_GONE"
+ msgid "The offer is gone"
+ msgstr "该邀请已失效"
++
++msgctxt "SET_LABEL_SCAN_RESUME_DELAY"
++msgid "Resume after call"
++msgstr "通话结束后恢复扫描"
++
++msgctxt "SET_LABEL_DMR_ROGER"
++msgid "DMR Motorola roger"
++msgstr "DMR Motorola 结束提示音"
