@@ -1,0 +1,100 @@
+diff --git a/core/ysf/ysf_engine.c b/core/ysf/ysf_engine.c
+index 34c07e0..2966a42 100644
+--- a/core/ysf/ysf_engine.c
++++ b/core/ysf/ysf_engine.c
+@@ -61,8 +61,10 @@ static void merge_dch(ysf_engine_t *e, const ysf_rx_frame_t *f)
+ 	if (f->fich.fi == YSF_FI_HEADER || f->fich.fi == YSF_FI_TERMINATOR) {
+ 		copy_call(c->dest, f->dch, 10);
+ 		copy_call(c->src, f->dch + 10, 10);
+-		copy_call(c->down, f->dch2, 10);
+-		copy_call(c->up, f->dch2 + 10, 10);
++		if (f->header_dch2_valid) {
++			copy_call(c->down, f->dch2, 10);
++			copy_call(c->up, f->dch2 + 10, 10);
++		}
+ 		return;
+ 	}
+ 	switch (f->fich.dt) {
+diff --git a/core/ysf/ysf_rx.c b/core/ysf/ysf_rx.c
+index fc45f45..82a7e0d 100644
+--- a/core/ysf/ysf_rx.c
++++ b/core/ysf/ysf_rx.c
+@@ -26,9 +26,14 @@ static void rx_frame(const air_frame_t *f, void *ctx)
+ 		r->fich_fail++;
+ 		return;
+ 	}
+-	if (!ysf_frame_decode_dch(frame, &out.fich, out.dch, out.dch2, &out.dch_len)) {
++	bool boundary = out.fich.fi == YSF_FI_HEADER || out.fich.fi == YSF_FI_TERMINATOR;
++	if (ysf_frame_decode_dch(frame, &out.fich, out.dch, out.dch2, &out.dch_len)) {
++		out.header_dch2_valid = boundary;
++	} else {
+ 		r->dch_fail++;
+-		out.dch_len = 0;
++		// CSD1 contains the source and destination and has its own CRC.
++		if (!boundary || !ysf_frame_decode_dch(frame, &out.fich, out.dch, NULL, &out.dch_len))
++			out.dch_len = 0;
+ 		// The CRC covers data only. Keep call boundaries and independently coded voice.
+ 		if (out.fich.fi == YSF_FI_COMMUNICATION && out.fich.dt == YSF_DT_DATA_FR)
+ 			return;
+diff --git a/core/ysf/ysf_rx.h b/core/ysf/ysf_rx.h
+index 6011e7d..66393a9 100644
+--- a/core/ysf/ysf_rx.h
++++ b/core/ysf/ysf_rx.h
+@@ -31,6 +31,7 @@ typedef struct {
+ 	uint8_t dch[20];	// first DCH's data (CSD1 / DN unit / DT unit)
+ 	uint8_t dch2[20];	// second DCH (CSD2 / Data FR DCH-2), zeros when none
+ 	unsigned dch_len;	// first DCH length in bytes: 20, 10 or 0 (absent or failed CRC)
++	bool header_dch2_valid;	// header/terminator CSD2 passed its own CRC
+ 	uint8_t voice[YSF_BLOCKS][18];	// voice bytes per 20 ms block (communication frames only;
+ 					// header/terminator frames carry DCHs there instead, voice_len 0)
+ 	uint8_t voice_first; // first voice block (three slots hold the VW sub-header and reserved data)
+diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
+index b23aa29..2da81cf 100644
+--- a/docs/spec/ysf.md
++++ b/docs/spec/ysf.md
+@@ -82,6 +82,8 @@ error); weight 3 with odd parity is four errors and is rejected.
+ | DCH2 (DN) | 10 bytes | 25 bytes (200 bits) |
+ 
+ Home displays the decoded source call sign during an active reception.
++The source and destination in a CRC-valid header are still used when the
++separately protected downlink and uplink block fails its CRC.
+ 
+ A header or terminator always carries two DCH1s (CSD1: destination, source,
+ downlink, uplink; CSD2: downlink, uplink, remote 1..4). A V/D-1 or DN
+diff --git a/tests/host/ysfEngineTest.c b/tests/host/ysfEngineTest.c
+index 9d34d41..3454f11 100644
+--- a/tests/host/ysfEngineTest.c
++++ b/tests/host/ysfEngineTest.c
+@@ -521,16 +521,19 @@ static void send_frame(const uint8_t frame[YSF_FRAME_BYTES])
+ 
+ static void testBadData(uint8_t dt)
+ {
+-	ysf_engine_cfg_t cfg = base_cfg(dt, false);
++	ysf_engine_cfg_t cfg = base_cfg(dt, true);
+ 	ysf_fich fich = { .fi = YSF_FI_HEADER, .sc = 7, .dt = dt };
+-	const uint8_t csd1[20] = "DEST      SOURCE    ";
+-	const uint8_t csd2[20] = "DOWN      UP        ";
++	const uint8_t csd1[] = "DEST      SOURCE    ";
++	const uint8_t csd2[] = "DOWN      UP        ";
+ 	uint8_t frame[YSF_FRAME_BYTES];
+ 
+ 	begin(1, &cfg, &hooks);
+ 	ysf_frame_build(&fich, csd1, csd2, frame);
++	for (unsigned b = 0; b < YSF_BLOCKS; b++)
++		memset(frame + YSF_SYNC_BYTES + YSF_FICH_BYTES + 18 * b + 9, 0, 9);
+ 	send_frame(frame);
+-	CHECK(!strcmp(r[1].e.call.src, "SOURCE"), "call header gives the source");
++	CHECK(r[1].e.rx.dch_fail == 1 && !strcmp(r[1].e.call.src, "SOURCE") && !r[1].e.call.down[0],
++	      "valid header source survives the other data block failing its CRC");
+ 
+ 	fich.fi = YSF_FI_COMMUNICATION;
+ 	fich.ft = 7;
+@@ -547,7 +550,7 @@ static void testBadData(uint8_t dt)
+ 			memcpy(payload + dch_bytes, silence, sizeof silence);
+ 	}
+ 	send_frame(frame);
+-	CHECK(r[1].e.rx.dch_fail == 1 && r[1].ndata == 0, "bad data is counted and never delivered");
++	CHECK(r[1].e.rx.dch_fail == 2 && r[1].ndata == 0, "bad data is counted and never delivered");
+ 	CHECK(r[1].nvoice == YSF_BLOCKS && !strcmp(r[1].e.call.src, "SOURCE"),
+ 	      "bad data leaves all five voice blocks and the callsign intact");
+ 	for (unsigned b = 0; b < YSF_BLOCKS && b < r[1].nvoice; b++)
