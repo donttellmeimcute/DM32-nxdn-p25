@@ -1,0 +1,281 @@
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index 6ea4644..23fa47d 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -91,7 +91,9 @@ void radio_ysf_set_quick(const radio_ysf_settings_t *s, uint8_t mask, bool vfo)
+ 		if (to->dest[0] == '\0')
+ 			strcpy(to->dest, YSF_CP_DEST_ALL);
+ 	}
+-	quick_mask = vfo ? 0 : (uint8_t)(quick_mask | mask);
++	if ((mask & RADIO_YSF_QUICK_DT) && vfo)
++		set.dt = s->dt;
++	quick_mask = vfo ? 0 : (uint8_t)(quick_mask | (mask & ~RADIO_YSF_QUICK_DT));
+ }
+ 
+ uint8_t radio_ysf_quick_settings(radio_ysf_settings_t *out)
+diff --git a/core/radio/radio_ysf.h b/core/radio/radio_ysf.h
+index 856a3cc..77db677 100644
+--- a/core/radio/radio_ysf.h
++++ b/core/radio/radio_ysf.h
+@@ -85,6 +85,7 @@ void radio_ysf_set_settings(const radio_ysf_settings_t *s);	// radio task (RREQ_
+ // The Quick menu's changes (RREQ_YSF_SET with a mask): which fields radio_ysf_set_quick takes, as P25's
+ #define RADIO_YSF_QUICK_DGID	0x01u	// the DG-ID (receive and transmit)
+ #define RADIO_YSF_QUICK_DEST	0x02u	// the destination call sign PTT calls
++#define RADIO_YSF_QUICK_DT	0x04u	// voice data type in the VFO
+ void radio_ysf_set_quick(const radio_ysf_settings_t *s, uint8_t mask, bool vfo);	// radio task
+ uint8_t radio_ysf_quick_settings(radio_ysf_settings_t *out);	// the mask in force, the values in out (any task)
+ void radio_ysf_clear_quick(void);
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index 85aa518..bb9d6a0 100644
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -1734,6 +1734,16 @@ static void quick_activate(int tile)
+ 		ui_st.air_edit = quick_air_target_current();
+ 		ui_st.quick_edit = true;
+ 		break;
++#if CONFIG_YSF
++	case QT_YSF_DT: {
++		uint8_t dt = view->ysf.tx_dt;
++		uint8_t next = dt == YSF_DT_VD_MODE1 ? YSF_DT_VD_MODE2 :
++			dt == YSF_DT_VD_MODE2 && CONFIG_P25 && CONFIG_IMBE ? YSF_DT_VOICE_FR : YSF_DT_VD_MODE1;
++		if (!ui_svc_ysf_dt(next))
++			quick_unavailable(kind);
++		break;
++	}
++#endif
+ 	case QT_YSF_DEST:
+ #endif
+ #if CONFIG_YSF && CONFIG_CHANNEL_EDIT
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index ce11cbb..ecb09c4 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -1582,13 +1582,17 @@ static void draw_talk(const radio_view_t *v, bool label_first)
+ }
+ 
+ #if CONFIG_YSF
++static const char *ysf_dt_name(uint8_t dt)
++{
++	return dt == YSF_DT_VD_MODE1 ? "V/D-1" : dt == YSF_DT_DATA_FR ? "Data" : dt == YSF_DT_VD_MODE2 ? "DN" : "VW";
++}
++
+ static void sb_ysf_dg(sbuf_t *b, uint8_t dgid, uint8_t dt)
+ {
+ 	sb_str(b, "DG ");
+ 	sb_u32(b, dgid, 1);
+ 	sb_chr(b, ' ');
+-	sb_str(b, dt == YSF_DT_VD_MODE1 ? "V/D-1" : dt == YSF_DT_DATA_FR ? "Data" :
+-		dt == YSF_DT_VD_MODE2 ? "DN" : "VW");
++	sb_str(b, ysf_dt_name(dt));
+ }
+ #endif
+ 
+@@ -4471,8 +4475,12 @@ uint8_t ui_quick_kind(int pos, const radio_view_t *v)
+ 	bool air_mode = v->ch.mode == RADIO_MODE_P25 || v->ch.mode == RADIO_MODE_NXDN || v->ch.mode == RADIO_MODE_YSF ||
+ 			v->ch.mode == RADIO_MODE_M17;
+ 	uint8_t kind = v->ch.mode == RADIO_MODE_DMR ? dmr[pos] : air_mode ? air[pos] : fm[pos];
+-	if (air_mode && v->ch.mode == RADIO_MODE_YSF && pos == 7)
+-		kind = QT_YSF_DEST;
++	if (v->ch.mode == RADIO_MODE_YSF) {
++		if (pos == 7)
++			return QT_YSF_DEST;
++		if (v->vfo && pos == 2)
++			return QT_YSF_DT;
++	}
+ #if CONFIG_NXDN
+ 	if (v->vfo && v->ch.mode == RADIO_MODE_NXDN && pos == 8)
+ 		return QT_NXDN_TRUNK;	// in place of Bright (Settings keeps it)
+@@ -4518,6 +4526,7 @@ bool ui_quick_tile(int tile, const radio_view_t *v, const ui_state_t *s, char *l
+ 		[QT_AIR_TG] = TRX(QUICK_LABEL_TG, "TG"),
+ 		[QT_YSF_DEST] = TRN(QUICK_LABEL_DEST, TEXT_ALT_OPEN "Destination" TEXT_ALT_NEXT "Dest" TEXT_ALT_CLOSE),
+ 		[QT_NXDN_TRUNK] = TRN(QUICK_LABEL_TRUNK, "Trunk"),
++		[QT_YSF_DT] = TRN(CHAN_LABEL_DATA_TYPE, "Data type"),
+ 	};
+ 	uint8_t kind = ui_quick_kind(tile, v);
+ 	bool editing = s->quick_edit && s->quick_focus == tile;
+@@ -4678,6 +4687,11 @@ bool ui_quick_tile(int tile, const radio_view_t *v, const ui_state_t *s, char *l
+ 		else if (v->nxdn.tstate == RADIO_NXDN_TS_VOICE || v->nxdn.tstate == RADIO_NXDN_TS_TALK)
+ 			sb_chr(&b, '*');	// on a voice channel
+ 		return true;
++#endif
++#if CONFIG_YSF
++	case QT_YSF_DT:
++		sb_str(&b, ysf_dt_name(v->ysf.tx_dt));
++		return !v->hotspot;
+ #endif
+ 	case QT_YSF_DEST:
+ #if CONFIG_YSF
+diff --git a/core/ui/ui_screens.h b/core/ui/ui_screens.h
+index 3bbba00..f9d6ea9 100644
+--- a/core/ui/ui_screens.h
++++ b/core/ui/ui_screens.h
+@@ -163,6 +163,7 @@ enum {
+ 	QT_AIR_CODE,		// P25 NAC, NXDN RAN or YSF DG-ID (tile 2 on those modes)
+ 	QT_AIR_TG,		// the talk group PTT calls (P25/NXDN, tile 8)
+ 	QT_YSF_DEST,		// the YSF destination PTT calls (tile 8)
++	QT_YSF_DT,		// the YSF VFO voice data type (tile 3)
+ 	QT_NXDN_TRUNK,		// the NXDN VFO's Type-C trunking: off, our group, every group (tile 9, nxdn-trunking.md)
+ };
+ // The tile kind at position 0..8 (keys 1..9) for this channel or the VFO
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+index 07352aa..129aeff 100644
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -101,6 +101,7 @@ bool ui_svc_air_target(uint32_t id);
+ // The NXDN VFO's trunking (RADIO_NXDN_TRUNK_*); false: not an NXDN VFO, or not in this build
+ bool ui_svc_nxdn_trunk(uint8_t mode);
+ bool ui_svc_ysf_destination(const char *dest);
++bool ui_svc_ysf_dt(uint8_t dt);
+ // The VFO's SFR role (CONFIG_SFR, sfr.md 4): a as a channel's SFR byte A; false: not in this build
+ bool ui_svc_vfo_sfr(uint8_t a);
+ bool ui_svc_vfo_mode(uint8_t mode, uint8_t variant);
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+index 45dea8d..9868c91 100644
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -291,6 +291,23 @@ bool ui_svc_ysf_destination(const char *dest)
+ #endif
+ }
+ 
++bool ui_svc_ysf_dt(uint8_t dt)
++{
++#if CONFIG_YSF
++	radio_get_view(&ui_svc_view);
++	if (!ui_svc_view.vfo || ui_svc_view.hotspot || ui_svc_view.ch.mode != RADIO_MODE_YSF ||
++	    (dt != YSF_DT_VD_MODE1 && dt != YSF_DT_VD_MODE2 &&
++	     !(CONFIG_P25 && CONFIG_IMBE && dt == YSF_DT_VOICE_FR)))
++		return false;
++	radio_ysf_settings_t s = { .dt = dt };
++	radio_req_ysf_quick(&s, RADIO_YSF_QUICK_DT);
++	return true;
++#else
++	(void)dt;
++	return false;
++#endif
++}
++
+ bool ui_svc_vfo_sfr(uint8_t a)
+ {
+ #if CONFIG_SFR
+diff --git a/core/ui/ui_svc_stub.c b/core/ui/ui_svc_stub.c
+index 58f49b2..d6171f8 100644
+--- a/core/ui/ui_svc_stub.c
++++ b/core/ui/ui_svc_stub.c
+@@ -33,6 +33,7 @@ WEAK bool ui_svc_air_code(uint32_t code) { (void)code; return false; }
+ WEAK bool ui_svc_air_target(uint32_t id) { (void)id; return false; }
+ WEAK bool ui_svc_nxdn_trunk(uint8_t mode) { (void)mode; return false; }
+ WEAK bool ui_svc_ysf_destination(const char *dest) { (void)dest; return false; }
++WEAK bool ui_svc_ysf_dt(uint8_t dt) { (void)dt; return false; }
+ WEAK bool ui_svc_vfo_sfr(uint8_t a) { (void)a; return false; }
+ WEAK bool ui_svc_mode(uint8_t mode) { (void)mode; return false; }
+ WEAK bool ui_svc_vfo_mode(uint8_t mode, uint8_t variant) { (void)mode; (void)variant; return false; }
+diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
+index 4e79acd..994ebd6 100644
+--- a/docs/spec/ysf.md
++++ b/docs/spec/ysf.md
+@@ -189,9 +189,10 @@ any call starts; a DG-ID change mid-call ends the old call.
+ ## 8. The channel kind
+ 
+ The VFO defaults to DN (V/D mode 2) at Narrow deviation. Its W/N selection
+-controls the deviation independently of the data type. The debug link can set
+-a different data type, including V/D mode 1. Stored YSF channels use the data
+-type and deviation from their own parameter block.
++controls deviation independently of the data type. Quick's Data type tile
++cycles V/D-1, DN and VW (with full-rate voice in the build). This radio-wide
++VFO setting is held in RAM, along with the other live YSF parameters. Stored
++YSF channels use the data type and deviation from their own parameter block.
+ 
+ The radio glue is written: `RADIO_MODE_YSF`, `CODEPLUG_KIND_YSF` (kind 6),
+ `core/radio/radio_ysf.c`, the channel editor rows, the mode row, dual watch,
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index ef322da..3b1093c 100644
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -421,8 +421,8 @@ Host tested only: it has not been tried on air against a real YSF radio yet.
+ - Home shows **YSF** for both Wide and Narrow, including on the selected side in dual watch. The VFO's Quick menu
+   shows **YSF W** or **YSF N**. Home also shows what PTT calls and the DG-ID and data type. During a call it shows who
+   calls and where, or why the call isn't played. FM's tone and width tiles say "FM only: this is YSF".
+-- The data type, the DG-IDs, the deviation and the call signs can be changed only from a computer for now
+-  (`rfoundry_debug.py radio ysf`), and the change lasts until the radio is switched off.
++- **Quick → 3 Data type** cycles **V/D-1**, **DN** and **VW**. VW is offered when full-rate voice is built in.
++  The selection stays in memory until the radio is switched off. **Quick → 4 Mode** selects the YSF W/N deviation.
+ - Some radios only transmit YSF or only receive it ([feature matrix](../feature-matrix.md)). One that only receives
+   says "This mode: receive only" on PTT.
+ 
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 3121ca8..73dc637 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -11698,11 +11698,28 @@ static void test_ysf_vfo_tx(void)
+ 		CHECK(!hw.keyed && !fair[0].on);
+ 		ysf_engine_end(&receiver);
+ 	}
++	// The Quick selection uses the live engine and applies without changing deviation or frequency.
++	uint32_t hz = sm.view.ch.rx_hz;
++	CHECK(ui_svc_ysf_dt(YSF_DT_VD_MODE1));
++	run(100);
++	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VD_MODE1);
++#if CONFIG_P25 && CONFIG_IMBE
++	CHECK(ui_svc_ysf_dt(YSF_DT_VOICE_FR));
++	run(100);
++	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VOICE_FR);
++#else
++	CHECK(!ui_svc_ysf_dt(YSF_DT_VOICE_FR));
++#endif
++	CHECK(ui_svc_ysf_dt(YSF_DT_VD_MODE2));
++	run(100);
++	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VD_MODE2 &&
++	      sm.view.ch.rx_hz == hz && (sm.view.ysf.flags & RADIO_YSF_NARROW) != 0);
+ 	v_encode_hook = NULL;
+ 	aud.feed = aud.feed_signal = air_clock_handoff = false;
+ 	kv_t3_clear();
+ 	req(RREQ_VFO, 0);
+ 	run(100);
++	CHECK(!ui_svc_ysf_dt(YSF_DT_VD_MODE1));
+ }
+ 
+ static void test_ysf_pcm_handoff(void)
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 8d3e544..0917720 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2113,6 +2113,20 @@ bool ui_svc_air_target(uint32_t id)
+ 	return false;
+ }
+ 
++bool ui_svc_ysf_dt(uint8_t dt)
++{
++#if CONFIG_YSF
++	to_selected();
++	if (!view.vfo || view.ch.mode != RADIO_MODE_YSF)
++		return false;
++	view.ysf.tx_dt = dt;
++	return true;
++#else
++	(void)dt;
++	return false;
++#endif
++}
++
+ bool ui_svc_ysf_destination(const char *dest)
+ {
+ #if CONFIG_YSF
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 58e9939..d982834 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -92,6 +92,14 @@ static const flow_t flows[] = {
+ 	{ "YSF Quick: DG-ID 00", "dlmode:ysf", "quick 2 0 0 ok", "screen=quick shows=00 aircode=0 temporary=1", 5, false },
+ 	{ "YSF Quick: destination", "dlmode:ysf", "quick 8 back back back back back back ok",
+ 	  "screen=quick airdest=ALL temporary=1", 9, false },
++#if CONFIG_P25 && CONFIG_IMBE
++	{ "YSF VFO Quick: DN to VW", "vfokey dlmode:ysf ysfdt:2", "quick 3",
++	  "screen=quick shows=Data_type shows=VW", 2, false },
++	{ "YSF VFO Quick: VW to V/D-1", "vfokey dlmode:ysf ysfdt:2", "quick 3 3",
++	  "screen=quick shows=V/D-1", 3, false },
++	{ "YSF VFO Quick: V/D-1 to DN", "vfokey dlmode:ysf ysfdt:0", "quick 3",
++	  "screen=quick shows=DN", 2, false },
++#endif
+ 	{ "YSF VFO Quick: DG-ID stays in RAM", "vfokey dlmode:ysf", "quick 2 9 9 ok",
+ 	  "screen=quick aircode=99 temporary=0 vfo=1", 5, false },
+ #endif
