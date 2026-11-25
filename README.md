@@ -9,7 +9,7 @@ Unete a mi grupo de telegram <https://t.me/+fGNVb8mR-eliYmMx>
 Firmware abierto para el **Baofeng DM-32UV** con **DMR, P25, NXDN48, NXDN96, M17, YSF y D-STAR**.
 El VFO recibe **FM comercial** por encima de 88 MHz y por debajo de 108 MHz. Para escuchar **105.7 MHz**,
 teclea **1 0 5 7** y pulsa **OK**. Funciona con **RX past bands** desactivado. A 108 MHz comienza la recepción AM.
-De **66 a 88 MHz** inclusive se mantiene la FM estrecha de 12.5 kHz, solo recepción. Su sensibilidad requiere pruebas en el DM-32UV. Desde el 17 de noviembre de 2026 se compila sobre
+De **66 a 88 MHz** inclusive se puede recibir FM analógica con ancho de 12.5 o 25 kHz en VFO y canales guardados. Su sensibilidad requiere pruebas en el DM-32UV. Desde el 17 de noviembre de 2026 se compila sobre
 [RadioFoundry](https://github.com/RadioFoundry/RadioFoundry) actual (commit `e89121e9`), que ya trae P25 y NXDN, más
 los cambios de esta rama en [`integration/current/base.patch`](integration/current/base.patch). Deriva de
 [Open25-DM32](https://github.com/tylerwatt12/Open25-DM32) (tylerwatt12). La mantiene **lyra XE1POC**.
