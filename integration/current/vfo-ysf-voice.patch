@@ -127,3 +127,41 @@ index a7f0029..3121ca8 100644
  	test_ysf_pcm_handoff();
  	test_ysf_quick();
  #endif
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+index 2ce324f..6ea4644 100644
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -29,7 +29,7 @@ static ysf_engine_t own_mem;
+ #endif
+ 
+ static const radio_ysf_settings_t defaults = {
+-	.dt = YSF_DT_VD_MODE1, .narrow = true, .rx_dgid = 0, .tx_dgid = 0,
++	.dt = YSF_DT_VD_MODE2, .narrow = true, .rx_dgid = 0, .tx_dgid = 0,
+ 	.dest = YSF_CP_DEST_ALL, .src = "", .down = "", .up = "",
+ };
+ static radio_ysf_settings_t set;
+@@ -69,7 +69,7 @@ void radio_ysf_set_settings(const radio_ysf_settings_t *s)
+ {
+ 	set = *s;
+ 	if (set.dt > YSF_DT_VOICE_FR)
+-		set.dt = YSF_DT_VD_MODE1;
++		set.dt = defaults.dt;
+ 	if (set.rx_dgid > RADIO_YSF_DGID_MAX)
+ 		set.rx_dgid = 0;
+ 	if (set.tx_dgid > RADIO_YSF_DGID_MAX)
+diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
+index 2da81cf..4e79acd 100644
+--- a/docs/spec/ysf.md
++++ b/docs/spec/ysf.md
+@@ -188,6 +188,11 @@ any call starts; a DG-ID change mid-call ends the old call.
+ 
+ ## 8. The channel kind
+ 
++The VFO defaults to DN (V/D mode 2) at Narrow deviation. Its W/N selection
++controls the deviation independently of the data type. The debug link can set
++a different data type, including V/D mode 1. Stored YSF channels use the data
++type and deviation from their own parameter block.
++
+ The radio glue is written: `RADIO_MODE_YSF`, `CODEPLUG_KIND_YSF` (kind 6),
+ `core/radio/radio_ysf.c`, the channel editor rows, the mode row, dual watch,
+ the debug link and zone import. The channel format is
