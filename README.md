@@ -135,8 +135,8 @@ La compilación predeterminada del DM-32UV desactiva el servidor de estado HTTP 
 
 `python3 tools/build_current.py --tree build/bench-1p25m --bench-tx-1p25m` crea
 `build/bench-1p25m/build/dm32-bench-1p25m/rfoundry_dm32.bin`. En esta imagen, el PTT de FM en
-VFO y canales admite de 222,0125 a 224,9875 MHz, con ancho de 12,5 kHz y excitación limitada
-a un valor de banco. La publicación automática usa la compilación normal.
+VFO y canales admite de 220,000 a 225,000 MHz inclusive, con ancho de 12,5 kHz y excitación limitada
+a un valor de banco. Se eligió 225 MHz como extremo de ensayo. El máximo físico en esta banda requiere medición. La publicación automática usa la compilación normal.
 
 En Estados Unidos, la banda de aficionados de 1,25 m admite voz FM de 222 a 225 MHz. En China continental e Italia, el tramo de 220 a 225 MHz está atribuido a otros servicios. El operador debe consultar el plan del país desde el que transmite. El firmware aplica los mismos límites de banco en todos los equipos y carece de selección automática por país. [FCC, 47 CFR § 97.301](https://www.law.cornell.edu/cfr/text/47/97.301) · [MIIT, tabla nacional de China](https://www.miit.gov.cn/cms_files/filemanager/1226211233/attach/20236/9086700eed45430bafe236efd1096fd3.pdf) · [ARI, bandas de aficionados en Italia](https://www.ari.it/index.php?option=com_content&view=article&id=120)
 

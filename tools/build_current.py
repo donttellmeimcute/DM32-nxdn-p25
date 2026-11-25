@@ -201,7 +201,7 @@ def main():
 	ap.add_argument('--no-m17', action='store_true', help='build with CONFIG_M17=n (M17 voice; Codec 2 real time on the MCU unverified)')
 	ap.add_argument('--no-mdc1200', action='store_true', help='build with CONFIG_MDC1200=n (MDC-1200 ID on FM channels)')
 	ap.add_argument('--bench-tx-1p25m', action='store_true',
-	                help='enable manual narrow-FM TX for conducted RF tests in the 222–225 MHz amateur band')
+	                help='enable manual narrow-FM TX for conducted RF tests from 220 through 225 MHz')
 	args = ap.parse_args()
 	tree = args.tree.resolve()
 	prepare(tree, args.dstar, args.bench_tx_1p25m)
