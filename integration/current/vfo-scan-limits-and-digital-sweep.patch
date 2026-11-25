@@ -69,14 +69,16 @@ diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
 diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
 --- a/core/ui/ui_menus.c
 +++ b/core/ui/ui_menus.c
-@@ -7216,7 +7216,9 @@
+@@ -7216,7 +7216,11 @@
  		if (!v->vfo || v->scan != 0)
  			break;
  		uint8_t id = tool == T_VFO_SCAN_LOW ? UI_SET_VFO_SCAN_LOW : UI_SET_VFO_SCAN_HIGH;
 -		ui_svc_setting_set(id, hold ? 0 : (int32_t)v->ch.rx_hz);
 +		int32_t value = hold ? 0 : (int32_t)v->ch.rx_hz;
-+		if (ui_svc_setting_set(id, value))
++		if (ui_svc_setting_set(id, value)) {
 +			ui_svc_apply(id, value);
++			ui_dirty();
++		}
  		break;
  	}
  	case T_RX_EXT:
@@ -180,3 +182,45 @@ diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
  	{ "11 scan stop", "ok 6 1", "back", "scanning=0", 1, false },
  	// Dual watch (docs/ux/dual-watch.md): on in a few presses, PTT on the selected channel, the other one press away
  	{ "11 dual watch: start, B the next channel", "", "quick 7", "dual=1 sel=A pos=3 bpos=4 screen=home", 2, false },
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -734,8 +734,10 @@
+ 	if (id == UI_SET_DMR_REPLAY)
+ 		return radio_req_dmr_replay(value ? RADIO_DMR_REPLAY_ON : RADIO_DMR_REPLAY_OFF);
+ #endif
+-	if (id < UI_SET_RAM_COUNT || id >= UI_SET_COUNT)
+-		return ui_svc_ram_set(id, value);
++	if (id == UI_SET_VFO_SCAN_LOW || id == UI_SET_VFO_SCAN_HIGH)
++		return true;	// ui_svc_apply updates the radio-owned value
++	if (id < UI_SET_RAM_COUNT || id >= UI_SET_COUNT)
++		return ui_svc_ram_set(id, value);
+ 	sim_late[id - UI_SET_RAM_COUNT] = value;
+ 	return true;
+ }
+@@ -2314,9 +2316,11 @@
+ 		changed();
+ 	} else if (id == UI_SET_BCAST_STEP)
+ 		changed();
+-	else if (id == UI_SET_RX_EXT)
+-		rx_ext_on = value != 0;
+-}
++	else if (id == UI_SET_RX_EXT)
++		rx_ext_on = value != 0;
++	else if (id == UI_SET_VFO_SCAN_LOW || id == UI_SET_VFO_SCAN_HIGH)
++		sim_late[id - UI_SET_RAM_COUNT] = value;
++}
+ bool ui_svc_scan_skip(void) { radio_req_channel_step(1); return true; }
+ // Dual watch as the radio core does it with a receiver per channel: the view stays on the selected channel (the
+ // keys act on it); `tune:a` / `tune:b` move it to a channel, as the alternating receiver does when a call holds it
+@@ -2802,7 +2806,9 @@
+ 			ui_svc_setting_set(id, id != UI_SET_SCAN_TONE);	// scan stop tone off, the other tones on
+ 	}
+ 	ui_svc_setting_set(UI_SET_ZONE_SCAN_DWELL, RADIO_ZONE_SCAN_DWELL_MS);
+-	ui_svc_setting_set(UI_SET_SCAN_DELAY_MS, 2000);
++	ui_svc_setting_set(UI_SET_SCAN_DELAY_MS, 2000);
++	ui_svc_apply(UI_SET_VFO_SCAN_LOW, 0);
++	ui_svc_apply(UI_SET_VFO_SCAN_HIGH, 0);
+ 	ui_svc_setting_set(UI_SET_DMR_ROGER, 0);
+ 	ui_svc_setting_set(UI_SET_HEAR_ALL_DEFAULT, 0);
+ 	ui_svc_setting_set(UI_SET_NOISE_REDUCTION, 1);
