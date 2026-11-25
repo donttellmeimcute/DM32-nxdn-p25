@@ -1,0 +1,49 @@
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+index 8fed0a0..07352aa 100644
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -111,2 +111,4 @@ static inline const char *ui_mode_name(uint8_t mode)
+ {
++	if (mode == RADIO_MODE_YSF)
++		return "YSF";
+ 	return mode == RADIO_MODE_DMR ? "DMR" : mode == RADIO_MODE_P25 ? "P25" : mode == RADIO_MODE_NXDN ? "NXDN" :
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index 323696d..3bc759f 100644
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -418,7 +418,8 @@ Host tested only: it has not been tried on air against a real YSF radio yet.
+ - It hears voice calls on every DG-ID, to every destination. Data calls are dropped for now.
+ - Home shows the source call sign when it has been decoded during a YSF reception, including in Large Text.
+ - PTT sends a voice call to ALL with DG-ID 0 in V/D-1, Narrow deviation, from your source call sign (blank until set).
+-- Home shows "YSF", what PTT calls ("ALL") and the DG-ID and data type ("DG 0 V/D-1"). During a call it shows who
++- Home shows **YSF** for both Wide and Narrow, including on the selected side in dual watch. The VFO's Quick menu
++  shows **YSF W** or **YSF N**. Home also shows what PTT calls and the DG-ID and data type. During a call it shows who
+   calls and where, or why the call isn't played. FM's tone and width tiles say "FM only: this is YSF".
+ - The data type, the DG-IDs, the deviation and the call signs can be changed only from a computer for now
+   (`rfoundry_debug.py radio ysf`), and the change lasts until the radio is switched off.
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 6ec2a8a..58e9939 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -82,6 +82,10 @@ static const flow_t flows[] = {
+ 	{ "NXDN Quick: TG", "dlmode:nxdn", "quick 8 2 0 ok", "screen=quick shows=TG airtalk=20 temporary=1", 5, false },
+ #endif
+ #if CONFIG_YSF
++	{ "YSF Wide VFO is labeled on Home", "vfokey quick 4 4 back wait:4000", "",
++	  "mode=ysf vfo=1 screen=home shows=YSF hides=FM", 0, false },
++	{ "YSF Narrow VFO is labeled on Home", "vfokey quick 4 4 4 back wait:4000", "",
++	  "mode=ysf vfo=1 screen=home shows=YSF hides=FM", 0, false },
+ 	{ "YSF caller on Home", "dlmode:ysf ysfrx:K1ABC", "", "screen=home shows=K1ABC", 0, false },
+ 	{ "YSF call ended", "dlmode:ysf ysfrx:K1ABC", "ysfrxend", "screen=home hides=K1ABC", 0, false },
+ 	{ "YSF Quick: two-digit DG-ID 99", "dlmode:ysf", "quick 2 9 9 ok", "screen=quick shows=DG-ID aircode=99 temporary=1", 5, false },
+@@ -316,6 +320,10 @@ static const flow_t flows[] = {
+ #if CONFIG_NXDN
+ 	{ "11 dual watch: the NXDN VFO keeps its mode label", "nxdn vfokey dlmode:nxdn vfokey quick 7 ctx 1 vfokey",
+ 	  "wait:1000", "dual=1 bvfo=1 sel=B shows=VFO_NXDN hides=VFO_FM", 0, false },
++#endif
++#if CONFIG_YSF
++	{ "YSF VFO is labeled in dual watch", "vfokey dlmode:ysf vfokey quick 7 ctx 1 vfokey",
++	  "wait:1000", "dual=1 bvfo=1 sel=B shows=YSF hides=FM", 0, false },
+ #endif
+ 	{ "11 dual watch: talk on B from #", "quick 7 ctx 3 5 ok", "ctx 1", "dual=1 sel=B uipos=5", 2, false },
+ 	{ "11 dual watch: the A/B key", "quick 7 ctx 3 5 ok", "abkey", "dual=1 sel=B", 1, false },

@@ -1,0 +1,129 @@
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index 3bc759f..ef322da 100644
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -417,7 +417,7 @@ Host tested only: it has not been tried on air against a real YSF radio yet.
+ 
+ - It hears voice calls on every DG-ID, to every destination. Data calls are dropped for now.
+ - Home shows the source call sign when it has been decoded during a YSF reception, including in Large Text.
+-- PTT sends a voice call to ALL with DG-ID 0 in V/D-1, Narrow deviation, from your source call sign (blank until set).
++- By default, PTT sends DN voice to ALL with DG-ID 0 and Narrow deviation, using the configured source call sign.
+ - Home shows **YSF** for both Wide and Narrow, including on the selected side in dual watch. The VFO's Quick menu
+   shows **YSF W** or **YSF N**. Home also shows what PTT calls and the DG-ID and data type. During a call it shows who
+   calls and where, or why the call isn't played. FM's tone and width tiles say "FM only: this is YSF".
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index a7f0029..3121ca8 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -199,7 +199,18 @@ static const hal_audio_t fake_audio = { .start = a_start, .stop = a_stop, .speak
+ static bool codec_present;
+ static bool v_present(void) { return codec_present; }
+ static void v_reset(void) {}
+-static void v_encode(const int16_t *pcm, uint8_t *bits) { (void)pcm; memset(bits, 0, VOCODER_BITS); }
++#if CONFIG_YSF
++static void (*v_encode_hook)(const int16_t *pcm, uint8_t *bits);
++#endif
++static void v_encode(const int16_t *pcm, uint8_t *bits)
++{
++	(void)pcm;
++	memset(bits, 0, VOCODER_BITS);
++#if CONFIG_YSF
++	if (v_encode_hook != NULL)
++		v_encode_hook(pcm, bits);
++#endif
++}
+ // Each frame the decoder is given, to a test that looks (the NXDN voice path's check)
+ static void (*v_decode_hook)(const uint8_t *bits);
+ static void v_decode(const uint8_t *bits, int16_t *pcm)
+@@ -11617,6 +11628,83 @@ static void test_t3_stun(void)
+ #endif
+ 
+ #if CONFIG_YSF
++#include "dmr/ambe/ambeFec.h"
++#include "ysf/ysf_engine.h"
++
++static void ysf_vfo_encode(const int16_t *pcm, uint8_t *bits)
++{
++	// Mark voice blocks that actually came from the simulated microphone.
++	if (pcm[0] != 0 || pcm[1] != 0) {
++		bits[3] = 1;
++		bits[VOCODER_BITS - 1] = 1;
++	}
++}
++
++static struct {
++	unsigned headers, voice;
++	uint8_t dt, dev;
++	char source[YSF_CALLSIGN_LEN + 1];
++} ysf_vfo_rx;
++
++static void ysf_vfo_rx_start(const ysf_call_t *call, void *ctx)
++{
++	(void)ctx;
++	ysf_vfo_rx.headers++;
++	ysf_vfo_rx.dt = call->fich.dt;
++	ysf_vfo_rx.dev = call->fich.dev;
++	strcpy(ysf_vfo_rx.source, call->src);
++}
++
++static void ysf_vfo_rx_voice(const uint8_t frame[AMBE_FRAME_BYTES], void *ctx)
++{
++	(void)ctx;
++	uint8_t bits[AMBE_PARAM_BITS];
++	if (ambeFecDecode(frame, bits, NULL) == 0 && bits[3] == 1 && bits[AMBE_PARAM_BITS - 1] == 1)
++		ysf_vfo_rx.voice++;
++}
++
++static void test_ysf_vfo_tx(void)
++{
++	static const char identity[] = "XE1ABC    DOWN      UP        ";
++	static const ysf_engine_hooks_t hooks = { .rx_start = ysf_vfo_rx_start, .rx_voice = ysf_vfo_rx_voice };
++	static ysf_engine_t receiver;
++
++	dmr_start(true);
++	sm.set.talk_permit = false;
++	kv_t3_set(CODEPLUG_KEY_MODE_SET + CODEPLUG_KIND_YSF, identity, sizeof identity - 1);
++	req(RREQ_VFO, 1);
++	CHECK(sm.view.vfo);
++	aud.feed = aud.feed_signal = air_clock_handoff = true;
++	v_encode_hook = ysf_vfo_encode;
++
++	for (uint8_t variant = VFO_VARIANT_FIRST; variant <= VFO_VARIANT_SECOND; variant++) {
++		bool narrow = variant == VFO_VARIANT_SECOND;
++		// Select the same two variants offered by the front panel.
++		CHECK(ui_svc_vfo_mode(RADIO_MODE_YSF, variant));
++		run(100);
++		CHECK(radio_ysf_running() && sm.view.ch.mode == RADIO_MODE_YSF);
++		memset(&ysf_vfo_rx, 0, sizeof ysf_vfo_rx);
++		ysf_engine_cfg_t config = { .dt = YSF_DT_VD_MODE2, .narrow = narrow, .silence = dmr_ambe_silence };
++		CHECK(ysf_engine_begin(&receiver, &fake_air1, &config, &hooks, NULL));
++
++		req(RREQ_PTT, 1);
++		run(1800);
++		CHECK(hw.keyed && sm.view.state == RS_TX && aud.started);
++		CHECK(ysf_vfo_rx.headers == 1 && strcmp(ysf_vfo_rx.source, "XE1ABC") == 0);
++		CHECK(ysf_vfo_rx.dt == YSF_DT_VD_MODE2 && ysf_vfo_rx.dev == (uint8_t)narrow);
++		CHECK(ysf_vfo_rx.voice > 50);
++		req(RREQ_PTT, 0);
++		run(500);
++		CHECK(!hw.keyed && !fair[0].on);
++		ysf_engine_end(&receiver);
++	}
++	v_encode_hook = NULL;
++	aud.feed = aud.feed_signal = air_clock_handoff = false;
++	kv_t3_clear();
++	req(RREQ_VFO, 0);
++	run(100);
++}
++
+ static void test_ysf_pcm_handoff(void)
+ {
+ 	static const char identity[] = "XE1ABC    DOWN      UP        ";
+@@ -12293,6 +12381,7 @@ int main(int argc, char **argv)
+ 	test_factory_reset();
+ 	test_volume_step_of();
+ #if CONFIG_YSF
++	test_ysf_vfo_tx();
+ 	test_ysf_pcm_handoff();
+ 	test_ysf_quick();
+ #endif
