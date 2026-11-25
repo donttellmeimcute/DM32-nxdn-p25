@@ -1,0 +1,184 @@
+diff --git a/core/ysf/ysf_codeplug.c b/core/ysf/ysf_codeplug.c
+--- a/core/ysf/ysf_codeplug.c
++++ b/core/ysf/ysf_codeplug.c
+@@ -43,15 +43,12 @@
+ 
+ void ysf_conv_decode(const uint8_t *b, int len, ysf_conv_t *out)
+ {
+-	uint8_t f = len >= 1 ? b[0] : 0u;
++	uint8_t f = len >= 1 ? b[0] : YSF_CP_NARROW;
+ 	uint8_t rx = len >= 2 ? b[1] : 0u;
+ 	uint8_t tx = len >= 3 ? b[2] : 0u;
+ 
+ 	out->dt = (uint8_t)(f & YSF_CP_DT_MASK);
+-	// Yaesu 4.2.1 pairs data type and deviation: only Voice FR (VW) is wide (2700 Hz); V/D mode 1,
+-	// Data FR and DN are narrow (1350 Hz). A stored Wide bit on one of those is stale (the pre-fix
+-	// default) and is ignored, so an old channel transmits Narrow without needing an edit.
+-	out->narrow = out->dt != YSF_DT_VOICE_FR || (f & YSF_CP_NARROW) != 0;
++	out->narrow = (f & YSF_CP_NARROW) != 0;
+ 	if (rx > YSF_CP_DGID_MAX)
+ 		rx = 0;			// any DG-ID
+ 	out->rx_dgid = rx;
+diff --git a/site/static/js/codeplug/mode_ysf.js b/site/static/js/codeplug/mode_ysf.js
+--- a/site/static/js/codeplug/mode_ysf.js
++++ b/site/static/js/codeplug/mode_ysf.js
+@@ -31,14 +31,14 @@
+ // --- Conventional channel (2) ---
+ 
+ export function decodeConv(b) {
+-	const f = u8(b, 0);
++	const f = b?.length ? b[0] : NARROW;
+ 	let rx = u8(b, 1);
+ 	if (rx > DGID_MAX) rx = 0;
+ 	const t = u8(b, 2);
+ 	const dt = f & DT_MASK;
+ 	return {
+ 		dt,
+-		narrow: dt !== DT_VW || (f & NARROW) !== 0,
++		narrow: (f & NARROW) !== 0,
+ 		rxDgid: rx,
+ 		txDgid: (t & TX_DGID_SET) !== 0 ? t & DGID_MAX : rx,
+ 		// a destination of all spaces or all zeros reads as ALL
+@@ -81,7 +81,7 @@
+ 	defaultTx: true,
+ 	recordFields: [],
+ 	flags: {},
+-	newParams: () => ({ dt: DT_VD1, narrow: false, rxDgid: 0, txDgid: 0, dest: DEST_ALL }),
++	newParams: () => ({ dt: DT_VD1, narrow: true, rxDgid: 0, txDgid: 0, dest: DEST_ALL }),
+ 	decode: decodeConv,
+ 	encode: encodeConv,
+ 	fields: () => [
+diff --git a/tests/vectors/channel-modes.txt b/tests/vectors/channel-modes.txt
+--- a/tests/vectors/channel-modes.txt
++++ b/tests/vectors/channel-modes.txt
+@@ -133,16 +133,18 @@
+ #
+ # ysfconv <block> <data type> <narrow 0|1> <RX DG-ID> <TX DG-ID> <destination>: decoding a YSF channel's block
+ ysfconv - 0 1 0 0 ALL
+-ysfconv 00000020202020202020202020 0 1 0 0 ALL
+-ysfconv 010000414C4C20202020202020 1 1 0 0 ALL
++ysfconv 00000020202020202020202020 0 0 0 0 ALL
++ysfconv 010000414C4C20202020202020 1 0 0 0 ALL
+ ysfconv 067F8558453141525320202020 2 1 7F 5 XE1ARS
+-ysfconv 027F8547334C4A4C2020202020 2 1 7F 5 G3LJL
++ysfconv 027F8547334C4A4C2020202020 2 0 7F 5 G3LJL
+ ysfconv 030A0043512020202020202020 3 0 A A CQ
+-ysfconv 00FF00414C4C20202020202020 0 1 0 0 ALL
+-ysfconv 02 2 1 0 0 ALL
+-ysfconv 000A80584531 0 1 A 0 XE1
++ysfconv 00FF00414C4C20202020202020 0 0 0 0 ALL
++ysfconv 02 2 0 0 0 ALL
++ysfconv 05 1 1 0 0 ALL
++ysfconv 07 3 1 0 0 ALL
++ysfconv 000A80584531 0 0 A 0 XE1
+ ysfconv 0400FF414C4C20202020202020 0 1 0 7F ALL
+-ysfconv 00000000FF2020202020202020 0 1 0 0 ALL
++ysfconv 00000000FF2020202020202020 0 0 0 0 ALL
+ #
+ # ysfenc <data type> <narrow> <RX DG-ID> <TX DG-ID> <destination> <block>: encoding
+ ysfenc 0 0 0 0 ALL 000000414C4C20202020202020
+diff --git a/tests/host/ysfCodeplugTest.c b/tests/host/ysfCodeplugTest.c
+--- a/tests/host/ysfCodeplugTest.c
++++ b/tests/host/ysfCodeplugTest.c
+@@ -188,21 +188,16 @@
+ 	CHECK(codeplug_channel(11, &c) && ysf_conv_load(11, &c, &cfg) && cfg.conv.dt == YSF_DT_VD_MODE2 &&
+ 	      cfg.conv.narrow && cfg.conv.rx_dgid == 127 && cfg.conv.tx_dgid == 5 &&
+ 	      strcmp(cfg.conv.dest, "XE1ARS") == 0);
+-	// A channel stored Wide before the Narrow default: V/D mode 1, Data FR and DN read Narrow anyway
+-	// (Yaesu 4.2.1); only Voice FR honors a stored Wide bit
+-	uint8_t stale[YSF_CP_CONV_LEN] = { 0x02, 0x7F, 0x85, 'G', '3', 'L', 'J', 'L', ' ', ' ', ' ', ' ', ' ' };
+-	CHECK(codeplug_tag_write(11, "Zeroed", &t, stale, sizeof stale));
+-	CHECK(codeplug_channel(11, &c) && ysf_conv_load(11, &c, &cfg) && cfg.conv.dt == YSF_DT_VD_MODE2 &&
+-	      cfg.conv.narrow && cfg.conv.rx_dgid == 127 && cfg.conv.tx_dgid == 5 &&
+-	      strcmp(cfg.conv.dest, "G3LJL") == 0);
+-	stale[0] = 0x01;	// Data FR, stored Wide
+-	CHECK(codeplug_tag_write(11, "Zeroed", &t, stale, sizeof stale));
+-	CHECK(codeplug_channel(11, &c) && ysf_conv_load(11, &c, &cfg) && cfg.conv.dt == YSF_DT_DATA_FR &&
+-	      cfg.conv.narrow);
+-	stale[0] = 0x03;	// Voice FR, stored Wide: still Wide
+-	CHECK(codeplug_tag_write(11, "Zeroed", &t, stale, sizeof stale));
+-	CHECK(codeplug_channel(11, &c) && ysf_conv_load(11, &c, &cfg) && cfg.conv.dt == YSF_DT_VOICE_FR &&
+-	      !cfg.conv.narrow);
++	// Save and reopen every combination through the radio's tagged-channel path.
++	for (uint8_t dt = 0; dt <= YSF_DT_VOICE_FR; dt++) {
++		for (unsigned narrow = 0; narrow <= 1; narrow++) {
++			ysf_conv_t saved = { .dt = dt, .narrow = narrow != 0, .rx_dgid = 127, .tx_dgid = 5, .dest = "G3LJL" };
++			CHECK(ysf_conv_save(11, &c, &saved));
++			CHECK(codeplug_channel(11, &c) && ysf_conv_load(11, &c, &cfg));
++			CHECK(cfg.conv.dt == dt && cfg.conv.narrow == saved.narrow && cfg.conv.rx_dgid == 127 &&
++			      cfg.conv.tx_dgid == 5 && strcmp(cfg.conv.dest, "G3LJL") == 0);
++		}
++	}
+ 	// Another kind's channel, or a plain one: no set-up
+ 	channel_t plain = make("Plain", 439400000, 439400000);
+ 	CHECK(codeplug_set_channel(12, &plain) && codeplug_channel(12, &plain) && !ysf_conv_load(12, &plain, &cfg));
+diff --git a/docs/spec/ysf-codeplug.md b/docs/spec/ysf-codeplug.md
+--- a/docs/spec/ysf-codeplug.md
++++ b/docs/spec/ysf-codeplug.md
+@@ -40,7 +40,7 @@
+ | 2 | 1 | TX DG-ID: bit 7 set = bits 6-0 hold it (0 to 127); clear = the RX DG-ID |
+ | 3 | 10 | Destination call sign (Dest), 10 ASCII, space padded; all spaces (or all zero) reads as `ALL` |
+ 
+-A zeroed block, or none, is V/D mode 1, Narrow deviation, any DG-ID received and DG-ID 0 (none) sent, destination
++An absent block defaults to V/D mode 1, Narrow deviation, any DG-ID received and DG-ID 0 (none) sent, destination
+ `ALL`; with the tag's flag bit 0 clear, receive only. A block shorter than 13 octets reads with its missing fields
+ at their defaults (a short destination reads with the missing characters as spaces). Both deviations use 12.5 kHz
+ channel settings ([ysf.md](ysf.md) 1).
+@@ -72,11 +72,8 @@
+ AMBE+2 parameter bits per 20 ms block), Data FR carries data, Voice FR carries full-rate voice, which this build
+ receives and sends with the voice blocks zero ([ysf.md](ysf.md) 4). Reception takes any DT: a frame's own DT
+ decides its voice path. Dev is the deviation of the channel, Wide (2700 Hz) or Narrow (1350 Hz), for transmit and
+-receive alike. A new DT or a new deviation is a new session: the engine starts over. The standard pairs data type
+-and deviation (Yaesu 4.2.1): V/D mode 1, Data FR and DN (V/D mode 2) are narrow (1350 Hz); only Voice FR (VW) is
+-wide (2700 Hz). A zeroed block reads as Narrow, the deviation of its V/D mode 1 data type; a stored Wide bit on
+-V/D mode 1, Data FR or DN is ignored (those modes always read Narrow) and only Voice FR honors a stored
+-deviation. The editor defaults a new channel to the deviation of its data type.
++receive alike. A new DT or a new deviation is a new session: the engine starts over. A stored flags byte supplies DT and Dev independently
++(Yaesu table 4-1). A present zero byte selects V/D mode 1 with Wide deviation. A new channel defaults to Narrow.
+ 
+ ### 2.3 Call signs
+ 
+diff --git a/site/tests/ysf-deviation.test.mjs b/site/tests/ysf-deviation.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/site/tests/ysf-deviation.test.mjs
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: MIT
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { empty, encode, decode } from "../static/js/codeplug/model.js";
++import { importTable, exportTable } from "../static/js/codeplug/csv.js";
++import { ysfKind } from "../static/js/codeplug/mode_ysf.js";
++
++test("DN keeps the selected deviation through a codeplug and CSV round trip", () => {
++	for (const [name, narrow] of [["Wide", false], ["Narrow", true]]) {
++		const model = empty();
++		const csv = "Name,Mode,RX Frequency,TX Frequency,YSF DT,Deviation,RX DG-ID,YSF TX DG-ID\n"
++			+ `Fusion,YSF,435.000,435.000,DN,${name},0,7\n`;
++		assert.deepEqual(importTable(model, csv, "channels").problems, []);
++		const reopened = decode(encode(model));
++		const copy = empty();
++		assert.deepEqual(importTable(copy, exportTable(reopened, "channels"), "channels").problems, []);
++		for (const ch of [model.channels[0], reopened.channels[0], decode(encode(copy)).channels[0]]) {
++			assert.equal(ch.kind, 6);
++			assert.equal(ch.params.dt, 2);
++			assert.equal(ch.params.narrow, narrow);
++			assert.equal(ch.params.txDgid, 7);
++		}
++	}
++});
++
++test("YSF preserves an explicit flags byte, including zero, and defaults a missing byte to Narrow", () => {
++	assert.equal(ysfKind.newParams().narrow, true);
++	assert.equal(ysfKind.decode(new Uint8Array()).narrow, true);
++	for (let dt = 0; dt < 4; dt++) {
++		for (const narrow of [false, true]) {
++			const flags = dt | (narrow ? 4 : 0);
++			const params = ysfKind.decode(Uint8Array.of(flags));
++			assert.equal(params.dt, dt);
++			assert.equal(params.narrow, narrow);
++			assert.equal(ysfKind.encode(params)[0], flags);
++			ysfKind.validate({}, params, { warn: (key) => assert.fail(key) });
++		}
++	}
++});

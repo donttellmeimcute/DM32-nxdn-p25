@@ -149,6 +149,7 @@ PATCHES = (
 	'hrc7000-air-copy-recovery.patch',
 	'dm32-tools-menu.patch',
 	'dm32-vfo-broadcast.patch',
+	'issue79-ysf-channel-deviation.patch',
 )
 
 
