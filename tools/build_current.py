@@ -204,6 +204,7 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-ysf-voice.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-ysf-quick-data-type.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-scan-limits-and-digital-sweep.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'low-band-fm-bandwidth.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
