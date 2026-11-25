@@ -143,6 +143,7 @@ quedan en `build/current/build/dm32-<variante>/rfoundry_dm32.bin`.
 Para una combinación propia, repite `--without` con los módulos que quieras omitir. Por ejemplo,
 `python3 tools/build_current.py --without m17 --without dstar`. Los módulos disponibles aparecen con `--help`.
 Si omites P25, también se omite D-STAR. Si omites P25, NXDN y YSF, también se omite M17.
+MDC-1200 usa el modulador AFSK de APRS y se omite cuando desactivas APRS.
 Instala la imagen con **Usar mi propia compilación del firmware** en el flasher.
 
 La compilación predeterminada del DM-32UV desactiva el servidor de estado HTTP y el repetidor DMR SFR para recuperar RAM.

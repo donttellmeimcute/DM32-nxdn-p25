@@ -196,6 +196,7 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'scan-delay-monitor-fields.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'dmr-roger.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'scan-monitor-roger-tests.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'dm32-preset-stacks.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
@@ -221,7 +222,7 @@ def main():
 		disabled.add('dstar')
 	if args.no_m17 or args.variant != 'full' or {'p25', 'nxdn', 'ysf'} <= disabled:
 		disabled.add('m17')
-	if args.no_mdc1200:
+	if args.no_mdc1200 or 'aprs' in disabled:
 		disabled.add('mdc1200')
 	dstar = 'dstar' not in disabled
 	prepare(tree, dstar)

@@ -1,0 +1,66 @@
+diff --git a/boards/dm32/freertos_board.h b/boards/dm32/freertos_board.h
+index 1e1af46..551cf58 100644
+--- a/boards/dm32/freertos_board.h
++++ b/boards/dm32/freertos_board.h
+@@ -11,6 +11,15 @@
+ // tests/hil/test_task_stacks.py asks for, and gives the rest to main RAM (the air MTU's 64-burst lists took the last
+ // 1 KB from 34, the talk permit before keying 0.5 KB from 33). The debug link's tasks view reports the least free since
+ // start (tasks.heap_min_free)
++#if CONFIG_AIR
+ #define configTOTAL_HEAP_SIZE	(32 * 1024 + 512)
++#else
++// The DMR/FM call graph uses larger task frames with the additional digital modes omitted.
++// Add space for those stacks while keeping the same heap headroom.
++#define configTOTAL_HEAP_SIZE	(32 * 1024 + 512 + 1280)
++#define START_TASK_STACK	704
++#define RADIO_TASK_STACK	832
++#define UI_TASK_STACK_WORDS	688
++#endif
+ 
+ #endif
+diff --git a/core/app/app.c b/core/app/app.c
+index b5196e3..277104b 100644
+--- a/core/app/app.c
++++ b/core/app/app.c
+@@ -55,7 +55,9 @@
+ #define START_TASK_PRIORITY	5
+ // words: the radio core's set-up runs here at boot (radio_sm_init, 584 bytes of frame on an HR_C7000 radio, then the APRS
+ // identity load or a DMR VFO's contact search down to the flash driver); 512 left that radio 88 bytes (make stack-check)
++#ifndef START_TASK_STACK
+ #define START_TASK_STACK	640
++#endif
+ #define HOUSEKEEPING_MS		100
+ #define POWER_OFF_TX_MS		200	// after the PTT release, before the latch drops
+ #define POWER_OFF_DEREG_MS	3000	// at most this long for the ARS deregistration (gotcha 7.4)
+diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
+index b10a342..352bb26 100644
+--- a/core/radio/radio_task.c
++++ b/core/radio/radio_task.c
+@@ -43,11 +43,13 @@
+ 
+ // Task layout (see core/app/app.c for the whole picture)
+ #define RADIO_TASK_PRIORITY	4
++#ifndef RADIO_TASK_STACK
+ #if CONFIG_DMR
+ #define RADIO_TASK_STACK	768	// words: the DMR call stack and the AMBE FEC run here
+ #else
+ #define RADIO_TASK_STACK	512	// words
+ #endif
++#endif
+ #define RADIO_QUEUE_LEN		16
+ 
+ static radio_sm_t sm RFOUNDRY_CPU_RAM;	// owned by the radio task; CPU only
+diff --git a/core/ui/ui.c b/core/ui/ui.c
+index ac7d619..e22b688 100644
+--- a/core/ui/ui.c
++++ b/core/ui/ui.c
+@@ -32,7 +32,9 @@
+ // the dual Home's layout table (dual_choose) live in frames of their own to stay below it, as a 4 bpp panel's palette
+ // lookup adds 48 bytes under every fill. 504 words leave the 208 byte port overhead, the 128 byte margin and 8 bytes.
+ // Every word here is RAM on all radios: raise it only by what the check shows
++#ifndef UI_TASK_STACK_WORDS
+ #define UI_TASK_STACK_WORDS	504
++#endif
+ 
+ #define SPLASH_MS		1000
+ #define FRAME_MIN_MS		50	// at most 20 redraws a second
