@@ -131,6 +131,17 @@ La imagen queda en `build/current/build/dm32/rfoundry_dm32.bin`. Detalle del cif
 
 La compilación predeterminada del DM-32UV desactiva el servidor de estado HTTP y el repetidor DMR SFR para recuperar RAM.
 
+### TX experimental de 1,25 m
+
+`python3 tools/build_current.py --tree build/bench-1p25m --bench-tx-1p25m` crea
+`build/bench-1p25m/build/dm32-bench-1p25m/rfoundry_dm32.bin`. En esta imagen, el PTT de FM en
+VFO y canales admite de 222,0125 a 224,9875 MHz, con ancho de 12,5 kHz y excitación limitada
+a un valor de banco. La publicación automática usa la compilación normal.
+
+Para la prueba, selecciona FM y 223,500 MHz en el VFO y usa una carga ficticia de 50 Ω con un
+acoplador o atenuador adecuado. Mide portadora, potencia y armónicos antes de considerar una
+prueba con antena. El manual de Baofeng especifica TX en VHF y UHF y no incluye 1,25 m.
+
 Si usas `--tree`, elige un directorio dedicado y vacío la primera vez. Al volver a compilar en ese directorio,
 la herramienta restablece el commit base y elimina los archivos sin seguimiento fuera de `build/`.
 

@@ -1,0 +1,254 @@
+diff --git a/boards/dm32/board.c b/boards/dm32/board.c
+index cad88a28..0f5ff499 100644
+--- a/boards/dm32/board.c
++++ b/boards/dm32/board.c
+@@ -27,6 +27,7 @@ static bool rx_ext_on;
+ enum {
+ 	LOW_NFM_BAND = 2,
+ 	BCAST_BAND = LOW_NFM_BAND + CONFIG_FM,
++	BENCH_TX_BAND = BCAST_BAND + CONFIG_BCAST_FM + CONFIG_AM_RX,
+ 	LOW_NFM_HI_HZ = 88000000,
+ };
+ 
+@@ -42,6 +43,8 @@ static const band_t bands[] = {
+ #if CONFIG_AM_RX
+ 	{ 108000000, 136000000, false },	// the air band, AM receive only (docs/spec/airband-and-broadcast.md 3)
+ #endif
++	// 1.25 m bench TX, with one 12.5 kHz channel of clearance at both band edges.
++	[BENCH_TX_BAND] = { 222012500, 224987500, true },
+ #if CONFIG_RX_EXT
+ 	// Receive only past the rated bands, while the user turns it on: the FD6818 band table (hardware-dm32.md 8.3). Keep these last
+ 	{ 16000000, 65000000, false },
+@@ -96,6 +99,7 @@ const board_t board = {
+ 		(CONFIG_AM_RX ? CAP_AM_RX : 0) | (CONFIG_BCAST_FM ? CAP_BCAST_FM : 0),
+ 	.bands = bands,
+ 	.band_count = sizeof(bands) / sizeof(bands[0]),
++	.manual_fm_tx_band = &bands[BENCH_TX_BAND],
+ #if CONFIG_FM
+ 	.nfm_rx_band = &bands[LOW_NFM_BAND],
+ #endif
+diff --git a/boards/dm32/radio_dm32.c b/boards/dm32/radio_dm32.c
+index 997682d6..5335e547 100644
+--- a/boards/dm32/radio_dm32.c
++++ b/boards/dm32/radio_dm32.c
+@@ -20,6 +20,8 @@
+ #define DAC_C_INIT		0x06E2u
+ 
+ #define UHF_FROM_HZ		280000000u	// PA / LNA band split (8.5)
++#define TX_BENCH_VHF_CAL_HZ	174000000u	// last calibrated VHF power point, hardware-dm32.md 11.3
++#define TX_BENCH_DAC_MAX	1024u		// raw DAC ceiling, not a calibrated RF power
+ #define MIC_GAIN_DB		11u		// GCR_ADCL at init (9.1)
+ // DMR bursts on the shared RF-burst task (dmr_rfburst.h), timed from the RF TX interrupt (hardware-dm32.md 8.5). The PA
+ // keys up from the power cal table (radio/pa_keyup.h): a drive boost sized for the step, then the
+@@ -496,6 +498,10 @@ static volatile uint16_t drive_override;
+ // between mid and high, high. Draft choice, to be set with a wattmeter
+ static uint16_t level_drive(uint32_t hz, uint8_t level)
+ {
++	if (board_manual_fm_tx_only(hz)) {
++		uint16_t drive = bf_cal_power_level(TX_BENCH_VHF_CAL_HZ, 0);
++		return drive < TX_BENCH_DAC_MAX ? drive : TX_BENCH_DAC_MAX;
++	}
+ 	static const uint8_t step[5] = { 0, 1, 4, 6, 8 };
+ 	return bf_cal_power_level(hz, step[level > 4u ? 4u : level]);
+ }
+@@ -514,15 +520,24 @@ static void keyup_plan(uint32_t hz)
+ }
+ #endif
+ 
++static void tx_off(void);
++
+ static bool tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
+ {
++	bool bench = board_manual_fm_tx_only(hz);
+ 	if (!board_in_band(hz, true) || rf_unlocked) {
+ 		return false;
+ 	}
++	if (bench) {
++		if (mode != RADIO_MODE_FM || !bf_cal_valid()) {
++			return false;
++		}
++		bw = RADIO_BW_12K5;
++	}
+ 	wake();
+ 	tx_uhf = hz >= UHF_FROM_HZ;
+ 	tx_drive = level_drive(hz, power);
+-	if (drive_override != 0u) {
++	if (!bench && drive_override != 0u) {
+ 		tx_drive = drive_override;
+ 	}
+ #if CONFIG_DMR
+@@ -572,6 +587,11 @@ static bool tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
+ 			fd6818_write(&fd, FD_REG_TX_AUX, FD_TX_AUX_FM);
+ 			hal_delay_ms(1);
+ 		}
++		if (bench && !fd6818_pll_locked(&fd, RF_LOCK_MS)) {
++			fd6818_set_state(&fd, FD6818_STATE_IDLE);
++			tx_off();
++			return false;
++		}
+ 		pa_key();
+ 	}
+ 	ring_play();
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 36f246c3..93260874 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -1450,9 +1450,8 @@ static bool bcl_busy(const radio_sm_t *sm)
+ 	return carrier && tone_needed(sm) && !sm->view.tone_ok;
+ }
+ 
+-// Every keying of the transmitter goes through here: the test TX limit (tx_limit.h) refuses what it doesn't allow, as
+-// a board that can't key there would
+-static bool key_tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
++// The test TX limit applies to all RF keying, including manual FM PTT.
++static bool key_rf(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
+ {
+ 	if (!tx_limit_allows(hz)) {
+ 		tx_limit_refused(hz);
+@@ -1464,6 +1463,11 @@ static bool key_tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *t
+ 	return board.radio->tx(hz, bw, power, tone);
+ }
+ 
++static bool key_tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
++{
++	return !board_manual_fm_tx_only(hz) && key_rf(hz, bw, power, tone);
++}
++
+ #define AIR_TRUNK	(CONFIG_P25_TRUNK || CONFIG_NXDN)
+ #if AIR_TRUNK
+ // A trunked air channel's transmit side: P25's follower (p25-trunking.md 7) or NXDN's (nxdn-trunking.md 4), one
+@@ -1562,6 +1566,9 @@ static uint8_t tx_check(const radio_sm_t *sm)
+ 	if (!trunk && !board_in_band(ch->tx_hz, true)) {
+ 		return TXDENY_BAND;
+ 	}
++	if (ch->mode != RADIO_MODE_FM && board_manual_fm_tx_only(ch->tx_hz)) {
++		return TXDENY_MODE;
++	}
+ 	if (board_hwopt_pending() != NULL) {
+ 		// Unset, or stored but not applied until a restart: the transmitter may be set up for the wrong hardware
+ 		return TXDENY_HWOPT;
+@@ -7034,7 +7041,7 @@ static void fm_key(radio_sm_t *sm, uint32_t now_ms)
+ 	sm->tx_start_ms = now_ms;
+ 	outputs(sm);
+ 	const channel_t *ch = &sm->view.ch;
+-	if (!key_tx(ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &ch->tx_tone)) {
++	if (!key_rf(ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &ch->tx_tone)) {
+ 		deny(sm, board_refusal());
+ 		return;
+ 	}
+@@ -7314,7 +7321,8 @@ bool radio_sm_hotspot_freq_ok(uint32_t rx_hz, uint32_t tx_hz)
+ 		return false;	// nor in the broadcast band
+ 	}
+ #endif
+-	return rx_hz != 0 && tx_hz != 0 && board_in_band(rx_hz, false) && board_in_band(tx_hz, true);
++	return rx_hz != 0 && tx_hz != 0 && board_in_band(rx_hz, false) &&
++	       board_in_band(tx_hz, true) && !board_manual_fm_tx_only(tx_hz);
+ }
+ 
+ uint8_t radio_sm_hotspot_power(uint8_t rf_level)
+diff --git a/hal/board.h b/hal/board.h
+index 7f64278c..53c5e08d 100644
+--- a/hal/board.h
++++ b/hal/board.h
+@@ -74,6 +74,7 @@ typedef struct {
+ 	// board_band_count(), and never set tx on these entries
+ 	uint8_t rx_ext_count;
+ 	bool *rx_ext_on;
++	const band_t *manual_fm_tx_band; // optional band where only manual FM PTT may transmit
+ 	uint8_t power_count;
+ 	const char *const *power_names;	// short labels for the status line, power_count entries
+ 	// Optional: the labels per band, where a level's power differs between bands (a top level of 45 W on one band and
+@@ -194,6 +195,12 @@ static inline bool board_nfm_rx_only(uint32_t hz)
+ 	return band != NULL && hz >= band->lo_hz && hz <= band->hi_hz;
+ }
+ 
++static inline bool board_manual_fm_tx_only(uint32_t hz)
++{
++	const band_t *band = board.manual_fm_tx_band;
++	return band != NULL && hz >= band->lo_hz && hz <= band->hi_hz;
++}
++
+ // hz is in one of the radio's bands (board.bands), and one that may transmit when need_tx
+ static inline bool board_in_band(uint32_t hz, bool need_tx)
+ {
+diff --git a/tests/host/radioListenBandsTest.c b/tests/host/radioListenBandsTest.c
+index da601aef..70e12dca 100644
+--- a/tests/host/radioListenBandsTest.c
++++ b/tests/host/radioListenBandsTest.c
+@@ -27,6 +27,7 @@ static uint32_t now;
+ static struct {
+ 	uint32_t rx_hz;
+ 	int rx_calls, am_calls, tx_calls;
++	uint32_t tx_hz;
+ 	bool am;		// the receiver is in AM (rx_am since the last rx / set_mode)
+ 	radio_bw_t am_bw;
+ 	radio_bw_t fm_bw;
+@@ -107,10 +108,10 @@ static bool r_rx_am(uint32_t hz, radio_bw_t bw)
+ }
+ static bool r_tx(uint32_t hz, radio_bw_t bw, uint8_t p, const subtone_t *t)
+ {
+-	(void)hz;
+ 	(void)bw;
+ 	(void)p;
+ 	(void)t;
++	hw.tx_hz = hz;
+ 	hw.tx_calls++;
+ 	return true;
+ }
+@@ -164,6 +165,8 @@ static const band_t bands[] = {
+ 	{ 108000000, 136000000, false },
+ 	{ 88000001, 108000000, false },
+ 	{ 66000000, 88000000, false },
++	{ 222012500, 224987500, true },
++	{ 174000000, 400000000, false },
+ };
+ static const char *const power_names[] = { "L", "M", "H" };
+ 
+@@ -173,6 +176,7 @@ const board_t board = {
+ 	.bands = bands,
+ 	.band_count = sizeof(bands) / sizeof(bands[0]),
+ 	.nfm_rx_band = &bands[4],
++	.manual_fm_tx_band = &bands[5],
+ 	.bcast_rx_band = &bands[3],
+ 	.bcast = &fake_bcast,
+ 	.power_count = 3,
+@@ -822,8 +826,39 @@ static void test_narrow_fm_band(void)
+ 	CHECK(sm.view.zone_pos == 4 && hw.rx_hz == 146520000);
+ }
+ 
++static void test_bench_tx_band(void)
++{
++	start();
++	CHECK(!board_in_band(222012499, true) && board_in_band(222012500, true));
++	CHECK(board_in_band(224987500, true) && !board_in_band(224987501, true));
++	CHECK(!radio_sm_hotspot_freq_ok(223500000, 223500000));
++
++	req(RREQ_VFO_SET, 223500000);
++	run(100);
++	CHECK(sm.view.vfo && hw.rx_hz == 223500000);
++	ptt(true);
++	CHECK(sm.view.state == RS_TX && hw.tx_calls == 1 && hw.tx_hz == 223500000);
++	ptt(false);
++
++	req(RREQ_MODE, RADIO_MODE_DMR);
++	run(100);
++	CHECK(sm.view.ch.mode == RADIO_MODE_DMR);
++	ptt(true);
++	CHECK(sm.view.state == RS_TX_DENIED && sm.view.tx_deny == TXDENY_MODE && hw.tx_calls == 1);
++	ptt(false);
++
++	req(RREQ_MODE, RADIO_MODE_FM);
++	req(RREQ_VFO_SET, 220000000);
++	run(100);
++	CHECK(hw.rx_hz == 220000000);
++	ptt(true);
++	CHECK(sm.view.state == RS_TX_DENIED && sm.view.tx_deny == TXDENY_BAND && hw.tx_calls == 1);
++	ptt(false);
++}
++
+ int main(void)
+ {
++	test_bench_tx_band();
+ 	test_helpers();
+ 	test_am_channel();
+ 	test_am_kind();
