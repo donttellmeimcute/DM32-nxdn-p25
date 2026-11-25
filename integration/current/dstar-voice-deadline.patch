@@ -1,0 +1,97 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 9024ca0..a7f0029 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12027,7 +12027,7 @@ static void test_m17(void)
+ 
+ static struct {
+ 	dstar_header_t header;
+-	unsigned headers, voice, ends;
++	unsigned headers, voice, speech, ends;
+ } dstar_far;
+ 
+ static void dstar_far_start(const dstar_header_t *header, void *ctx)
+@@ -12041,9 +12041,10 @@ static void dstar_far_start(const dstar_header_t *header, void *ctx)
+ 
+ static void dstar_far_voice(const uint8_t *voice, void *ctx)
+ {
+-	(void)voice;
+ 	(void)ctx;
+ 	dstar_far.voice++;
++	if (memcmp(voice, dstar_silence, DSTAR_VOICE_BYTES) != 0)
++		dstar_far.speech++;
+ }
+ 
+ static void dstar_far_end(void *ctx) { (void)ctx; dstar_far.ends++; }
+@@ -12066,14 +12067,21 @@ static void test_dstar_memory(void)
+ 	      radio_dstar_running() && !sim.started);
+ 	CHECK(dstar_engine_open(&far, &fake_air1, &hooks, NULL));
+ 	sm.set.talk_permit = false;
+-	aud.feed = true;
++	aud.feed = aud.feed_signal = true;
+ 
+-	// A legacy channel has no routing parameters and calls direct.
++	// A full-speed codec can have a costly frame or lose time to an interrupt without unkeying.
++	air_clock_step = 18000;
+ 	req(RREQ_PTT, 1);
+ 	run(600);
++	air_clock_step = 45000;
++	run(20); // one block exceeds the PCM period
++	air_clock_step = 18000;
++	run(1800);
++	CHECK(hw.keyed && sm.view.state == RS_TX && sm.view.tx_deny == TXDENY_NONE);
++	air_clock_step = 0;
+ 	req(RREQ_PTT, 0);
+ 	run(500);
+-	CHECK(dstar_far.headers == 1 && dstar_far.ends == 1 && dstar_far.voice > 0 && !hw.keyed);
++	CHECK(dstar_far.headers == 1 && dstar_far.ends == 1 && dstar_far.voice > 90 && dstar_far.speech > 90 && !hw.keyed);
+ 	CHECK(dstar_far.header.flags[0] == 0 && !memcmp(dstar_far.header.rpt1, "DIRECT  ", 8) &&
+ 	      !memcmp(dstar_far.header.rpt2, "DIRECT  ", 8) && !memcmp(dstar_far.header.ur, "CQCQCQ  ", 8));
+ 
+@@ -12098,6 +12106,37 @@ static void test_dstar_memory(void)
+ 	CHECK(dstar_engine_prime(&far, &reply) && air_session_tx_go(&far.session));
+ 	run(600);
+ 	CHECK(sm.view.dstar.rx && sm.view.dstar.played && !strcmp(sm.view.dstar.source, "N0CALL"));
++	// An overloaded receive call is muted, but it still tracks the incoming transmission.
++	air_clock_step = 30000;
++	run(600);
++	CHECK(sm.view.dstar.rx && !sm.view.dstar.played && !aud.pcm);
++	air_clock_step = 0;
++	dstar_engine_stop(&far);
++	run(500);
++	CHECK(!sm.view.dstar.rx);
++
++	// Sustained transmit overload still unkeys. No retune or power cycle is needed for the retry.
++	air_clock_step = 30000;
++	req(RREQ_PTT, 1);
++	run(600);
++	CHECK(!hw.keyed && sm.view.state == RS_TX_DENIED && sm.view.tx_deny == TXDENY_CPU);
++	req(RREQ_PTT, 0);
++	air_clock_step = 18000;
++	run(100);
++	req(RREQ_PTT, 1);
++	run(1600);
++	CHECK(hw.keyed && sm.view.state == RS_TX && sm.view.tx_deny == TXDENY_NONE);
++	req(RREQ_PTT, 0);
++	air_clock_step = 0;
++	run(500);
++	CHECK(!hw.keyed);
++
++	// RX resumes on a fresh header after an over-budget call.
++	CHECK(air_session_tx_state(&far.session) == AIR_TX_DONE);
++	air_session_tx_clear(&far.session);
++	CHECK(dstar_engine_prime(&far, &reply) && air_session_tx_go(&far.session));
++	run(600);
++	CHECK(sm.view.dstar.rx && sm.view.dstar.played && aud.pcm);
+ 	dstar_engine_stop(&far);
+ 	run(500);
+ 	CHECK(!sm.view.dstar.rx);
+@@ -12115,7 +12154,7 @@ static void test_dstar_memory(void)
+ 	run(100);
+ 	CHECK(!radio_dstar_running());
+ 	cp_radio_name = "";
+-	aud.feed = false;
++	aud.feed = aud.feed_signal = false;
+ 	kv_t3_clear();
+ }
+ #endif

@@ -49,18 +49,14 @@ static void pack(uint16_t *b, uint8_t *bits)
 			bits[positions[i][j]] = (b[i] >> (widths[i] - 1u - j)) & 1u;
 }
 
-static int32_t cosine(unsigned bin, unsigned at, unsigned n)
-{
-	uint32_t step = UINT32_C(0x40000000) / n;
-	return mbe_cos_i(step * (uint32_t)(bin * (2 * at + 1)));
-}
-
 static void transform(const int32_t *in, unsigned n, int32_t *out, unsigned count)
 {
+	uint32_t step = UINT32_C(0x40000000) / n;
 	for (unsigned k = 0; k < count; k++) {
 		int32_t sum = 0;
-		for (unsigned i = 0; i < n; i++)
-			sum += fxp_mulshr(in[i], cosine(k, i, n), 15);
+		uint32_t phase = step * k, delta = 2u * phase;
+		for (unsigned i = 0; i < n; i++, phase += delta)
+			sum += fxp_mul_q15(in[i], (int16_t)mbe_cos_i(phase));
 		out[k] = sum / (int32_t)n;
 	}
 }
@@ -68,8 +64,10 @@ static void transform(const int32_t *in, unsigned n, int32_t *out, unsigned coun
 static int32_t reconstruct(const int32_t *c, unsigned count, unsigned at, unsigned n)
 {
 	int32_t sum = c[0];
-	for (unsigned k = 1; k < count; k++)
-		sum += fxp_mulshr(c[k], cosine(k, at, n), 14);
+	uint32_t step = (UINT32_C(0x40000000) / n) * (2u * at + 1u);
+	uint32_t phase = step;
+	for (unsigned k = 1; k < count; k++, phase += step)
+		sum += fxp_mul_q15(2 * c[k], (int16_t)mbe_cos_i(phase));
 	return sum;
 }
 

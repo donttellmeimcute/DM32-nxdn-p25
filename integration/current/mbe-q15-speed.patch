@@ -1,0 +1,58 @@
+diff --git a/core/dsp/fxp.h b/core/dsp/fxp.h
+index ba26a35..9490efc 100644
+--- a/core/dsp/fxp.h
++++ b/core/dsp/fxp.h
+@@ -125,6 +125,17 @@ FXP_INLINE int64_t fxp_mul64(int32_t a, int32_t b) { return fxp_mul64_c(a, b); }
+ FXP_INLINE int32_t fxp_mulshr(int32_t a, int32_t b, int s) { return fxp_mulshr_c(a, b, s); }
+ #endif
+ 
++// A signed Q15 coefficient needs no 64-bit multiply on C-SKY without HI/LO.
++FXP_INLINE int32_t fxp_mul_q15(int32_t a, int16_t b)
++{
++#if defined(__csky__) && !FXP_HILO
++	// Split at the fractional boundary. The high product may wrap, as does the result.
++	return (int32_t)((uint32_t)(a >> 15) * (uint32_t)b + (uint32_t)(((a & 32767) * b) >> 15));
++#else
++	return fxp_mulshr(a, b, 15);
++#endif
++}
++
+ // acc + a * b (wraps like a hardware accumulate)
+ FXP_INLINE int64_t fxp_mac64(int64_t acc, int32_t a, int32_t b)
+ {
+diff --git a/core/mbe/mbe_dsp.c b/core/mbe/mbe_dsp.c
+index 56f160d..41aea4d 100644
+--- a/core/mbe/mbe_dsp.c
++++ b/core/mbe/mbe_dsp.c
+@@ -10,7 +10,8 @@ int32_t mbe_cos_i(uint32_t ph)
+ 	uint32_t i = ph >> 22;
+ 	int32_t c0 = mbe_sin_idx(i + 256u), c1 = mbe_sin_idx(i + 257u);
+ 
+-	return c0 + fxp_mulshr(c1 - c0, (int32_t)(ph & 0x3FFFFFu), 22);
++	// Adjacent Q15 table values differ by at most 202: the product fits int32_t.
++	return c0 + (((c1 - c0) * (int32_t)(ph & 0x3FFFFFu)) >> 22);
+ }
+ 
+ int32_t mbe_exp2_q11(int32_t x)
+@@ -58,7 +59,7 @@ int32_t mbe_log2_q11_64(uint64_t x)
+ 	return mbe_log2_q11(l);
+ }
+ 
+-static inline __attribute__((always_inline)) int32_t mulq15(int32_t a, int32_t b) { return fxp_mulshr(a, b, 15); }
++static inline __attribute__((always_inline)) int32_t mulq15(int32_t a, int16_t b) { return fxp_mul_q15(a, b); }
+ 
+ // Complex FFT of N points, radix 2, decimation in time, no scaling; the inverse (e^{+i}) when inv. The k = 0 and
+ // k = half/2 butterflies of each stage need no multiply.
+diff --git a/core/mbe/mbe_synth.c b/core/mbe/mbe_synth.c
+index e66a518..25e252a 100644
+--- a/core/mbe/mbe_synth.c
++++ b/core/mbe/mbe_synth.c
+@@ -118,7 +118,7 @@ static void osc(int32_t *acc, uint32_t ph, uint32_t inc, uint32_t dinc, const in
+ 			a += da;
+ 			ph += inc;
+ 			inc += dinc;
+-			o[n] += fxp_mulshr(a >> 8, mbe_cos(ph), 15);
++			o[n] += fxp_mul_q15(a >> 8, (int16_t)mbe_cos(ph));
+ 		}
+ 	}
+ }

@@ -13,7 +13,8 @@
 #include "dv_engine.h"
 
 #define QUEUE 8u
-#define CODEC_BUDGET_US 15000u
+#define PCM_PERIOD_US (AUDIO_BLOCK_MS * 1000u)
+#define MAX_CODEC_DEBT_US (2u * PCM_PERIOD_US)
 #define STACK_BYTES 8192u
 #define LOAD(field) __atomic_load_n(&(field), __ATOMIC_ACQUIRE)
 #define STORE(field, value) __atomic_store_n(&(field), (value), __ATOMIC_RELEASE)
@@ -30,10 +31,11 @@ typedef struct {
 	dstar_engine_t engine;
 	dstar_ambe_t codec;
 	voice_queue_t rx, tx;
+	uint32_t codec_debt_us;
 	uint8_t call, ended, tx_gen, codec_gen;
 	uint8_t lead;
-	bool speaker, slow, keyed;
-	bool streaming, sending;
+	bool speaker, tx_slow, keyed;
+	bool streaming, sending, codec_slow;
 	uint8_t source[8];
 	dstar_header_t header;
 	bool route_ok;
@@ -126,10 +128,17 @@ static void codec_block(void *arg)
 	if (r->sending != sending || r->codec_gen != gen) {
 		r->sending = sending;
 		r->codec_gen = gen;
+		r->codec_debt_us = 0;
+		r->codec_slow = false;
 		dstar_ambe_reset(&r->codec);
 		r->lead = (audio->speaker_lead_ms + AUDIO_BLOCK_MS - 1u) / AUDIO_BLOCK_MS;
 	}
 	uint8_t raw[DSTAR_AMBE_BITS], frame[DSTAR_VOICE_BYTES];
+	if (r->codec_slow) {
+		if (!sending)
+			get(&r->rx, gen, frame);
+		return;
+	}
 	uint32_t now = board.air->now_us();
 	if (sending) {
 		if (!b->mic)
@@ -149,16 +158,27 @@ static void codec_block(void *arg)
 		if (received || LOAD(r->ended) != gen)
 			dstar_ambe_decode(&r->codec, received && dstar_ambe_wire_decode(frame, raw) ? raw : NULL, b->spk);
 	}
-	if (board.air->now_us() - now >= CODEC_BUDGET_US)
-		STORE(r->slow, true);
+	// An interrupt or a costly frame can run late once. Cut only when the codec falls
+	// two blocks behind the 20 ms stream, counting time it recovers on faster blocks.
+	uint32_t elapsed = board.air->now_us() - now;
+	if (elapsed <= PCM_PERIOD_US) {
+		uint32_t spare = PCM_PERIOD_US - elapsed;
+		r->codec_debt_us = spare < r->codec_debt_us ? r->codec_debt_us - spare : 0;
+	} else if (elapsed - PCM_PERIOD_US < MAX_CODEC_DEBT_US - r->codec_debt_us) {
+		r->codec_debt_us += elapsed - PCM_PERIOD_US;
+	} else {
+		r->codec_slow = true;
+		if (sending)
+			STORE(r->tx_slow, true);
+		else
+			speaker(r, false);
+	}
 }
 
 static void pcm(const int16_t *mic, int16_t *spk, void *ctx)
 {
 	dstar_radio_t *r = ctx;
 	memset(spk, 0, AUDIO_BLOCK_SAMPLES * sizeof(*spk));
-	if (LOAD(r->slow))
-		return;
 	audio_block_t b = { mic, spk, r };
 #ifdef HAL_VOCODER_WINDOW
 	board.vocoder->call_on_stack(codec_block, &b, stack_top);
@@ -256,7 +276,7 @@ bool radio_dstar_poll(radio_dstar_view_t *view)
 {
 	radio_dstar_view_t v = {0};
 	dstar_radio_t *r = radio;
-	if (r && air_session_tx_state(&r->engine.session) == AIR_TX_IDLE && !LOAD(r->slow)) {
+	if (r && air_session_tx_state(&r->engine.session) == AIR_TX_IDLE) {
 		v.rx = LOAD(r->call) != LOAD(r->ended);
 		bool queued = LOAD(r->rx.head) != LOAD(r->rx.tail);
 		if (!r->streaming && (v.rx || queued))
@@ -268,8 +288,6 @@ bool radio_dstar_poll(radio_dstar_view_t *view)
 			v.source[i] = LOAD(r->source[i]);
 		for (unsigned i = 8; i != 0 && v.source[i - 1] == ' '; i--)
 			v.source[i - 1] = '\0';
-	} else if (r && LOAD(r->slow)) {
-		pause(r);
 	}
 	bool changed = memcmp(view, &v, sizeof(v)) != 0;
 	*view = v;
@@ -283,7 +301,7 @@ static bool no_tx(void)
 
 static uint8_t tx_fault(void)
 {
-	if (radio && LOAD(radio->slow))
+	if (radio && LOAD(radio->tx_slow))
 		return TXDENY_CPU;
 	return TXDENY_NONE;
 }
@@ -344,6 +362,7 @@ static void tx_clear(void)
 		return;
 	pause(radio);
 	STORE(radio->keyed, false);
+	STORE(radio->tx_slow, false);
 	air_session_tx_clear(&radio->engine.session);
 }
 

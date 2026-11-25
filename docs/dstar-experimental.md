@@ -59,7 +59,11 @@ The DM-32UV transmits 4800 binary symbols/s through the HR_C7000's
 RRC pulse path with a nominal outer deviation of 1200 Hz. The provider marks
 this shape as approximate. Validate deviation, occupied bandwidth, RX/TX with
 another D-STAR radio, and the 20 ms audio cadence on a cabled bench before RF
-use. The host tests do not measure the physical transmitter or MCU timing.
+use. The voice codec has a 20 ms frame period. Occasional late frames can recover
+on the next blocks. Sustained overload stops the current TX or mutes the current
+RX once processing falls two frames behind. A fresh call can start normally.
+The host tests inject short delays and sustained overload. They do not measure
+the physical transmitter or MCU timing.
 
 From the repository root after preparing the RadioFoundry tree:
 
