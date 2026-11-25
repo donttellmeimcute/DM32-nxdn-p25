@@ -95,3 +95,21 @@ index 9024ca0..a7f0029 100644
  	kv_t3_clear();
  }
  #endif
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index 5069214..ce11cbb 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -1954,9 +1954,12 @@ static const char *deny_action(const radio_view_t *v)
+ 	case TXDENY_REFUSED: return TR(DENY_FIX_RELEASE_AND_RETRY, "Release PTT, try again");
+ 	case TXDENY_BENCH: return TR(DENY_FIX_END_BENCH_ON_PC, "End the bench on the PC");
+ 	case TXDENY_TRUNK: return TR(DENY_FIX_RELEASE_AND_RETRY, "Release PTT, try again");
++	case TXDENY_CPU:
+ #if CONFIG_M17
+-	case TXDENY_CPU: return m17_codec_time(v);
++		if (v->ch.mode == RADIO_MODE_M17)
++			return m17_codec_time(v);
+ #endif
++		return TR(DENY_FIX_RELEASE_AND_RETRY, "Release PTT, try again");
+ 	default: return TR(DENY_FIX_PICK_ANOTHER_CHANNEL, "Pick another channel");
+ 	}
+ }
