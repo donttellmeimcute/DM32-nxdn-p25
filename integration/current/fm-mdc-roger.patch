@@ -259,7 +259,7 @@ diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
  
 +msgctxt "SET_VALUE_FM_ROGER_CLASSIC"
 +msgid "Classic"
-+msgstr "Cl�sico"
++msgstr "Clásico"
 +
 +msgctxt "SET_LABEL_FM_ROGER_MDC_ID"
 +msgid "MDC roger ID"
@@ -309,15 +309,15 @@ diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
 +++ b/core/ui/lang/zh.po
 @@ -3974,6 +3974,14 @@
  msgid "FM roger beep"
- msgstr "FM ?????"
+ msgstr "FM 结束提示音"
  
 +msgctxt "SET_VALUE_FM_ROGER_CLASSIC"
 +msgid "Classic"
-+msgstr "??"
++msgstr "双音"
 +
 +msgctxt "SET_LABEL_FM_ROGER_MDC_ID"
 +msgid "MDC roger ID"
-+msgstr "MDC ???? ID"
++msgstr "MDC 结束提示 ID"
 +
  #: core/ui/ui_menus.c
  msgctxt "SET_LABEL_DIGITAL_RX_LEVEL"
