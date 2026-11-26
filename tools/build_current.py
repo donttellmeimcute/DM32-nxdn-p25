@@ -211,6 +211,7 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'dm32-bench-tx-1p25m.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-am-rx.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'ysf-auto-vfo-deviation.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'dm32-satcom-rx-memories.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'release-decode-captures.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'release-mmdvm-captures.patch', cwd=tree)
 	if dstar:

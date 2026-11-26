@@ -1,0 +1,89 @@
+diff --git a/boards/dm32/board.c b/boards/dm32/board.c
+index 458b6aa..414fe74 100644
+--- a/boards/dm32/board.c
++++ b/boards/dm32/board.c
+@@ -45,6 +45,7 @@ static const band_t bands[] = {
+ #endif
+ 	// Conducted bench tests only. The PA has no factory rating for this range.
+ 	[BENCH_TX_BAND] = { 220000000, 230000000, true },
++	{ 240000000, 270000000, false },	// UHF satellite memories are available with RX past bands off
+ #if CONFIG_RX_EXT
+ 	// Receive only past the rated bands, while the user turns it on: the FD6818 band table (hardware-dm32.md 8.3). Keep these last
+ 	{ 16000000, 65000000, false },
+diff --git a/docs/spec/hardware-dm32.md b/docs/spec/hardware-dm32.md
+index 453b672..d893cc4 100644
+--- a/docs/spec/hardware-dm32.md
++++ b/docs/spec/hardware-dm32.md
+@@ -1603,6 +1603,9 @@ calibration (modem-hrc7000.md 10.4).
+ 
+ ## Receive past the rated bands
+ 
++240-270 MHz is available for reception with either setting of **Tools > RX past bands**. For example, an FM memory
++written by the CPS at 255.550 MHz can be recalled from its zone with extended RX off. This range has no TX band entry.
++
+ 16-65, 174-400 and 480-1120 MHz are receive-only ranges while **Tools > RX past bands** is On
+ ([radio-features.md](radio-features.md) 6.2). The option is Off on first start and after a factory reset. The saved
+ choice survives a restart. The 222-225 MHz band falls inside 174-400 MHz. Enter `222500` in the VFO for 222.500 MHz.
+diff --git a/tests/host/radioListenBandsTest.c b/tests/host/radioListenBandsTest.c
+index dfb4790..829205c 100644
+--- a/tests/host/radioListenBandsTest.c
++++ b/tests/host/radioListenBandsTest.c
+@@ -171,8 +171,10 @@ static const band_t bands[] = {
+ 	{ 88000001, 108000000, false },
+ 	{ 66000000, 88000000, false },
+ 	{ 220000000, 230000000, true },
++	{ 240000000, 270000000, false },
+ 	{ 174000000, 400000000, false },
+ };
++static bool extended_rx = true;
+ static const char *const power_names[] = { "L", "M", "H" };
+ 
+ const board_t board = {
+@@ -180,6 +182,8 @@ const board_t board = {
+ 	.caps = CAP_AM_RX | CAP_BCAST_FM | CAP_DMR,
+ 	.bands = bands,
+ 	.band_count = sizeof(bands) / sizeof(bands[0]),
++	.rx_ext_count = 1,
++	.rx_ext_on = &extended_rx,
+ 	.nfm_rx_band = &bands[4],
+ 	.manual_fm_tx_band = &bands[5],
+ 	.bcast_rx_band = &bands[3],
+@@ -924,6 +928,30 @@ static void test_low_fm_band(void)
+ 	CHECK(sm.view.zone_pos == 4 && hw.rx_hz == 146520000);
+ }
+ 
++static void test_satcom_memory(void)
++{
++	start();
++	board_rx_ext_set(false);
++	req(RREQ_ZONE_POS, 2);
++	CHECK(hw.rx_hz == 146520000);
++	add(4, "Satcom", 255550000, 255550000, RADIO_MODE_FM);
++	chans[4].rx_only = true;
++	req(RREQ_ZONE_POS, 3);
++	CHECK(!sm.view.vfo && sm.view.channel_number == 4 && sm.view.zone_pos == 3);
++	CHECK(sm.view.ch.rx_hz == 255550000 && hw.rx_hz == 255550000);
++	ptt(true);
++	CHECK(sm.view.tx_deny == TXDENY_RX_ONLY && hw.tx_calls == 0);
++	ptt(false);
++	req(RREQ_ZONE_POS, 2);
++	req(RREQ_CH_STEP, 1);
++	CHECK(sm.view.channel_number == 4 && hw.rx_hz == 255550000);
++	CHECK(board_in_band(240000000, false) && board_in_band(270000000, false));
++	CHECK(!board_in_band(239999990, false) && !board_in_band(270000010, false));
++	CHECK(!board_in_band(255550000, true));
++	board_rx_ext_set(true);
++	CHECK(board_in_band(270000010, false) && !board_in_band(255550000, true));
++}
++
+ static void test_bench_tx_band(void)
+ {
+ 	start();
+@@ -970,6 +998,7 @@ static void test_bench_tx_band(void)
+ 
+ int main(void)
+ {
++	test_satcom_memory();
+ 	test_bench_tx_band();
+ 	test_helpers();
+ 	test_am_channel();
