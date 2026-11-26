@@ -148,10 +148,10 @@ Instala la imagen con **Usar mi propia compilación del firmware** en el flasher
 
 La compilación predeterminada del DM-32UV desactiva el servidor de estado HTTP y el repetidor DMR SFR para recuperar RAM.
 
-Cada release incluye `rfoundry-dm32-<versión>-bench-1p25m.bin` para pruebas por cable con una carga ficticia de 50 Ω.
-Cárgalo en **Usar mi propia compilación del firmware**. Habilita PTT manual en FM estrecha de 220 a 230 MHz, con
-excitación limitada y comprobación de enganche del PLL. Para compilarlo localmente, añade `--bench-tx-1p25m`.
-La imagen local queda en `build/current/build/dm32-bench-1p25m/rfoundry_dm32.bin`.
+Las versiones que ofrece el flasher incluyen TX de banco de 220 a 230 MHz mediante PTT manual en FM estrecha.
+El firmware limita la excitación y comprueba el enganche del PLL. Usa una carga ficticia de 50 Ω para medir la
+salida RF. La opción local `--bench-tx-1p25m` genera una imagen con nombre de banco en
+`build/current/build/dm32-bench-1p25m/rfoundry_dm32.bin`.
 El PA está fuera de su rango calibrado de fábrica en esta banda. En México, el CNAF atribuye 220 a 225 MHz
 al servicio de aficionados y, desde 225 MHz, al fijo y móvil. [Cuadro Nacional de Atribución de Frecuencias](https://www.ift.org.mx/sites/default/files/c-erro-06-cnaf_06-22_version_accesible.pdf)
 
