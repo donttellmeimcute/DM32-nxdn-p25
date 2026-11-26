@@ -38,11 +38,12 @@ diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
 diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
 --- a/core/ui/ui_app.c
 +++ b/core/ui/ui_app.c
-@@ -1640,3 +1640,2 @@
+@@ -1640,4 +1640,3 @@
  			{ RADIO_MODE_NXDN, VFO_VARIANT_SECOND, UI_FEAT_NXDN },
 -			{ RADIO_MODE_YSF, VFO_VARIANT_FIRST, UI_FEAT_YSF },
 -			{ RADIO_MODE_YSF, VFO_VARIANT_SECOND, UI_FEAT_YSF },
 +			{ RADIO_MODE_YSF, VFO_VARIANT_DEFAULT, UI_FEAT_YSF },
+ #if CONFIG_M17
 diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
 --- a/core/ui/ui_screens.c
 +++ b/core/ui/ui_screens.c
@@ -163,7 +164,7 @@ diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
 diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
 --- a/docs/spec/ysf.md
 +++ b/docs/spec/ysf.md
-@@ -191,7 +191,8 @@
+@@ -191,9 +191,10 @@
  ## 8. The channel kind
  
 -The VFO defaults to DN (V/D mode 2) at Narrow deviation. Its W/N selection
@@ -177,13 +178,16 @@ diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
 +uses Wide (2700 Hz). The channel raster remains 12.5 kHz. This radio-wide
 +VFO setting is held in RAM; stored YSF channels keep their own parameter
 +blocks. Legacy saved VFO deviation overrides are discarded on restore.
+ 
+ The radio glue is written: `RADIO_MODE_YSF`, `CODEPLUG_KIND_YSF` (kind 6),
 diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
 --- a/docs/user/07-channels-zones-vfo.md
 +++ b/docs/user/07-channels-zones-vfo.md
-@@ -320,2 +320,2 @@
+@@ -320,3 +320,3 @@
  In the VFO, **\***, **4** cycles the supported modes ([feature matrix](../feature-matrix.md)):
 -FM, DMR, P25, NXDN48, NXDN96, YSF Wide and YSF Narrow. Each VFO keeps its mode, NXDN rate and YSF deviation across a restart.
 +FM, DMR, P25, NXDN48, NXDN96 and YSF (plus any other modes enabled in the build). Each VFO keeps its mode and NXDN rate across a restart.
+ 
 @@ -430,6 +430,6 @@
 -- Home shows **YSF** for both Wide and Narrow, including on the selected side in dual watch. The VFO's Quick menu
 -  shows **YSF W** or **YSF N**. Home also shows what PTT calls and the DG-ID and data type. During a call it shows who
