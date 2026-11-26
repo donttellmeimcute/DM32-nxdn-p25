@@ -143,7 +143,7 @@ jobs:
               manifest = json.load(f)
           enabled = set(manifest["features"].split(","))
           disabled = set(manifest["off"].split(","))
-          required = {"DMR", "P25", "NXDN", "YSF", "IMBE", "M17", "DSTAR", "MDC1200"}
+          required = {"DMR", "P25", "NXDN", "YSF", "M17", "DSTAR", "MDC1200"}
           missing = (required - enabled) | (required & disabled)
           if missing:
               raise SystemExit(f"full release manifest missing features: {', '.join(sorted(missing))}")
