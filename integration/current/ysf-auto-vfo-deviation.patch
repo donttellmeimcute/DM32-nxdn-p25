@@ -180,6 +180,10 @@ diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
 diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
 --- a/docs/user/07-channels-zones-vfo.md
 +++ b/docs/user/07-channels-zones-vfo.md
+@@ -320,2 +320,2 @@
+ In the VFO, **\***, **4** cycles the supported modes ([feature matrix](../feature-matrix.md)):
+-FM, DMR, P25, NXDN48, NXDN96, YSF Wide and YSF Narrow. Each VFO keeps its mode, NXDN rate and YSF deviation across a restart.
++FM, DMR, P25, NXDN48, NXDN96 and YSF (plus any other modes enabled in the build). Each VFO keeps its mode and NXDN rate across a restart.
 @@ -430,6 +430,6 @@
 -- Home shows **YSF** for both Wide and Narrow, including on the selected side in dual watch. The VFO's Quick menu
 -  shows **YSF W** or **YSF N**. Home also shows what PTT calls and the DG-ID and data type. During a call it shows who
@@ -192,7 +196,3 @@ diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vf
 +  V/D-1 and DN automatically use Narrow deviation; VW automatically uses Wide deviation. The channel remains 12.5 kHz.
 +  The selection stays in RAM until the radio is switched off.
  - Some radios only transmit YSF or only receive it ([feature matrix](../feature-matrix.md)). One that only receives
-@@ -480,2 +480,2 @@
- In the VFO, **\***, **4** cycles the supported modes ([feature matrix](../feature-matrix.md)):
--FM, DMR, P25, NXDN48, NXDN96, YSF Wide and YSF Narrow. Each VFO keeps its mode, NXDN rate and YSF deviation across a restart.
-+FM, DMR, P25, NXDN48, NXDN96 and YSF (plus any other modes enabled in the build). Each VFO keeps its mode and NXDN rate across a restart.
