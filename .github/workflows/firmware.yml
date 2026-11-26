@@ -107,6 +107,13 @@ jobs:
           python3 tools/bench/nxdntool.py selftest
         working-directory: build/current
 
+      - name: Build and test the 220–230 MHz bench firmware
+        run: |
+          set -eu
+          python3 tools/build_current.py --tree build/bench-1p25m --bench-tx-1p25m --jobs 4
+          make -C build/bench-1p25m/tests/host radioListenBandsTest
+          (cd build/bench-1p25m/tests/host && ./radioListenBandsTest)
+
       - name: Package the image
         id: package
         env:
@@ -115,8 +122,10 @@ jobs:
           set -eu
           VERSION="${INPUT_VERSION:-$(date -u +%Y.%m.%d)-${GITHUB_SHA::8}}"
           TREE=build/current
+          BENCH_TREE=build/bench-1p25m
           # The manifest's git and git_time are this repository's commit: release.py reads them from the tree's objects
           git -C "$TREE" fetch -q --depth=1 "$GITHUB_WORKSPACE" "$GITHUB_SHA"
+          git -C "$BENCH_TREE" fetch -q --depth=1 "$GITHUB_WORKSPACE" "$GITHUB_SHA"
           mkdir -p dist
           # release.py asks make print-config for the manifest: pass the same optional features as build_current.py,
           # otherwise the image contains M17/MDC1200 but the flasher's manifest incorrectly lists them as off
@@ -155,6 +164,11 @@ jobs:
           fi
           python3 tools/build_mode_presets.py --tree "$TREE" --out dist --version "$VERSION" \
             --git "$GITHUB_SHA" --cross "$GITHUB_WORKSPACE/toolchain/bin/csky-elf-" --jobs 4 "${MODE_ARGS[@]}"
+          # The suffix keeps the conducted bench image out of the web flasher's automatic release sync.
+          (cd "$BENCH_TREE" && MAKEFLAGS="CROSS=$GITHUB_WORKSPACE/toolchain/bin/csky-elf- CONFIG_DSTAR=y CONFIG_M17=y CONFIG_MDC1200=y CONFIG_NET_HTTP=n CONFIG_SFR=n" \
+            python3 tools/release.py --board dm32 --version "$VERSION-bench-1p25m" --git "$GITHUB_SHA" \
+            --bin build/dm32-bench-1p25m/rfoundry_dm32.bin --out "$GITHUB_WORKSPACE/dist")
+          (cd dist && sha256sum -c SHA256SUMS)
           ls -l dist
           cat dist/SHA256SUMS
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -180,6 +194,9 @@ jobs:
             echo "---"
             echo "Imagen sin códec AMBE para el Baofeng DM-32UV, compilada desde ${GITHUB_SHA::8}. El web flasher la instala sola"
             echo "en unos minutos: https://donttellmeimcute.github.io/dm32-web-cps-flasher/ (toma el códec de tu propia radio)."
+            echo
+            echo "Para pruebas por cable con una carga ficticia de 50 Ω, instala manualmente rfoundry-dm32-$VERSION-bench-1p25m.bin."
+            echo "El TX de banco de 220 a 230 MHz usa PTT manual en FM estrecha."
             echo
             echo '```'
             cat dist/SHA256SUMS
