@@ -1,0 +1,185 @@
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+index fa5ea7a..a8ebd74 100644
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -397,6 +397,11 @@ msgctxt "CHAN_TOAST_NAC_REPEATER"
+ msgid "F7F is for repeaters"
+ msgstr "F7F es para repetidores"
+ 
++#: core/ui/ui_app.c
++msgctxt "QUICK_WHY_DSTAR_WIDTH_FIXED"
++msgid "D-STAR bandwidth is fixed"
++msgstr "D-STAR usa un ancho fijo"
++
+ #: core/ui/ui_app.c
+ msgctxt "QUICK_WHY_FM_ONLY_DMR_CHANNEL"
+ msgid "FM only: this is a DMR channel"
+@@ -5507,6 +5512,11 @@ msgctxt "QUICK_VALUE_COPY"
+ msgid "Copy"
+ msgstr "Copiar"
+ 
++#: core/ui/ui_screens.c
++msgctxt "QUICK_VALUE_FIXED_WIDTH"
++msgid "Fixed"
++msgstr "Fijo"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_VALUE_ALL"
+ msgid "All"
+diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+index 1096ffb..b456bc1 100644
+--- a/core/ui/lang/fr.po
++++ b/core/ui/lang/fr.po
+@@ -397,6 +397,11 @@ msgctxt "CHAN_TOAST_NAC_REPEATER"
+ msgid "F7F is for repeaters"
+ msgstr "F7F: pour relais"
+ 
++#: core/ui/ui_app.c
++msgctxt "QUICK_WHY_DSTAR_WIDTH_FIXED"
++msgid "D-STAR bandwidth is fixed"
++msgstr "Largeur D-STAR fixe"
++
+ #: core/ui/ui_app.c
+ msgctxt "QUICK_WHY_FM_ONLY_DMR_CHANNEL"
+ msgid "FM only: this is a DMR channel"
+@@ -5507,6 +5512,11 @@ msgctxt "QUICK_VALUE_COPY"
+ msgid "Copy"
+ msgstr "Copier"
+ 
++#: core/ui/ui_screens.c
++msgctxt "QUICK_VALUE_FIXED_WIDTH"
++msgid "Fixed"
++msgstr "Fixe"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_VALUE_ALL"
+ msgid "All"
+diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+index e3a33b8..fc785ff 100644
+--- a/core/ui/lang/it.po
++++ b/core/ui/lang/it.po
+@@ -397,6 +397,11 @@ msgctxt "CHAN_TOAST_NAC_REPEATER"
+ msgid "F7F is for repeaters"
+ msgstr "F7F è per i ripetitori"
+ 
++#: core/ui/ui_app.c
++msgctxt "QUICK_WHY_DSTAR_WIDTH_FIXED"
++msgid "D-STAR bandwidth is fixed"
++msgstr "Larghezza D-STAR fissa"
++
+ #: core/ui/ui_app.c
+ msgctxt "QUICK_WHY_FM_ONLY_DMR_CHANNEL"
+ msgid "FM only: this is a DMR channel"
+@@ -5507,6 +5512,11 @@ msgctxt "QUICK_VALUE_COPY"
+ msgid "Copy"
+ msgstr "Copia"
+ 
++#: core/ui/ui_screens.c
++msgctxt "QUICK_VALUE_FIXED_WIDTH"
++msgid "Fixed"
++msgstr "Fissa"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_VALUE_ALL"
+ msgid "All"
+diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+index 88ff47c..a84f3ec 100644
+--- a/core/ui/lang/zh.po
++++ b/core/ui/lang/zh.po
+@@ -399,6 +399,11 @@ msgctxt "CHAN_TOAST_NAC_REPEATER"
+ msgid "F7F is for repeaters"
+ msgstr "F7F 仅用于中继台"
+ 
++#: core/ui/ui_app.c
++msgctxt "QUICK_WHY_DSTAR_WIDTH_FIXED"
++msgid "D-STAR bandwidth is fixed"
++msgstr "D-STAR 带宽固定"
++
+ #: core/ui/ui_app.c
+ msgctxt "QUICK_WHY_FM_ONLY_DMR_CHANNEL"
+ msgid "FM only: this is a DMR channel"
+@@ -5509,6 +5514,11 @@ msgctxt "QUICK_VALUE_COPY"
+ msgid "Copy"
+ msgstr "复制"
+ 
++#: core/ui/ui_screens.c
++msgctxt "QUICK_VALUE_FIXED_WIDTH"
++msgid "Fixed"
++msgstr "固定"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_VALUE_ALL"
+ msgid "All"
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index 22550d4..5ead092 100644
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -1543,6 +1543,12 @@ static void quick_close_editor(void)
+ 
+ static void quick_unavailable(uint8_t kind)
+ {
++#if CONFIG_DSTAR
++	if (kind == QT_BANDWIDTH && view->ch.mode == RADIO_MODE_DSTAR) {
++		ui_toast(TR(QUICK_WHY_DSTAR_WIDTH_FIXED, "D-STAR bandwidth is fixed"));
++		return;
++	}
++#endif
+ 	switch (kind) {
+ 	case QT_TONE:
+ 	case QT_BANDWIDTH:
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index 3cbc722..f57958e 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -4621,6 +4621,12 @@ bool ui_quick_tile(int tile, const radio_view_t *v, const ui_state_t *s, char *l
+ #endif
+ 		return feat(UI_FEAT_SCAN);
+ 	case QT_BANDWIDTH:
++#if CONFIG_DSTAR
++		if (v->ch.mode == RADIO_MODE_DSTAR) {
++			sb_str(&b, TR(QUICK_VALUE_FIXED_WIDTH, "Fixed"));
++			return false;
++		}
++#endif
+ 		if (v->temp & RADIO_TEMP_BW)
+ 			sb_str(&b, GLYPH_DOT);
+ 		sb_str(&b, v->ch.bw == RADIO_BW_25K ? "25k" : "12.5k");
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 188452d..a61d13e 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2984,6 +2984,7 @@ static bool check(const char *kv, char *err, size_t len)
+ 	else if (strcmp(key, "mode") == 0) snprintf(got, sizeof got, "%s", view.ch.mode == RADIO_MODE_DMR ? "dmr" :
+ 								     view.ch.mode == RADIO_MODE_P25 ? "p25" :
+ 								     view.ch.mode == RADIO_MODE_NXDN ? "nxdn" :
++								     view.ch.mode == RADIO_MODE_DSTAR ? "dstar" :
+ 								     view.ch.mode == RADIO_MODE_YSF ? "ysf" : "fm");
+ 	else if (strcmp(key, "vfoaes") == 0) snprintf(got, sizeof got, "%ld", (long)ui_vfo_aes_id(&view));
+ 	else if (strcmp(key, "tx") == 0) snprintf(got, sizeof got, "%u", (unsigned)sim_rec.tx_count);
+@@ -3513,9 +3514,10 @@ static bool run_token(char *t, char *err, size_t len)
+ 		advance(100);
+ 		return true;
+ 	}
+-	if (strcmp(t, "dlmode") == 0 && arg != NULL) {	// the debug link sets the mode (DMR_FIELDS): fm, dmr, p25, nxdn or ysf
++	if (strcmp(t, "dlmode") == 0 && arg != NULL) {	// set the channel or VFO's radio mode
+ 		ui_svc_mode(strcmp(arg, "p25") == 0 ? RADIO_MODE_P25 : strcmp(arg, "nxdn") == 0 ? RADIO_MODE_NXDN :
+ 			strcmp(arg, "ysf") == 0 ? RADIO_MODE_YSF :
++			strcmp(arg, "dstar") == 0 ? RADIO_MODE_DSTAR :
+ 			strcmp(arg, "dmr") == 0 ? RADIO_MODE_DMR : RADIO_MODE_FM);
+ 		advance(100);
+ 		return true;
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index e0badb1..964e4be 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -614,6 +614,10 @@ static const flow_t flows[] = {
+ 	{ "E on a radio with AM: OK on the Mode row keeps it AM", "am ok 5 up up ok down down down ok 1 2 1 5 0 0 ok up",
+ 	  "ok", "toast=Air_band:_receive_only shows=AM hides=FM hides=Color_code hides=RX_CTCSS", 1, false },
+ #if CONFIG_DSTAR
++	{ "D-STAR stored channel shows fixed width in Quick", "dstar dlmode:dstar",
++	  "quick 8 expect:toast=D-STAR_bandwidth_is_fixed wait:4000", "mode=dstar vfo=0 screen=quick shows=Fixed hides=12.5k", 2, false },
++	{ "D-STAR VFO shows fixed width in Quick", "dstar vfokey dlmode:dstar",
++	  "quick 8 expect:toast=D-STAR_bandwidth_is_fixed wait:4000", "mode=dstar vfo=1 screen=quick shows=Fixed hides=12.5k", 2, false },
+ 	{ "D-STAR is selectable in a stored channel", "dstar ok 5 ok down down", "ok",
+ 	  "focus=Mode shows=D-STAR hides=Color_code hides=RX_CTCSS", 1, false },
+ 	{ "D-STAR can save a stored channel", "dstar ok 5 ok down down ok", "long:ok",

@@ -168,7 +168,7 @@ def out(*args, cwd=None):
 	return subprocess.check_output([str(a) for a in args], cwd=cwd, text=True).strip()
 
 
-def prepare(tree, dstar=False):
+def prepare(tree, dstar=False, bench_tx_1p25m=False):
 	if not (tree / '.git').exists():
 		tree.mkdir(parents=True, exist_ok=True)
 		if any(tree.iterdir()):
@@ -205,6 +205,10 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-ysf-quick-data-type.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-scan-limits-and-digital-sweep.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'low-band-fm-bandwidth.patch', cwd=tree)
+	if dstar:
+		run('git', 'apply', '--binary', PATCH_DIR / 'dstar-quick-width.patch', cwd=tree)
+	if bench_tx_1p25m:
+		run('git', 'apply', '--binary', PATCH_DIR / 'dm32-bench-tx-1p25m.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
@@ -223,6 +227,8 @@ def main():
 	                help='build experimental D-STAR DV for the VFO and stored channels (RF unverified)')
 	ap.add_argument('--no-m17', action='store_true', help='build with CONFIG_M17=n (M17 voice; Codec 2 real time on the MCU unverified)')
 	ap.add_argument('--no-mdc1200', action='store_true', help='build with CONFIG_MDC1200=n (MDC-1200 ID on FM channels)')
+	ap.add_argument('--bench-tx-1p25m', action='store_true',
+	                help='enable manual narrow-FM TX from 220 through 230 MHz for conducted RF tests')
 	args = ap.parse_args()
 	tree = args.tree.resolve()
 	disabled = set(args.without)
@@ -233,20 +239,25 @@ def main():
 	if args.no_mdc1200 or 'aprs' in disabled:
 		disabled.add('mdc1200')
 	dstar = 'dstar' not in disabled
-	prepare(tree, dstar)
+	prepare(tree, dstar, args.bench_tx_1p25m)
 	# The version is this repository's commit, the time its commit time: the patched tree is never committed
 	version = out('git', 'rev-parse', '--short=8', 'HEAD', cwd=ROOT)
 	git_time = out('git', 'log', '-1', '--format=%ct', 'HEAD', cwd=ROOT)
 	# Reserve more main RAM for the private D-STAR build while keeping the host link and APRS enabled.
 	dstar_options = ('CONFIG_NET_HTTP=n', 'CONFIG_SFR=n') if dstar else ()
 	variant = ('VARIANT=' + args.variant,) if args.variant != 'full' else ()
-	preset = 'custom' if args.without or not args.dstar or args.no_m17 or args.no_mdc1200 else args.variant
+	bench_options = ()
+	if args.bench_tx_1p25m:
+		variant_suffix = '' if args.variant == 'full' else '-' + args.variant
+		bench_options = (f'BUILD=build/dm32{variant_suffix}-bench-1p25m',)
+		version += '-bench-1p25m'
+	preset = 'custom' if args.without or not args.dstar or args.no_m17 or args.no_mdc1200 or bench_options else args.variant
 	options = {name: 'n' for key, name in OPTIONAL_MODULES.items() if key in disabled}
 	options['M17'] = 'n' if 'm17' in disabled else 'y'
 	options['MDC1200'] = 'n' if 'mdc1200' in disabled else 'y'
 	options['DSTAR'] = 'y' if dstar else 'n'
 	run('make', '-j%d' % args.jobs, 'BOARD=dm32', 'CROSS=' + args.cross, 'GITVERSION=' + version,
-	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'RFOUNDRY_PRESET=' + preset, *variant,
+	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'RFOUNDRY_PRESET=' + preset, *variant, *bench_options,
 	    *(f'CONFIG_{name}={value}' for name, value in options.items()), *dstar_options, 'all', 'stack-check', cwd=tree)
 
 
