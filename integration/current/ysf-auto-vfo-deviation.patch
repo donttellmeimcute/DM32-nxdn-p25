@@ -1,0 +1,202 @@
+diff --git a/core/radio/radio_ysf.c b/core/radio/radio_ysf.c
+--- a/core/radio/radio_ysf.c
++++ b/core/radio/radio_ysf.c
+@@ -94,4 +94,6 @@
+-	if ((mask & RADIO_YSF_QUICK_DT) && vfo)
+-		set.dt = s->dt;
++	if ((mask & RADIO_YSF_QUICK_DT) && vfo) {
++		set.dt = s->dt;
++		set.narrow = s->dt != YSF_DT_VOICE_FR;
++	}
+ 	quick_mask = vfo ? 0 : (uint8_t)(quick_mask | (mask & ~RADIO_YSF_QUICK_DT));
+ }
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -7500,3 +7500,4 @@
+-	sm->vfo_ch.vfo_digital = st->vfo_digital[idx];
++	// Old front-panel YSF W/N selections must not override the current voice type.
++	sm->vfo_ch.vfo_digital = (uint8_t)(st->vfo_digital[idx] & ~VFO_DIG_YSF_MASK);
+ 	sm->vfo_ch.vfo_p25_kid = st->vfo_p25_kid[idx];
+ 	sm->vfo_ch.vfo_nxdn_key = st->vfo_nxdn_key[idx];
+@@ -9290,3 +9291,7 @@
++		if (sm->view.vfo && req->arg == RADIO_MODE_YSF && req->arg2 == VFO_VARIANT_DEFAULT) {
++			sm->vfo_ch.vfo_digital &= (uint8_t)~VFO_DIG_YSF_MASK;
++			sm->view.ch.vfo_digital = sm->vfo_ch.vfo_digital;
++		}
+ 		if (req->arg2 != VFO_VARIANT_DEFAULT) {
+ 			if (!sm->view.vfo || req->arg2 > VFO_VARIANT_SECOND)
+ 				break;
+@@ -9500,3 +9505,7 @@
+ 	case RREQ_YSF_SET:
+ 		// The same for YSF; a new data type or deviation starts the engine over (radio_ysf_apply)
++		if (sm->view.vfo && sm->view.ch.mode == RADIO_MODE_YSF && (req->arg & RADIO_YSF_QUICK_DT)) {
++			sm->vfo_ch.vfo_digital &= (uint8_t)~VFO_DIG_YSF_MASK;
++			sm->view.ch.vfo_digital = sm->vfo_ch.vfo_digital;
++		}
+ 		if (req->arg != 0 && !sm->view.vfo && sm->view.ch.mode == RADIO_MODE_YSF) {
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -1640,4 +1640,3 @@
+ 			{ RADIO_MODE_NXDN, VFO_VARIANT_SECOND, UI_FEAT_NXDN },
+-			{ RADIO_MODE_YSF, VFO_VARIANT_FIRST, UI_FEAT_YSF },
+-			{ RADIO_MODE_YSF, VFO_VARIANT_SECOND, UI_FEAT_YSF },
++			{ RADIO_MODE_YSF, VFO_VARIANT_DEFAULT, UI_FEAT_YSF },
+ #if CONFIG_M17
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -4420,3 +4420,3 @@
+ 	if (mode == RADIO_MODE_YSF)
+-		return variant == VFO_VARIANT_SECOND ? "YSF N" : "YSF W";
++		return "YSF";
+ 	return ui_mode_name(mode);
+@@ -4434,5 +4434,5 @@
+ 	if (v->ch.mode == RADIO_MODE_NXDN && (v->ch.vfo_digital & VFO_DIG_NXDN_MASK))
+ 		return v->ch.vfo_digital & VFO_DIG_NXDN_MASK;
+-	if (v->ch.mode == RADIO_MODE_YSF && (v->ch.vfo_digital & VFO_DIG_YSF_MASK))
+-		return (v->ch.vfo_digital & VFO_DIG_YSF_MASK) >> 2;
++	if (v->ch.mode == RADIO_MODE_YSF)
++		return VFO_VARIANT_DEFAULT;
+ #if CONFIG_NXDN
+@@ -4441,7 +4441,3 @@
+-#if CONFIG_YSF
+-	if (v->ch.mode == RADIO_MODE_YSF)
+-		return (v->ysf.flags & RADIO_YSF_NARROW) ? VFO_VARIANT_SECOND : VFO_VARIANT_FIRST;
+-#endif
+ 	(void)v;
+ 	return VFO_VARIANT_DEFAULT;
+ }
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -350,5 +350,6 @@
+ #if CONFIG_YSF
+-	if (mode == RADIO_MODE_YSF && radio_ysf_fit(variant == VFO_VARIANT_SECOND) != 0) {
++	if (mode == RADIO_MODE_YSF && (variant == VFO_VARIANT_DEFAULT ? radio_ysf_fits() :
++				      radio_ysf_fit(variant == VFO_VARIANT_SECOND) != 0)) {
+ 		radio_req_vfo_mode(mode, variant);
+ 		return true;
+ 	}
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -11700,4 +11700,4 @@
+-	// The Quick selection uses the live engine and applies without changing deviation or frequency.
++	// The Quick selection applies the data type and its deviation together without retuning frequency.
+ 	uint32_t hz = sm.view.ch.rx_hz;
+ 	CHECK(ui_svc_ysf_dt(YSF_DT_VD_MODE1));
+ 	run(100);
+@@ -11705,4 +11705,5 @@
+-	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VD_MODE1);
++	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VD_MODE1 &&
++	      (sm.view.ysf.flags & RADIO_YSF_NARROW) != 0 && sm.view.ch.rx_hz == hz);
+ #if CONFIG_P25 && CONFIG_IMBE
+ 	CHECK(ui_svc_ysf_dt(YSF_DT_VOICE_FR));
+ 	run(100);
+@@ -11710,4 +11711,5 @@
+-	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VOICE_FR);
++	CHECK(radio_ysf_running() && sm.view.ysf.tx_dt == YSF_DT_VOICE_FR &&
++	      (sm.view.ysf.flags & RADIO_YSF_NARROW) == 0 && sm.view.ch.rx_hz == hz);
+ #else
+ 	CHECK(!ui_svc_ysf_dt(YSF_DT_VOICE_FR));
+ #endif
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2000,5 +2000,6 @@
+ #if CONFIG_YSF
+ 	if (mode == RADIO_MODE_YSF)
+-		view.ysf.flags = variant == VFO_VARIANT_SECOND ? RADIO_YSF_NARROW : 0;
++		view.ysf.flags = (variant == VFO_VARIANT_DEFAULT ? view.ysf.tx_dt != YSF_DT_VOICE_FR :
++				  variant == VFO_VARIANT_SECOND) ? RADIO_YSF_NARROW : 0;
+ #endif
+ 	return ui_svc_mode(mode);
+@@ -2140,4 +2141,9 @@
+ 	if (!view.vfo || view.ch.mode != RADIO_MODE_YSF)
+ 		return false;
+ 	view.ysf.tx_dt = dt;
++	view.ch.vfo_digital &= (uint8_t)~VFO_DIG_YSF_MASK;
++	if (dt == YSF_DT_VOICE_FR)
++		view.ysf.flags &= (uint8_t)~RADIO_YSF_NARROW;
++	else
++		view.ysf.flags |= RADIO_YSF_NARROW;
+ 	return true;
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -100,5 +100,5 @@
+-	{ "YSF Wide VFO is labeled on Home", "vfokey quick 4 4 back wait:4000", "",
+-	  "mode=ysf vfo=1 screen=home shows=YSF hides=FM", 0, false },
+-	{ "YSF Narrow VFO is labeled on Home", "vfokey quick 4 4 4 back wait:4000", "",
+-	  "mode=ysf vfo=1 screen=home shows=YSF hides=FM", 0, false },
++	{ "YSF VFO is labeled on Home", "vfokey quick 4 4 back wait:4000", "",
++	  "mode=ysf vfo=1 screen=home shows=YSF hides=FM", 0, false },
++	{ "YSF VFO DT change keeps the mode", "vfokey quick 4 4 3 back wait:4000", "",
++	  "mode=ysf vfo=1 screen=home shows=YSF hides=FM", 0, false },
+ 	{ "YSF caller on Home", "dlmode:ysf ysfrx:K1ABC", "", "screen=home shows=K1ABC", 0, false },
+@@ -900,4 +900,4 @@
+-	{ "S VFO manual AM uses quick tile 4", "amvfo vfokey", "quick 4 4 4 4",
+-	  "toast=VFO:_AM_RX shows=AM_RX mode=fm vfo=1", 5, false },
+-	{ "S VFO manual AM cycles back to FM", "amvfo vfokey quick 4 4 4 4", "4",
++	{ "S VFO manual AM uses quick tile 4", "amvfo vfokey", "quick 4 4 4",
++	  "toast=VFO:_AM_RX shows=AM_RX mode=fm vfo=1", 4, false },
++	{ "S VFO manual AM cycles back to FM", "amvfo vfokey quick 4 4 4", "4",
+ 	  "toast=VFO:_FM mode=fm vfo=1", 1, false },
+@@ -950,3 +950,3 @@
+-	{ "S VFO mode: P25 back to FM", "p25 ok 4 up ok quick 4 back quick 4 back", "quick 4 4 4",
+-	  "toast=VFO:_FM mode=fm temporary=0", 4, false },
++	{ "S VFO mode: P25 back to FM", "p25 ok 4 up ok quick 4 back quick 4 back", "quick 4 4",
++	  "toast=VFO:_FM mode=fm temporary=0", 3, false },
+ 	{ "S VFO mode: DMR to NXDN", "nxdn ok 4 up ok quick 4 back", "quick 4", "toast=VFO:_NXDN48 mode=nxdn temporary=0 vfo=1",
+@@ -960,3 +960,3 @@
+ 	{ "S VFO mode: NXDN48 to NXDN96", "nxdn ok 4 up ok quick 4 4 back", "quick 4", "toast=VFO:_NXDN96 mode=nxdn", 2, false },
+-	{ "S VFO mode: YSF Wide to Narrow", "ok 4 up ok quick 4 4 back", "quick 4", "toast=VFO:_YSF_N mode=ysf", 2, false },
++	{ "S VFO mode: single YSF entry", "ok 4 up ok quick 4 back", "quick 4", "toast=VFO:_YSF mode=ysf", 2, false },
+ #if CONFIG_AIR_AES	// the AES tile needs an air-framed mode (config/features.mk)
+@@ -970,3 +970,3 @@
+-	{ "S VFO mode: NXDN back to FM", "nxdn ok 4 up ok quick 4 back quick 4 back", "quick 4 4 4 4", "toast=VFO:_FM mode=fm",
+-	  5, false },
++	{ "S VFO mode: NXDN back to FM", "nxdn ok 4 up ok quick 4 back quick 4 back", "quick 4 4 4", "toast=VFO:_FM mode=fm",
++	  4, false },
+ 	{ "S VFO mode: P25 shows on the strip", "p25 ok 4 up ok quick 4 back quick 4 back", "", "mode=p25 screen=home shows=P25",
+diff --git a/docs/spec/ysf.md b/docs/spec/ysf.md
+--- a/docs/spec/ysf.md
++++ b/docs/spec/ysf.md
+@@ -191,9 +191,10 @@
+ ## 8. The channel kind
+ 
+-The VFO defaults to DN (V/D mode 2) at Narrow deviation. Its W/N selection
+-controls deviation independently of the data type. Quick's DT (data type) tile
+-cycles V/D-1, DN and VW (with full-rate voice in the build). This radio-wide
+-VFO setting is held in RAM, along with the other live YSF parameters. Stored
+-YSF channels use the data type and deviation from their own parameter block.
++The VFO defaults to DN (V/D mode 2). Quick's Mode tile offers one YSF entry;
++its DT tile cycles V/D-1, DN and VW (with full-rate voice in the build). DT
++selection also sets the deviation: V/D-1 and DN use Narrow (1350 Hz), VW
++uses Wide (2700 Hz). The channel raster remains 12.5 kHz. This radio-wide
++VFO setting is held in RAM; stored YSF channels keep their own parameter
++blocks. Legacy saved VFO deviation overrides are discarded on restore.
+ 
+ The radio glue is written: `RADIO_MODE_YSF`, `CODEPLUG_KIND_YSF` (kind 6),
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -320,3 +320,3 @@
+ In the VFO, **\***, **4** cycles the supported modes ([feature matrix](../feature-matrix.md)):
+-FM, DMR, P25, NXDN48, NXDN96, YSF Wide and YSF Narrow. Each VFO keeps its mode, NXDN rate and YSF deviation across a restart.
++FM, DMR, P25, NXDN48, NXDN96 and YSF (plus any other modes enabled in the build). Each VFO keeps its mode and NXDN rate across a restart.
+ 
+@@ -430,6 +430,6 @@
+-- Home shows **YSF** for both Wide and Narrow, including on the selected side in dual watch. The VFO's Quick menu
+-  shows **YSF W** or **YSF N**. Home also shows what PTT calls and the DG-ID and data type. During a call it shows who
+-  calls and where, or why the call isn't played. FM's tone and width tiles say "FM only: this is YSF".
+-- **Quick → 3 DT** cycles **V/D-1**, **DN** and **VW**. VW is offered when full-rate voice is built in.
+-  The selection stays in memory until the radio is switched off. **Quick → 4 Mode** selects the YSF W/N deviation.
++- Home and **Quick → 4 Mode** show a single **YSF** mode. Home also shows what PTT calls and the DG-ID and data type.
++  During a call it shows who calls and where, or why the call isn't played.
++- **Quick → 3 DT** cycles **V/D-1**, **DN** and **VW**. VW is offered when full-rate voice is built in.
++  V/D-1 and DN automatically use Narrow deviation; VW automatically uses Wide deviation. The channel remains 12.5 kHz.
++  The selection stays in RAM until the radio is switched off.
+ - Some radios only transmit YSF or only receive it ([feature matrix](../feature-matrix.md)). One that only receives
