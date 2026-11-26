@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Decode the current radio core's NXDN48 TX capture with MMDVMHost's NXDN decoder.
+// Decode captured NXDN frames with MMDVMHost's NXDN decoder.
 #include "NXDNDefines.h"
 #include "NXDNFACCH1.h"
 #include "NXDNLICH.h"
@@ -77,6 +77,6 @@ int main(int argc, char** argv)
 		released = frames != 0;
 	}
 	assert(voice_frames > 0 && released);
-	std::printf("MMDVMHost decoded current NXDN48 TX: VCALL 4567 -> 123, RAN %u, %u traffic frames, TX_REL\n",
+	std::printf("MMDVMHost decoded NXDN: VCALL 4567 -> 123, RAN %u, %u traffic frames, TX_REL\n",
 	            ran, voice_frames);
 }

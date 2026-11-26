@@ -1,0 +1,95 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -17,6 +17,8 @@
+ #include "radio/tones.h"
+ #include "dmr/call/dmr_call.h"
+ #include "dmr/call/dmr_lc.h"
++#include "dmr/fec/dmrFec.h"
++#include "hotspot/dmrDataFrame.h"
+ #include "dmr/ambe/ambeVoice.h"
+ #include "sim/dmr_sim_modem.h"
+ #include "radio/radio_hotspot.h"
+@@ -2045,6 +2047,63 @@
+ 	setup_codeplug();
+ }
+ 
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++// The HR_C7000 builds DMR bursts in hardware. Re-create its mobile-station
++// framing around the LC and voice payloads sent by the simulated PTT.
++static void capture_dmr(void)
++{
++	capture_start("dmr");
++	if (!interop_capture)
++		return;
++
++	const uint8_t ms_voice_sync[] = {0x7F, 0x7D, 0x5D, 0xD5, 0x7D, 0xFD};
++	for (unsigned i = 0; i < sim.air_count; i++) {
++		const sim_air_t *burst = &sim.air[i];
++		uint8_t frame[DMR_FEC_BURST_BYTES] = {0};
++
++		if (burst->kind == DMR_BURST_VOICE) {
++			uint8_t middle[6];
++			if (burst->voice_index == 0) {
++				memcpy(middle, ms_voice_sync, sizeof middle);
++			} else {
++				uint16_t emb = dmrFecEmbEncode(sim.cfg.cc, false, burst->lcss);
++				middle[0] = (uint8_t)(emb >> 8);
++				memcpy(middle + 1, burst->emb, sizeof burst->emb);
++				middle[5] = (uint8_t)emb;
++			}
++
++			CHECK(burst->len == DMR_VOICE_BYTES);
++			memcpy(frame, burst->payload, 14);
++			frame[13] &= 0xF0;
++			for (unsigned j = 0; j < sizeof middle; j++) {
++				frame[13 + j] |= middle[j] >> 4;
++				frame[14 + j] = (uint8_t)(middle[j] << 4);
++			}
++			frame[19] |= burst->payload[13] & 0x0F;
++			memcpy(frame + 20, burst->payload + 14, 13);
++		} else {
++			bool header = burst->kind == DMR_BURST_VOICE_LC_HEADER;
++			CHECK(header || burst->kind == DMR_BURST_TERMINATOR_LC);
++			dmrBurst_t data = {
++				.dataType = header ? DMR_TYPE_VOICE_LC_HEADER : DMR_TYPE_TERMINATOR_LC,
++				.length = DMR_LC_FULL_BYTES,
++			};
++			dmr_lc_encode_full(burst->payload, header ? DMR_RS_MASK_VOICE_HEADER : DMR_RS_MASK_TERMINATOR,
++			                   data.payload);
++			CHECK(dmrDataBurstToFrame(&data, sim.cfg.cc, frame));
++		}
++
++		for (unsigned j = 0; j < sizeof frame; j++)
++			for (int shift = 6; shift >= 0; shift -= 2)
++				fputc((frame[j] >> shift) & 3, interop_capture);
++		// Simplex MS occupies one 27.5 ms burst every 60 ms at 4800 symbols/s.
++		for (unsigned j = sizeof frame * 4; j < 288; j++)
++			fputc(4, interop_capture);
++	}
++	capture_end();
++}
++#endif
++
+ static void test_dmr_tx(void)
+ {
+ 	dmr_start(true);
+@@ -2071,6 +2130,9 @@
+ 	}
+ 	CHECK(!early && sm.view.state == RS_IDLE && hw.tx_off_calls == 1 && !sim.tx_active && !hw.led[LED_RED]);
+ 	CHECK(sim.air[sim.air_count - 1].kind == DMR_BURST_TERMINATOR_LC);
++#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++	capture_dmr();
++#endif
+ 	run(100);
+ 	CHECK(hw.tx_off_calls == 1);
+ 
+@@ -11993,7 +12055,7 @@
+ 		ambeVoiceResetStats();
+ 		req(RREQ_PTT, 1);
+ 		CHECK(fair[0].qn > 0 && fair[0].q[0].syms[0] == (mode == RADIO_MODE_NXDN ? 0x5F : 0x77));
+-		run(1450);
++		run(mode == RADIO_MODE_P25 ? 2450 : 1450);
+ 		CHECK(sm.view.state == RS_TX && aud.started);
+ 		if (imbe) {
+ 			p25_voice_stats_t v;

@@ -42,8 +42,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential bison flex texinfo zlib1g-dev \
-            libgmp-dev libmpfr-dev libmpc-dev clang python3 cmake \
-            libsndfile1-dev libncurses-dev libpulse-dev libcodec2-dev
+            libgmp-dev libmpfr-dev libmpc-dev clang python3 nlohmann-json3-dev
 
       # The C-SKY compiler and newlib are built once and kept between runs
       - name: Restore C-SKY toolchain
@@ -80,29 +79,17 @@ jobs:
             (cd "$T" && ./"$t")
           done
 
-      - name: Decode simulated digital voice with DSD-FME
+      - name: Decode digital TX with MMDVM
+        run: python3 tools/test_mmdvm_interop.py
+
+      - name: Check D-STAR GMSK receive acquisition
         run: |
           set -eu
-          sh tools/build_validators.sh
-          decoder=build/validators/dsd-fme/build/dsd-fme
-          python3 tools/test_air_interop.py --dsd-fme "$decoder"
-          python3 tools/test_ysf_dsd.py --dsd-fme "$decoder"
           cc -std=c11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -Wl,--gc-sections \
             -Isrc/dstar -Ibuild/current/core -Ibuild/current/hal \
             src/dstar/dv_frame.c src/dstar/dv_stream.c src/dstar/dv_engine.c \
             build/current/core/air/air_softmodem.c tests/test_dstar_gmsk.c -o "$RUNNER_TEMP/dstar-gmsk"
           "$RUNNER_TEMP/dstar-gmsk"
-
-      - name: Decode current NXDN48 TX with MMDVMHost
-        run: |
-          set -eu
-          capture="$RUNNER_TEMP/nxdn48-capture"
-          modem="$GITHUB_WORKSPACE/research/protocol/MMDVMHost"
-          mkdir -p "$capture"
-          (cd build/current/tests/host && ./radioCoreTestAirInterop "$capture")
-          c++ -std=c++17 -O2 -I"$modem" "$modem"/{NXDNLICH,NXDNSACCH,NXDNFACCH1,NXDNConvolution,NXDNCRC}.cpp \
-            tests/nxdn/stubs/utils_count.cc tests/nxdn/test_nxdn_current_mmdvm.cc -o "$capture/nxdn-mmdvm"
-          "$capture/nxdn-mmdvm" "$capture/nxdn48.bin"
 
       - name: Check channel modes, privacy and boot images in the CPS
         run: |
