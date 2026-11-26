@@ -20,8 +20,8 @@ index fa5ea7a..a8ebd74 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "Fixed"
-+msgstr "Fijo"
++msgid "6.25k DV"
++msgstr "6.25k DV"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -48,8 +48,8 @@ index 1096ffb..b456bc1 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "Fixed"
-+msgstr "Fixe"
++msgid "6.25k DV"
++msgstr "6.25k DV"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -76,8 +76,8 @@ index e3a33b8..fc785ff 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "Fixed"
-+msgstr "Fissa"
++msgid "6.25k DV"
++msgstr "6.25k DV"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -104,8 +104,8 @@ index 88ff47c..a84f3ec 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "Fixed"
-+msgstr "固定"
++msgid "6.25k DV"
++msgstr "6.25k DV"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -137,18 +137,36 @@ index 3cbc722..f57958e 100644
  	case QT_BANDWIDTH:
 +#if CONFIG_DSTAR
 +		if (v->ch.mode == RADIO_MODE_DSTAR) {
-+			sb_str(&b, TR(QUICK_VALUE_FIXED_WIDTH, "Fixed"));
++			sb_str(&b, TR(QUICK_VALUE_FIXED_WIDTH, "6.25k DV"));
 +			return false;
 +		}
 +#endif
  		if (v->temp & RADIO_TEMP_BW)
  			sb_str(&b, GLYPH_DOT);
  		sb_str(&b, v->ch.bw == RADIO_BW_25K ? "25k" : "12.5k");
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -152,6 +152,7 @@ static void step_update(radio_sm_t *sm)
+ {
+ 	uint32_t hz = sm->vfo_step_set;
+ 	if (hz == 0)
+-		hz = sm->view.ch.bw == RADIO_BW_25K || sm->view.am ? 25000u : RADIO_VFO_STEP_HZ;
++		hz = sm->view.ch.mode == RADIO_MODE_DSTAR ? 6250u :
++		     sm->view.ch.bw == RADIO_BW_25K || sm->view.am ? 25000u : RADIO_VFO_STEP_HZ;
+ #if CONFIG_BCAST_FM
+ 	if (sm->view.bcast)
 diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
 index 188452d..a61d13e 100644
 --- a/tests/host/sim/ui_sim.c
 +++ b/tests/host/sim/ui_sim.c
-@@ -2984,6 +2984,7 @@ static bool check(const char *kv, char *err, size_t len)
+@@ -1234,3 +1234,4 @@ static void changed(void)
+ 	view.vfo_step_hz = sim_step == 833 ? 8333u : sim_step > 0 ? (uint32_t)sim_step * 10u :
+-			   view.ch.bw == RADIO_BW_25K ? 25000u : 12500u;
++			   view.ch.mode == RADIO_MODE_DSTAR ? 6250u :
++			   view.ch.bw == RADIO_BW_25K ? 25000u : 12500u;
+ 	view.vfo_step_auto = sim_step == 0;
+@@ -2984,6 +2985,7 @@ static bool check(const char *kv, char *err, size_t len)
  	else if (strcmp(key, "mode") == 0) snprintf(got, sizeof got, "%s", view.ch.mode == RADIO_MODE_DMR ? "dmr" :
  								     view.ch.mode == RADIO_MODE_P25 ? "p25" :
  								     view.ch.mode == RADIO_MODE_NXDN ? "nxdn" :
@@ -156,7 +174,7 @@ index 188452d..a61d13e 100644
  								     view.ch.mode == RADIO_MODE_YSF ? "ysf" : "fm");
  	else if (strcmp(key, "vfoaes") == 0) snprintf(got, sizeof got, "%ld", (long)ui_vfo_aes_id(&view));
  	else if (strcmp(key, "tx") == 0) snprintf(got, sizeof got, "%u", (unsigned)sim_rec.tx_count);
-@@ -3513,9 +3514,10 @@ static bool run_token(char *t, char *err, size_t len)
+@@ -3513,9 +3515,10 @@ static bool run_token(char *t, char *err, size_t len)
  		advance(100);
  		return true;
  	}
@@ -177,9 +195,9 @@ index e0badb1..964e4be 100644
  	  "ok", "toast=Air_band:_receive_only shows=AM hides=FM hides=Color_code hides=RX_CTCSS", 1, false },
  #if CONFIG_DSTAR
 +	{ "D-STAR stored channel shows fixed width in Quick", "dstar dlmode:dstar",
-+	  "quick 8 expect:toast=D-STAR_bandwidth_is_fixed wait:4000", "mode=dstar vfo=0 screen=quick shows=Fixed hides=12.5k", 2, false },
++	  "quick 8 expect:toast=D-STAR_bandwidth_is_fixed wait:4000", "mode=dstar vfo=0 screen=quick shows=6.25k hides=12.5k", 2, false },
 +	{ "D-STAR VFO shows fixed width in Quick", "dstar vfokey dlmode:dstar",
-+	  "quick 8 expect:toast=D-STAR_bandwidth_is_fixed wait:4000", "mode=dstar vfo=1 screen=quick shows=Fixed hides=12.5k", 2, false },
++	  "quick 8 expect:toast=D-STAR_bandwidth_is_fixed wait:4000", "mode=dstar vfo=1 screen=quick shows=6.25k hides=12.5k", 2, false },
  	{ "D-STAR is selectable in a stored channel", "dstar ok 5 ok down down", "ok",
  	  "focus=Mode shows=D-STAR hides=Color_code hides=RX_CTCSS", 1, false },
  	{ "D-STAR can save a stored channel", "dstar ok 5 ok down down ok", "long:ok",

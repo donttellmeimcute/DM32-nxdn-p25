@@ -11,6 +11,14 @@ frequency and hold OK to save. The web Codeplug Editor shows D-STAR when
 the radio reports the feature. The channel tag stores the mode and the
 receive-only setting alongside the channel's standard frequencies.
 
+D-STAR DV uses a nominal 6.25 kHz channel raster. The VFO's Auto step is
+6.25 kHz in D-STAR; explicit step settings remain available. Quick displays
+`6.25k DV` as a fixed nominal channel designation, not an RF filter setting.
+The DM-32UV's supported narrow FM digital RF path uses the 12.5 kHz filter
+profile. Do not substitute an unverified FD6818 register value or change
+deviation to imitate a narrower receive filter. Occupied bandwidth and actual
+filter response still require measurements on hardware.
+
 The incoming source appears on the home screen after a valid header. The VFO
 and channels with both repeater fields blank use direct routing. With URCALL
 blank, the radio sends `CQCQCQ`.

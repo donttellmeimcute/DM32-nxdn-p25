@@ -12,6 +12,7 @@ const air_mode_t dstar_air_mode = {
 	.name = "D-STAR",
 	.profile = {
 		.sym_rate = 4800, .levels = 2, .shape = AIR_SHAPE_GAUSS, .shape_param = 50,
+		// 6.25 kHz DV channel raster; bw is the supported board RF filter, not the raster.
 		.dev_outer_hz = 1200, .timing = AIR_TIMING_CONTINUOUS, .bw = RADIO_BW_12K5,
 		.sync_every_syms = DSTAR_FRAME_BITS * DSTAR_SUPERFRAME_FRAMES,
 		.idle = DSTAR_IDLE_DIBITS, .nsyncs = 4,

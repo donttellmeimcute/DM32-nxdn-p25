@@ -43,10 +43,14 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  }
  
  static void dstar_far_end(void *ctx) { (void)ctx; dstar_far.ends++; }
-@@ -12282,6 +12298,33 @@
+@@ -12282,6 +12298,37 @@
  	      !memcmp(dstar_far.header.ur, route, 8) && !memcmp(dstar_far.header.rpt1, route + 8, 8) &&
  	      !memcmp(dstar_far.header.rpt2, route + 16, 8));
  
++	// The nominal DV raster is independent of the board's supported RF filter.
++	CHECK(sm.view.vfo_step_auto && sm.view.vfo_step_hz == 6250u);
++	CHECK(dstar_air_mode.profile.bw == RADIO_BW_12K5 && dstar_air_mode.profile.dev_outer_hz == 1200u);
++
 +	// Positive gain must preserve the shape of a loud PCM block rather than clipping samples.
 +	const int16_t gain_test_quiet[] = { -1000, 1000 };
 +	const int16_t gain_test_loud[] = { -20000, 20000 };
