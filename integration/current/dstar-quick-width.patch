@@ -20,8 +20,8 @@ index fa5ea7a..a8ebd74 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "6.25k DV"
-+msgstr "6.25k DV"
++msgid "6.25k"
++msgstr "6.25k"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -48,8 +48,8 @@ index 1096ffb..b456bc1 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "6.25k DV"
-+msgstr "6.25k DV"
++msgid "6.25k"
++msgstr "6.25k"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -76,8 +76,8 @@ index e3a33b8..fc785ff 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "6.25k DV"
-+msgstr "6.25k DV"
++msgid "6.25k"
++msgstr "6.25k"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -104,8 +104,8 @@ index 88ff47c..a84f3ec 100644
  
 +#: core/ui/ui_screens.c
 +msgctxt "QUICK_VALUE_FIXED_WIDTH"
-+msgid "6.25k DV"
-+msgstr "6.25k DV"
++msgid "6.25k"
++msgstr "6.25k"
 +
  #: core/ui/ui_screens.c
  msgctxt "QUICK_VALUE_ALL"
@@ -137,7 +137,7 @@ index 3cbc722..f57958e 100644
  	case QT_BANDWIDTH:
 +#if CONFIG_DSTAR
 +		if (v->ch.mode == RADIO_MODE_DSTAR) {
-+			sb_str(&b, TR(QUICK_VALUE_FIXED_WIDTH, "6.25k DV"));
++			sb_str(&b, TR(QUICK_VALUE_FIXED_WIDTH, "6.25k"));
 +			return false;
 +		}
 +#endif

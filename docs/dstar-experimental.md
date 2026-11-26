@@ -13,7 +13,7 @@ receive-only setting alongside the channel's standard frequencies.
 
 D-STAR DV uses a nominal 6.25 kHz channel raster. The VFO's Auto step is
 6.25 kHz in D-STAR; explicit step settings remain available. Quick displays
-`6.25k DV` as a fixed nominal channel designation, not an RF filter setting.
+`6.25k` as a fixed nominal channel designation, not an RF filter setting.
 The DM-32UV's supported narrow FM digital RF path uses the 12.5 kHz filter
 profile. Do not substitute an unverified FD6818 register value or change
 deviation to imitate a narrower receive filter. Occupied bandwidth and actual
