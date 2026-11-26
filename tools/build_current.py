@@ -209,6 +209,7 @@ def prepare(tree, dstar=False):
 		run('git', 'apply', '--binary', PATCH_DIR / 'dstar-quick-width.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'dm32-bench-tx-1p25m.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-am-rx.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'ysf-auto-vfo-deviation.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
