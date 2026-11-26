@@ -1,0 +1,116 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -312,9 +312,27 @@
+ } fake_air_t;
+ static fake_air_t fair[2];
+ static uint32_t air_clock_step;		// microseconds board.air's clock moves at each read (a slow codec, test_m17)
+-#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++#if (CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF) || CONFIG_M17 || CONFIG_DSTAR
+ static const char *interop_dir;
+ static FILE *interop_capture;
++
++static void capture_start(const char *name)
++{
++	if (!interop_dir)
++		return;
++	char path[512];
++	snprintf(path, sizeof path, "%s/%s.bin", interop_dir, name);
++	interop_capture = fopen(path, "wb");
++	CHECK(interop_capture != NULL);
++}
++
++static void capture_end(void)
++{
++	if (interop_capture) {
++		CHECK(fclose(interop_capture) == 0);
++		interop_capture = NULL;
++	}
++}
+ #endif
+ static bool air_nofit;			// board.air can't carry P25
+ static uint32_t air_rng = 0x1234567;
+@@ -431,7 +449,7 @@
+ 		return;
+ 	}
+ 	air_tx_chunk_t c = p->q[0];
+-#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++#if (CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF) || CONFIG_M17 || CONFIG_DSTAR
+ 	if (i == 0 && interop_capture)
+ 		for (uint16_t n = 0; n < c.nsyms; n++)
+ 			fputc(air_sym_get(c.syms, n), interop_capture);
+@@ -11933,7 +11951,8 @@
+ {
+ 	static const struct { uint8_t mode, profile; const char *capture; } cases[] = {
+ 		{ RADIO_MODE_P25, 0, "p25" }, { RADIO_MODE_NXDN, 0, "nxdn48" }, { RADIO_MODE_NXDN, 1, "nxdn96" },
+-		{ RADIO_MODE_YSF, YSF_DT_VD_MODE2, "dn" }, { RADIO_MODE_YSF, YSF_DT_VOICE_FR, "vw" },
++		{ RADIO_MODE_YSF, YSF_DT_VD_MODE1, "vd1" }, { RADIO_MODE_YSF, YSF_DT_VD_MODE2, "dn" },
++		{ RADIO_MODE_YSF, YSF_DT_VOICE_FR, "vw" },
+ 	};
+ 	static const uint8_t nxdn_unit[] = { 0xD7, 0x11 };	// 4567, the CPS unit ID
+ 
+@@ -11959,23 +11978,16 @@
+ 			p.unit_id = 4567;
+ 			p.tx_dst = 123;
+ 			radio_req_p25_settings(&p);
+-		} else {
+-			radio_ysf_settings_t y;
+-			radio_ysf_settings(&y);
+-			y.dt = cases[i].profile;
+-			radio_req_ysf_settings(&y);
+ 		}
+ 		req(RREQ_MODE, mode);
+ 		if (mode == RADIO_MODE_YSF) {
+ 			radio_ysf_settings_t y;
++			CHECK(ui_svc_ysf_dt(cases[i].profile));
++			run(50);
+-			CHECK(radio_ysf_in_force(&y) && !strcmp(y.src, "XE1ABC"));
++			CHECK(radio_ysf_in_force(&y) && !strcmp(y.src, "XE1ABC") &&
++			      y.dt == cases[i].profile && y.narrow == (y.dt != YSF_DT_VOICE_FR));
+ 		}
+-		if (interop_dir) {
+-			char path[512];
+-			snprintf(path, sizeof path, "%s/%s.bin", interop_dir, cases[i].capture);
+-			interop_capture = fopen(path, "wb");
+-			CHECK(interop_capture != NULL);
+-		}
++		capture_start(cases[i].capture);
+ 		aud.feed = aud.feed_signal = air_clock_handoff = true;
+ 		p25VoiceResetStats();
+ 		ambeVoiceResetStats();
+@@ -11995,10 +12007,7 @@
+ 		req(RREQ_PTT, 0);
+ 		run(750);
+ 		CHECK(!hw.keyed && fair[0].underruns == 0);
+-		if (interop_capture) {
+-			fclose(interop_capture);
+-			interop_capture = NULL;
+-		}
++		capture_end();
+ 		air_audio_start_fail = true;
+ 		req(RREQ_PTT, 1);
+ 		run(100);
+@@ -12064,11 +12073,13 @@
+ 	sm.set.talk_permit = false;
+ 	aud.feed = true;
+ 	aud.feed_signal = true;
++	capture_start("m17");
+ 	req(RREQ_PTT, 1);
+-	run(800);
++	run(1200);
+ 	CHECK(sm.view.state == RS_TX && hw.keyed && aud.started);
+ 	req(RREQ_PTT, 0);
+ 	run(600);
++	capture_end();
+ 	CHECK(!hw.keyed && sm.view.state != RS_TX);
+ 	m17VoiceGetStats(&vs);
+ 	CHECK(vs.tx_encoded >= 20 && vs.tx_frames >= 8 && vs.alloc_fails == 0);
+@@ -12268,7 +12279,7 @@
+ 
+ int main(int argc, char **argv)
+ {
+-#if CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
++#if (CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF) || CONFIG_M17 || CONFIG_DSTAR
+ 	if (argc == 2)
+ 		interop_dir = argv[1];
+ #else

@@ -42,7 +42,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential bison flex texinfo zlib1g-dev \
-            libgmp-dev libmpfr-dev libmpc-dev clang python3
+            libgmp-dev libmpfr-dev libmpc-dev clang python3 cmake \
+            libsndfile1-dev libncurses-dev libpulse-dev libcodec2-dev
 
       # The C-SKY compiler and newlib are built once and kept between runs
       - name: Restore C-SKY toolchain
@@ -70,6 +71,7 @@ jobs:
           set -eu
           T=build/current/tests/host
           tests="radioFeaturesTest radioCoreTestNxdn radioListenBandsTest aprsRadioTest rda5807mTest voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest hrc7000AirTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
+            dmrFecTest dmrRxChainTest
             nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest radioCoreTestYsf
             radioCoreTestP25Nxdn radioCoreTestAirInterop fd6818Test m17Test m17VoiceTest radioCoreTestM17 radioCoreTestDstar
             mmdvmTest codeplugEditTest codeplugEditTestDstar codeplugTagTest settingsTest uiFlowTest uiFlowTestReplay uiFlowTestDstar"
@@ -78,16 +80,26 @@ jobs:
             (cd "$T" && ./"$t")
           done
 
+      - name: Decode simulated digital voice with DSD-FME
+        run: |
+          set -eu
+          sh tools/build_validators.sh
+          decoder=build/validators/dsd-fme/build/dsd-fme
+          python3 tools/test_air_interop.py --dsd-fme "$decoder"
+          python3 tools/test_ysf_dsd.py --dsd-fme "$decoder"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections -Wl,--gc-sections \
+            -Isrc/dstar -Ibuild/current/core -Ibuild/current/hal \
+            src/dstar/dv_frame.c src/dstar/dv_stream.c src/dstar/dv_engine.c \
+            build/current/core/air/air_softmodem.c tests/test_dstar_gmsk.c -o "$RUNNER_TEMP/dstar-gmsk"
+          "$RUNNER_TEMP/dstar-gmsk"
+
       - name: Decode current NXDN48 TX with MMDVMHost
         run: |
           set -eu
           capture="$RUNNER_TEMP/nxdn48-capture"
-          modem="$RUNNER_TEMP/mmdvmhost"
+          modem="$GITHUB_WORKSPACE/research/protocol/MMDVMHost"
           mkdir -p "$capture"
           (cd build/current/tests/host && ./radioCoreTestAirInterop "$capture")
-          git init -q "$modem"
-          git -C "$modem" fetch -q --depth=1 https://github.com/g4klx/MMDVMHost.git 6ffa6d354a2c185316201c27c831c766a25a5653
-          git -C "$modem" checkout -q --detach FETCH_HEAD
           c++ -std=c++17 -O2 -I"$modem" "$modem"/{NXDNLICH,NXDNSACCH,NXDNFACCH1,NXDNConvolution,NXDNCRC}.cpp \
             tests/nxdn/stubs/utils_count.cc tests/nxdn/test_nxdn_current_mmdvm.cc -o "$capture/nxdn-mmdvm"
           "$capture/nxdn-mmdvm" "$capture/nxdn48.bin"
@@ -131,13 +143,15 @@ jobs:
               manifest = json.load(f)
           enabled = set(manifest["features"].split(","))
           disabled = set(manifest["off"].split(","))
-          if not {"M17", "MDC1200"} <= enabled or {"M17", "MDC1200"} & disabled:
-              raise SystemExit("release manifest does not match the M17/MDC1200 build configuration")
+          required = {"DMR", "P25", "NXDN", "YSF", "IMBE", "M17", "DSTAR", "MDC1200"}
+          missing = (required - enabled) | (required & disabled)
+          if missing:
+              raise SystemExit(f"full release manifest missing features: {', '.join(sorted(missing))}")
           if "AIR_RAW" in enabled or "AIR_RAW" not in disabled:
               raise SystemExit("release manifest unexpectedly enables AIR_RAW")
           if "BCAST_FM" not in enabled or "BCAST_FM" in disabled:
               raise SystemExit("release manifest is missing broadcast FM")
-          print("Manifest features verified: M17=y MDC1200=y AIR_RAW=n BCAST_FM=y")
+          print("Full release manifest includes all tested digital voice modes")
           PY
           for PRESET in multimode dmr-fm; do
             (

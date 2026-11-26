@@ -1,0 +1,19 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12186,6 +12186,7 @@
+ 	aud.feed = aud.feed_signal = true;
+ 
+ 	// A full-speed codec can have a costly frame or lose time to an interrupt without unkeying.
++	capture_start("dstar");
+ 	air_clock_step = 18000;
+ 	req(RREQ_PTT, 1);
+ 	run(600);
+@@ -12197,6 +12198,7 @@
+ 	air_clock_step = 0;
+ 	req(RREQ_PTT, 0);
+ 	run(500);
++	capture_end();
+ 	CHECK(dstar_far.headers == 1 && dstar_far.ends == 1 && dstar_far.voice > 90 && dstar_far.speech > 90 && !hw.keyed);
+ 	CHECK(dstar_far.header.flags[0] == 0 && !memcmp(dstar_far.header.rpt1, "DIRECT  ", 8) &&
+ 	      !memcmp(dstar_far.header.rpt2, "DIRECT  ", 8) && !memcmp(dstar_far.header.ur, "CQCQCQ  ", 8));

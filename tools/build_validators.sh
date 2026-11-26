@@ -24,10 +24,12 @@ prefix="$root/build/validators/prefix"
 rm -rf build/validators/mbelib build/validators/dsd-fme
 cp -r research/codec/mbelib build/validators/mbelib
 cp -r research/protocol/dsd-fme build/validators/dsd-fme
+# The pinned decoder otherwise routes YSF V/D-1 through NXDN and mutes the WAV.
+git -C build/validators/dsd-fme apply "$root/tools/patches/dsd-fme-ysf-vd1-audio.patch"
 (cd build/validators/mbelib && mkdir -p build && cd build &&
     cmake .. -DCMAKE_INSTALL_PREFIX="$prefix" > "$root/logs/validators-mbelib.log" 2>&1 &&
     make -j"${JOBS:-4}" >> "$root/logs/validators-mbelib.log" 2>&1 && make install >> "$root/logs/validators-mbelib.log" 2>&1)
-# dsd-fme needs libsndfile, ncurses and pulseaudio headers (Ubuntu: libsndfile1-dev libncurses-dev libpulse-dev)
+# The M17 playback test also needs libcodec2-dev.
 (cd build/validators/dsd-fme && mkdir -p build && cd build &&
     cmake .. -DCMAKE_PREFIX_PATH="$prefix" -DCMAKE_BUILD_TYPE=Release > "$root/logs/validators-dsd-fme.log" 2>&1 &&
     make -j"${JOBS:-4}" >> "$root/logs/validators-dsd-fme.log" 2>&1)
