@@ -6,6 +6,8 @@
 #include "board.h"
 #include "codeplug/codeplug.h"
 #include "radio/radio.h"
+#include "radio/mic_gain.h"
+#include "dsp/fxp.h"
 #include "radio/digital_rx_trim.h"
 #include "radio_dstar.h"
 #include "dstar_codeplug.h"
@@ -119,6 +121,21 @@ typedef struct {
 	dstar_radio_t *radio;
 } audio_block_t;
 
+static void encode_mic(dstar_ambe_t *codec, const int16_t *mic, int16_t *spk, uint8_t *raw)
+{
+	static const uint16_t q8[MIC_GAIN_STEPS + 1] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 643, 810 };
+	uint8_t step = radio_mic_gain();
+	if (step == MIC_GAIN_UNITY || mic_gain_on_board()) {
+		dstar_ambe_encode(codec, mic, raw);
+		return;
+	}
+	// The speaker is silent on TX. Borrow its block so gain costs no extra codec-window RAM.
+	for (unsigned i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
+		spk[i] = fxp_sat16(((int32_t)mic[i] * q8[step]) / 256);
+	dstar_ambe_encode(codec, spk, raw);
+	memset(spk, 0, AUDIO_BLOCK_SAMPLES * sizeof(*spk));
+}
+
 static void codec_block(void *arg)
 {
 	audio_block_t *b = arg;
@@ -143,7 +160,7 @@ static void codec_block(void *arg)
 	if (sending) {
 		if (!b->mic)
 			return;
-		dstar_ambe_encode(&r->codec, b->mic, raw);
+		encode_mic(&r->codec, b->mic, b->spk, raw);
 		dstar_ambe_wire_encode(raw, frame);
 		put(&r->tx, gen, frame);
 	} else {

@@ -1,0 +1,143 @@
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index 0b4ce4d..aaba734 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -3705,5 +3705,5 @@ static const char *ced_problem(void)
+-	// The contact is whom PTT calls, so a channel that never transmits needs none
+-	// (P25 and NXDN: none is talk group 1)
+-	if (CONFIG_DMR && c->mode == RADIO_MODE_DMR && !c->rx_only && c->contact == 0 && !ced_is_p25(c) && !ced_is_nxdn(c))
++	// Other digital modes can use a DMR stand-in record. Only a transmitting DMR channel requires a contact.
++	if (CONFIG_DMR && c->mode == RADIO_MODE_DMR && !c->rx_only && c->contact == 0 &&
++	    (c->kind == CODEPLUG_KIND_NONE || c->kind == CODEPLUG_KIND_DMR_TRUNK))
+ 		return TR(CHAN_WHY_PICK_TX_CONTACT, "Pick a TX contact first");
+ 	return NULL;
+diff --git a/docs/spec/ui.md b/docs/spec/ui.md
+index 8229461..002d0a5 100644
+--- a/docs/spec/ui.md
++++ b/docs/spec/ui.md
+@@ -201,5 +201,6 @@ instead of OK pressed once per step. The rows shown follow the copy's mode, so a
+ - Save checks the copy first and names the first problem in a toast: an empty name, RX out of every band, TX out of
+   the transmit bands on a channel that isn't RX only, a DMR channel whose RX takes no DMR ("Receive only band: set
+-  FM"), a DMR channel without a TX contact unless it is RX only (the contact is whom PTT calls).
++  FM"), a transmitting DMR channel without a TX contact. Other digital modes use their own destination or a default
++  and save without a TX contact.
+ - DMR goes wherever FM goes: any band of the table, receive-only ones included, but never a listen band (the air band
+   on a radio with AM receive, the broadcast receiver's range). `radio_listen_band()` (`core/radio/radio_bands.h`) is
+diff --git a/docs/user/07-channels-zones-vfo.md b/docs/user/07-channels-zones-vfo.md
+index 30a1c16..5daf58f 100644
+--- a/docs/user/07-channels-zones-vfo.md
++++ b/docs/user/07-channels-zones-vfo.md
+@@ -156,7 +156,7 @@ channel you are on: the radio reloads it from the codeplug.
+ 
+ The radio won't save a channel without a name, with RX outside its bands, with TX where it can't transmit (set RX only
+-instead), a DMR channel in the broadcast band or in the air band (on a radio that receives AM there), or a DMR channel
+-without a TX contact, unless it is RX only. It says which. A DMR channel where the radio receives but can't transmit
+-saves when it is RX only.
++instead), a DMR channel in the broadcast band or in the air band (on a radio that receives AM there), or a transmitting
++DMR channel without a TX contact. It says which. An RX-only DMR channel saves without a contact. Other digital modes
++also save without a TX contact, including System Fusion (YSF), D-STAR, and M17.
+ 
+ **Save as new channel** stores the edited copy at the lowest free number and leaves the original as it was.
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index dad46dd..f61135c 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -788,4 +788,5 @@ UIFLAGS := -std=gnu99 -Wall -Wextra -Wno-unused-parameter -Wshadow -g $(COVFLAGS
+            '-DGFX_FB_BYTES=(320u*320u*2u)' -DGFX_MAX_ROWS=320 -DCONFIG_FONT_XL=1 -DFONT_BOTH -DGFX_INDEXED=1 -DGFX_FIT_TRACE
+ UIDEPS  := $(UIAPP) $(ABOUT_H) $(LANG_H) $(wildcard $(CORE)/ui/*.h $(CORE)/ui/fonts/*.inc sim/ui_sim.h)
++uiFlowTest: UIFLAGS += -DCONFIG_M17=1
+ TESTS   += uiFlowTest uiFlowTestNoColor uiFlowTestNxdnScrambler uiSim
+ 
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 46e71f1..6a67971 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -33,5 +33,5 @@
+ //   ysfrx:<call> / ysfrxend   start / end a YSF reception with a decoded source call sign
+ //   ysfdt:<dt>         configure the TX data type of the simulated YSF view
+-//   chkind:<n>,p25|nxdn stored channel n is a P25 or NXDN channel (CONFIG_P25 / CONFIG_NXDN builds)
++//   chkind:<n>,p25|nxdn|ysf|dstar|m17 sets the kind of stored channel n (as enabled in the build)
+ //   p25t:<state>[,<tg>] the channel on view is a trunked P25 one (CONFIG_P25_TRUNK builds), its follower in state
+ //                       1 finding the system, 2 on the control channel, 3 following talk group tg
+@@ -1105,4 +1105,20 @@ bool ysf_conv_load(uint16_t number, const channel_t *ch, ysf_conv_cfg_t *out)
+ #endif
+ 
++#if CONFIG_M17
++bool radio_m17_fits(void) { return view.ch.mode == RADIO_MODE_M17; }
++void radio_m17_settings(radio_m17_settings_t *s)
++{
++	*s = (radio_m17_settings_t){ .can = view.m17.tx_can, .dest = M17_DEST_ALL };
++}
++bool m17_conv_load(uint16_t number, const channel_t *ch, m17_conv_t *out)
++{
++	(void)number;
++	if (ch->kind != CODEPLUG_KIND_M17)
++		return false;
++	*out = (m17_conv_t){ .dest = M17_DEST_ALL };
++	return true;
++}
++#endif
++
+ static void load_channel(void);
+ static ui_dual_ref_t sim_dual[2];
+@@ -1834,5 +1850,9 @@ static bool vol_held;		// ui_svc_volume_hold: the radio ignores the volume knob
+ uint32_t ui_svc_features(void)
+ {
+-	return 0xFFFFFFFFu & ~(soft_volume ? 0 : UI_FEAT_VOLUME) & ~(radio_bcast_capable() ? 0 : UI_FEAT_BCAST) &
++	return 0xFFFFFFFFu &
++#if CONFIG_M17
++	       ~(radio_m17_fits() ? 0 : UI_FEAT_M17) &
++#endif
++	       ~(soft_volume ? 0 : UI_FEAT_VOLUME) & ~(radio_bcast_capable() ? 0 : UI_FEAT_BCAST) &
+ 	       ~(ref_trim ? 0 : UI_FEAT_REF_TRIM) &
+ 	       ~(knob_radio ? 0 : UI_FEAT_VOLUME_KNOB) & ~(p25_radio ? 0 : UI_FEAT_P25) &
+@@ -3522,6 +3542,6 @@ static bool run_token(char *t, char *err, size_t len)
+ 	}
+ #endif
+-#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
+-	if (strcmp(t, "chkind") == 0) {		// stored channel n is a P25, NXDN or YSF channel: its tag, over a stand-in record
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF || CONFIG_M17 || CONFIG_DSTAR
++	if (strcmp(t, "chkind") == 0) {		// the kind of a stored channel, over a DMR stand-in record
+ 		unsigned n = 0;
+ 		char k[8] = "";
+@@ -3534,7 +3554,19 @@ static bool run_token(char *t, char *err, size_t len)
+ #if CONFIG_YSF
+ 			strcmp(k, "ysf") == 0 ? CODEPLUG_KIND_YSF :
++#endif
++#if CONFIG_M17
++			strcmp(k, "m17") == 0 ? CODEPLUG_KIND_M17 :
++#endif
++#if CONFIG_DSTAR
++			strcmp(k, "dstar") == 0 ? CODEPLUG_KIND_DSTAR :
+ #endif
+ 			CODEPLUG_KIND_P25;
+ 		c.mode = RADIO_MODE_DMR;
++		if (c.kind == CODEPLUG_KIND_YSF || c.kind == CODEPLUG_KIND_M17)
++			c.contact = 0;
++#if CONFIG_DSTAR
++		if (c.kind == CODEPLUG_KIND_DSTAR)
++			c.contact = 0;
++#endif
+ 		if (sim_write((uint16_t)n, &c) < 0) {
+ 			snprintf(err, len, "no room for %s", t);
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 75419c4..10db500 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -701,4 +701,16 @@ static const flow_t flows[] = {
+ 	{ "E BACK takes a tone digit back", "ok 5 up up ok down down down down down down down down", "ok 8 8 5 back ok", "shows=88.0", 6, false },
+ 	{ "E the knob steps on from a typed tone", "ok 5 up up ok down down down down down down down down", "ok 8 8 5 up ok", "shows=91.5", 6, false },
++#endif
++#if CONFIG_YSF
++	{ "E stored YSF saves without a TX contact", "chkind:3,ysf ok 5 ok", "ok long:7 ok long:ok",
++	  "toast=Saved_channel_3 writes=1 shows=YSF", 4, true },
++#endif
++#if CONFIG_DSTAR
++	{ "E stored D-STAR saves without a TX contact", "dstar chkind:3,dstar ok 5 ok", "ok long:7 ok long:ok",
++	  "toast=Saved_channel_3 writes=1 shows=D-STAR", 4, true },
++#endif
++#if CONFIG_M17
++	{ "E stored M17 saves without a TX contact", "chkind:3,m17 ok 5 ok", "ok long:7 ok long:ok",
++	  "toast=Saved_channel_3 writes=1 shows=M17", 4, true },
+ #endif
+ 	{ "E DMR needs a TX contact to save", "ok 5 ok down down down down down down down down down", "ok up ok long:ok",

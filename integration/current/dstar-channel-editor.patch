@@ -201,7 +201,7 @@ diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
  // The first problem that keeps the copy from being saved, as a toast; NULL when it can be saved
  static const char *ced_problem(void)
  {
-@@ -3719,9 +3759,17 @@
+@@ -3719,9 +3759,16 @@
  		return TR(CHAN_WHY_TX_NOT_ALLOWED, "TX can't transmit there: set RX only");
  	if (CONFIG_DMR && c->mode == RADIO_MODE_DMR && radio_listen_band(c->rx_hz))
  		return TR(CHAN_WHY_RX_ONLY_BAND_SET_FM, "Receive only band: set FM");
@@ -214,9 +214,7 @@ diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
 +#endif
  	// The contact is whom PTT calls, so a channel that never transmits needs none
  	// (P25 and NXDN: none is talk group 1)
--	if (CONFIG_DMR && c->mode == RADIO_MODE_DMR && !c->rx_only && c->contact == 0 && !ced_is_p25(c) && !ced_is_nxdn(c))
-+	if (CONFIG_DMR && c->mode == RADIO_MODE_DMR && !c->rx_only && c->contact == 0 && !ced_is_p25(c) && !ced_is_nxdn(c) &&
-+	    !ced_is_dstar(c))
+ 	if (CONFIG_DMR && c->mode == RADIO_MODE_DMR && !c->rx_only && c->contact == 0 && !ced_is_p25(c) && !ced_is_nxdn(c))
  		return TR(CHAN_WHY_PICK_TX_CONTACT, "Pick a TX contact first");
  	return NULL;
  }

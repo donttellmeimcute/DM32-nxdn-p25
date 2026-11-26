@@ -1,0 +1,93 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12203,11 +12203,16 @@
+ 
+ #if CONFIG_DSTAR
+ #include "dstar/dv_engine.h"
++#include "dstar/ambe_wire.h"
++#include "radio/mic_gain.h"
+ #include "hostlink/build_info.h"
+ 
+ static struct {
+ 	dstar_header_t header;
+ 	unsigned headers, voice, speech, ends;
++	dstar_ambe_t decoder;
++	unsigned frames;
++	uint64_t energy;
+ } dstar_far;
+ 
+ static void dstar_far_start(const dstar_header_t *header, void *ctx)
+@@ -12216,6 +12221,9 @@
+ 	if (header) {
+ 		dstar_far.header = *header;
+ 		dstar_far.headers++;
++		dstar_ambe_reset(&dstar_far.decoder);
++		dstar_far.frames = 0;
++		dstar_far.energy = 0;
+ 	}
+ }
+ 
+@@ -12225,6 +12233,13 @@
+ 	dstar_far.voice++;
+ 	if (memcmp(voice, dstar_silence, DSTAR_VOICE_BYTES) != 0)
+ 		dstar_far.speech++;
++	uint8_t raw[DSTAR_AMBE_BITS];
++	int16_t pcm[MBE_FRAME_LEN];
++	dstar_ambe_decode(&dstar_far.decoder, dstar_ambe_wire_decode(voice, raw) ? raw : NULL, pcm);
++	// Use the same steady portion of the test tone in each call.
++	if (++dstar_far.frames > 10 && dstar_far.frames <= 30)
++		for (unsigned i = 0; i < MBE_FRAME_LEN; i++)
++			dstar_far.energy += (uint32_t)((int32_t)pcm[i] * pcm[i]);
+ }
+ 
+ static void dstar_far_end(void *ctx) { (void)ctx; dstar_far.ends++; }
+@@ -12282,6 +12297,23 @@
+ 	      !memcmp(dstar_far.header.ur, route, 8) && !memcmp(dstar_far.header.rpt1, route + 8, 8) &&
+ 	      !memcmp(dstar_far.header.rpt2, route + 16, 8));
+ 
++	// Manual gain must reach the far-end PCM when the board has no microphone gain hook.
++	uint8_t saved_gain = radio_mic_gain();
++	uint64_t energy[3];
++	for (unsigned i = 0; i < 3; i++) {
++		unsigned headers = dstar_far.headers;
++		radio_set_mic_gain((uint8_t)(i * MIC_GAIN_UNITY));
++		req(RREQ_PTT, 1);
++		run(1000);
++		req(RREQ_PTT, 0);
++		run(500);
++		CHECK(dstar_far.headers == headers + 1 && dstar_far.frames >= 30);
++		energy[i] = dstar_far.energy;
++	}
++	radio_set_mic_gain(saved_gain);
++	// Each five-step increase is 10 dB. Allow for quantization in the decoded energy.
++	CHECK(energy[0] > 0 && energy[1] > 6 * energy[0] && energy[1] < 16 * energy[0]);
++	CHECK(energy[2] > 6 * energy[1] && energy[2] < 16 * energy[1]);
+ 	// The external station transmits a DV reply and the handheld plays it.
+ 	dstar_header_t reply = dstar_far.header;
+ 	memcpy(reply.my, "N0CALL  ", 8);
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -335,7 +335,8 @@
+ 
+ The board only stores the offset in the hook; a change takes effect at the next transmission. On an HR_C7000 radio
+ the register is clamped to 0-42 dB (`hrc7000_mic_db`). The VOX meter reads the same codec ADC, so on these radios
+-the mic gain also moves the VOX level. Without `CONFIG_DMR` and without the hook the row is dimmed.
++the mic gain also moves the VOX level. D-STAR applies the same manual gain to its transmit PCM before encoding
++on boards without a microphone gain hook. Samples saturate at the 16-bit limits. Without `CONFIG_DMR` and without the hook the row is dimmed.
+ 
+ ### 3.7 DTMF transmit (CONFIG_DTMF)
+ 
+diff --git a/docs/user/17-settings.md b/docs/user/17-settings.md
+--- a/docs/user/17-settings.md
++++ b/docs/user/17-settings.md
+@@ -82,7 +82,7 @@
+ | Default squelch | 0 to 9 | 5 | The FM squelch level when a channel doesn't set one | Works |
+ | VFO step | Auto, 2.5, 5, 6.25, 8.33, 10, 12.5, 20, 25, 50, 100 kHz | Auto | The step of Up, Down and the knob in the VFO. Auto is 25 kHz at width 25K and in AM, else 12.5 kHz. Only on radios with a VFO | Works |
+ | FM broadcast step | 200 kHz, 100 kHz | 200 kHz | The VFO step in the broadcast band. 200 kHz lands on the odd tenths (88.1, 88.3), the stations in the Americas. You can still type any frequency. Only on radios with a broadcast receiver ([Air band and FM broadcast](07-channels-zones-vfo.md#air-band-and-fm-broadcast)) | Works |
+-| Mic gain | 0 to 10 | 5 | Microphone level, 2 dB a step. 5 is the radio's normal level. Sets DMR, and FM on the radios that set the level in their microphone path ([Radio reference](23-radios.md)). A change counts from the next transmission. Shows "AGC" and can't be changed while Mic AGC is on | Works (DMR); FM not checked on air |
++| Mic gain | 0 to 10 | 5 | Microphone level, 2 dB a step. 5 is the radio's normal level. Sets DMR and D-STAR transmit audio, and FM on the radios that set the level in their microphone path ([Radio reference](23-radios.md)). A change counts from the next transmission. Shows "AGC" and can't be changed while Mic AGC is on | Works (DMR); D-STAR checked in simulation; FM not checked on air |
+ | Mic AGC | On, Off | Off | Evens out your level on DMR: a quiet voice is raised and a loud one lowered, so you don't need to set Mic gain. While it's on, Mic gain stays at 5. Dimmed on radios whose voice codec can't do it | Needs an on-air check (DMR) |
+ | Mic noise reduction | On, Off | On | Reduces steady background noise (fans, engines, wind) in what you send on DMR, also between words. Turn it off if a steady sound you want heard is cut. Dimmed on radios whose voice codec can't do it | Needs an on-air check (DMR) |
+ | Monitor by default | On, Off | Off | Digital monitor (DMR: every talkgroup, promiscuous) goes on each time you select a DMR channel, and a scan started from it keeps it on at every channel. **Back** on Home turns it off until the next channel | Works |

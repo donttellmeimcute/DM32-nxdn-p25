@@ -94,7 +94,7 @@ PATCHES = (
 	'vfo-ghz-entry-doc.patch',
 	# RX past bands: every mode there (VFO and channels), and GHz channel records with a 0xA/0xB marker nibble
 	'rx-ext-ghz-channels.patch',
-	# NXDN48/NXDN96 Type-C trunking, listen only: CAC decode, VCALL_ASSGN follower (DFA or channel plan), editor fields
+	# NXDN48/NXDN96 Type-C trunking: follow voice grants, register and request calls on TX-enabled channels
 	'nxdn-trunking.patch',
 	# The APRS preset uses a new ID so saved Custom settings remain compatible.
 	'aprs-brazil.patch',
@@ -216,6 +216,8 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'release-mmdvm-captures.patch', cwd=tree)
 	if dstar:
 		run('git', 'apply', '--binary', PATCH_DIR / 'release-decode-dstar.patch', cwd=tree)
+		run('git', 'apply', '--binary', PATCH_DIR / 'issue108-dstar-mic-gain.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'issue105-channel-tx-contact.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
