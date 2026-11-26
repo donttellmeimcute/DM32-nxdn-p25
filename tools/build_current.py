@@ -204,6 +204,7 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-ysf-voice.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-ysf-quick-data-type.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'vfo-scan-limits-and-digital-sweep.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'dmr-fast-empty-scan.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'low-band-fm-bandwidth.patch', cwd=tree)
 	if dstar:
 		run('git', 'apply', '--binary', PATCH_DIR / 'dstar-quick-width.patch', cwd=tree)

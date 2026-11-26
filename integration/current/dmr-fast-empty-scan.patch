@@ -1,0 +1,292 @@
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index ee166fe..cd10d16 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -5127,6 +5127,26 @@ static bool scan_carrier_heard(const radio_sm_t *sm, const radio_status_t *st, u
+ 	return carrier_heard(sm, st->noise);
+ }
+ 
++#if CONFIG_DMR
++// One extra RF reading on the existing 10 ms modem tick. Before the normal settle it can only veto a fast
++// skip. It never opens the squelch, starts a probe, or contributes to the learned noise floor.
++static void scan_dmr_early_sample(radio_sm_t *sm, uint32_t now_ms)
++{
++	scan_t *sc = &sm->scan;
++	uint32_t age = now_ms - sc->tuned_ms;
++	if ((sc->kind != SCAN_ZONE && sc->kind != SCAN_VFO) || sc->phase != SCAN_PH_LISTEN ||
++	    sm->view.ch.mode != RADIO_MODE_DMR || sm->view.monitor || sc->quiet_samples ||
++	    age < 7 || age > 16)
++		return;
++	uint16_t dwell = sc->kind == SCAN_ZONE ? sm->set.zone_scan_dwell_ms : sm->set.scan_dwell_ms;
++	if (dwell >= RADIO_SCAN_DMR_FALLBACK_MS)
++		return;
++	radio_status_t st;
++	board.radio->status(&st);
++	sc->quiet_samples = carrier_heard(sm, st.noise) || dmr_strength_heard(sm, st.rssi_dbm) ? -1 : 1;
++}
++#endif
++
+ #if CONFIG_DUAL_WATCH
+ // Dual watch on one receiver, in the wait after a signal (SCAN_PH_RESUME): the receiver stays for the reply, but after
+ // each dwell there it looks at the other channel for one. A carrier only sets view.dual_busy. If the digital engine
+@@ -5265,9 +5285,18 @@ static void scan_service(radio_sm_t *sm, const radio_status_t *st, uint32_t now_
+ 		if (rejected)
+ 			sc->heard = false;
+ 		uint16_t dwell = sc->kind == SCAN_ZONE ? sm->set.zone_scan_dwell_ms : sm->set.scan_dwell_ms;
+-		// DMR's idle slot lasts 30 ms. Two 25 ms polls can both fall in it; three polls cannot.
+-		if (dmr && dwell < RADIO_SCAN_DMR_DWELL_MS)
+-			dwell = RADIO_SCAN_DMR_DWELL_MS;
++		if (dmr && dwell < RADIO_SCAN_DMR_FALLBACK_MS) {
++			uint32_t age = now_ms - sc->tuned_ms;
++			if (sc->quiet_samples == 1 && age >= RADIO_POLL_MS && age <= 30 && !carrier)
++				sc->quiet_samples = 2;
++			if (dwell < RADIO_SCAN_DMR_DWELL_MS)
++				dwell = RADIO_SCAN_DMR_DWELL_MS;
++			// Samples at 7-16, 25-30 and 50-52 ms leave at most 27 ms between readings around
++			// a 60 ms TDMA cycle. Use the original three polls if a tick was late or ambiguous.
++			if (sc->phase == SCAN_PH_LISTEN && age >= dwell && !rejected && !sc->heard &&
++			    !carrier && !sync && (sc->quiet_samples != 2 || age > 52))
++				dwell = RADIO_SCAN_DMR_FALLBACK_MS;
++		}
+ 		sc->cfg.dwell_ms = dwell < sc->cfg.settle_ms ? sc->cfg.settle_ms : dwell;
+ 	}
+ 	// A no-tone FM carrier still needs a poll for the squelch, which runs after this scan step.
+@@ -10241,6 +10270,9 @@ void radio_sm_tick(radio_sm_t *sm, uint32_t now_ms)
+ 		dmr_call_poll(now_ms);
+ 		dmr_follow(sm, now_ms);
+ 		one_shot_follow(sm, now_ms);
++#if CONFIG_SCAN
++		scan_dmr_early_sample(sm, now_ms);
++#endif
+ 	}
+ #if CONFIG_SFR
+ 	if (sm->sfr_rpt) {
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index 2fcf838..30124dd 100644
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -84,7 +84,8 @@
+ // Scan defaults and per-stop timing (docs/spec/radio-features.md 2)
+ #define RADIO_SCAN_DWELL_MS	25	// VFO: empty-channel dwell after the receiver settle
+ #define RADIO_SCAN_ZONE_SETTLE_MS 25	// zone scan: one poll to discard the last stop's readings
+-#define RADIO_SCAN_DMR_DWELL_MS (3 * RADIO_POLL_MS)	// DMR: three status readings to cover the idle TDMA slot
++#define RADIO_SCAN_DMR_DWELL_MS (2 * RADIO_POLL_MS)	// an empty DMR stop with three well-spaced RF samples
++#define RADIO_SCAN_DMR_FALLBACK_MS (3 * RADIO_POLL_MS)	// use the third regular poll if sampling was inconclusive
+ #define RADIO_SCAN_DUAL_MIN_DWELL_MS 150	// dual watch takes several status samples on each channel
+ #define RADIO_SCAN_FM_PROBE_MS	350	// FM: a carrier without the RX tone yet (CTCSS detection takes 100-250 ms)
+ #define RADIO_SCAN_DMR_PROBE_MS	450	// DMR: an unsynchronized carrier. The initial dwell and this probe cover
+diff --git a/core/radio/scan.c b/core/radio/scan.c
+index d8d5b91..97f3012 100644
+--- a/core/radio/scan.c
++++ b/core/radio/scan.c
+@@ -57,6 +57,7 @@ void scan_tuned(scan_t *s, uint32_t now_ms)
+ 	s->tuned_ms = now_ms;
+ 	s->heard = false;
+ 	s->synced = false;
++	s->quiet_samples = 0;
+ 	s->steps++;
+ 	phase(s, SCAN_PH_LISTEN, now_ms);
+ }
+@@ -95,6 +96,7 @@ void scan_pause(scan_t *s, bool paused, uint32_t now_ms)
+ 		s->tuned_ms = now_ms;
+ 		s->heard = false;
+ 		s->synced = false;
++		s->quiet_samples = 0;
+ 		phase(s, SCAN_PH_LISTEN, now_ms);
+ 	}
+ }
+@@ -216,8 +218,8 @@ int scan_next_pos(scan_t *s, uint16_t count, scan_usable_fn usable, void *ctx)
+ 	if (count == 0) {
+ 		return -1;
+ 	}
+-	bool origin_ok = s->origin_pos < count && pos_ok(s, s->origin_pos, usable, ctx);
+-	if (s->cfg.priority && origin_ok && s->since_priority >= SCAN_PRIORITY_EVERY) {
++	bool origin_ok = s->cfg.priority && s->origin_pos < count && pos_ok(s, s->origin_pos, usable, ctx);
++	if (origin_ok && s->since_priority >= SCAN_PRIORITY_EVERY) {
+ 		s->since_priority = 0;
+ 		return s->origin_pos;
+ 	}
+diff --git a/core/radio/scan.h b/core/radio/scan.h
+index 92a774c..a432934 100644
+--- a/core/radio/scan.h
++++ b/core/radio/scan.h
+@@ -46,6 +46,7 @@ typedef struct {
+ 	uint32_t heard_ms;	// this stop: the last poll with a carrier or sync (heard: one since the settle)
+ 	bool heard;
+ 	bool synced;		// this stop: sync heard
++	int8_t quiet_samples;	// fast DMR listen: early busy (-1), unread (0), early quiet (1), settled quiet too (2)
+ 	scan_cfg_t cfg;
+ 	// Where the scan started (CANCEL goes back there; priority revisits it). Dual watch keeps its two channels
+ 	// in the radio core, which alternates between them on SCAN_ACT_NEXT
+diff --git a/docs/spec/debuglink.md b/docs/spec/debuglink.md
+index 3741d6c..6c30472 100644
+--- a/docs/spec/debuglink.md
++++ b/docs/spec/debuglink.md
+@@ -412,7 +412,7 @@ At most one per 20 ms (busy otherwise; the radio core's queue holds 16).
+ | 21 | lo u32, hi u32 | `radio_req_scan_vfo`: VFO scan from lo to hi Hz in the VFO step |
+ | 22 | beep u8 [, delay u8] | `radio_req_beep`: 1 key (only with `set.key_beep`), 2 error, 3 TX permit, 4 TX deny, 5 call end, 6 time-out warning, 7 battery low, 8 battery critical, 9 scan hold, 10 emergency, 11 message, 12 TX permit before keying, 13 the speaker test's sweep (`radio-features.md` 4; CONFIG_BEEP builds). A delay of 1-255 s plays it that much later (`radio_req_beep_after`), so a radio that mutes its speaker with the cable in can be unplugged first; a later request replaces one still waiting |
+ | 23 | on u8, max_ms u16 (optional) | `radio_req_tone_burst`: the 1750 Hz burst, keys up while on (FM channels, CONFIG_FM_TX_TONES builds). It ends by itself `max_ms` after it started (0 or missing: `inject_max_ms`, also the cap), as PTT does, so a host that goes away, or a link the radio's own transmission jams, can't leave the radio keyed; `tone_burst_max_ms` in the version reply is the cap, and its presence says the burst has the limit |
+-| 24 | id u8, value u16 | one radio setting (`radio_set_settings`: in effect at once and saved by the settings store, as from the settings screen; the ids marked "not stored" below are RAM only): 1 tot_s, 2 tot_warn_s, 3 bcl (0 off, 1 carrier, 2 wrong tone), 4 roger_beep, 5 tx_inhibit, 6 scan_resume (0 time, 1 carrier, 2 stop), 7 scan_hold_s, 8 scan_delay_ms, 9 scan_dwell_ms, 10 scan_priority, 11 beep_level (0-100), 12 key_beep, 13 vox (0 off, 1 channel, 2 all), 14 vox_level (0-10), 15 vox_tail_ms, 16 rx_save (0-3), 17 rx_save_idle_s, 18 battery_off_s, 19 scan_beep, 20 reply_s (0-30, 255 = the codeplug's hang times), 21 roam_rssi_dbm (-125..-60, two's complement), 22 roam_hyst_db (1-30), 23 roam_probe (0 passive, 1 wake), 24 roam_check_s (0 or 30-3600), 25 roam_beacon_s (0 or 10-600), 26 roam_beacon_len_s (1-10), 27 roam_survey (0 off, 1 synced, 2 per site), 28 rpt_beacon (0/1), 29 mic_gain (0-10, `radio_set_mic_gain`: the UI's stored setting is not changed, so a restart brings it back; unavailable when the setting does nothing in this build), 30 dual_delay_ms (0-10000), 31 enc_options (0-7, the vocoder's encode options `VOCODER_OPT_*` for the next frames, `ambeVoiceSetEncodeOptions`: not stored, so a restart or a change of Mic noise reduction or Mic AGC brings the settings' back; 0 gives the AMBE+2 hosts' plain 0x800 word; unavailable when the vocoder has no options, a bad argument in builds without DMR; `dmr-voice.md` 6), 32 zs_offers (0 off, 1 ask; `zone_share_set_offers`, not stored: a restart brings back the stored setting; unavailable without `CONFIG_ZONE_SHARE`; `zone-share.md` 5.1), 33 sfr_cwid (the SFR repeater's CW ID interval, `sfr.md` 4: 0 off, 1 5 min, 2 10 min, 3 15 min, 4 30 min; refused without `CONFIG_SFR_CWID`), 34 sfr_rx (an SFR user's receive mode, `sfr.md` 4: 0 repeater only, 1 first copy, 2 dual-path RX; 2 is refused without `CONFIG_SFR_DUALPATH_RX`), 35 ref_trim (the reference trim, ppb -10000..+10000 as two's complement, rounded to 100 ppb (0.1 ppm); `radio_set_ref_trim`: not stored, so a restart brings back the stored setting; unavailable on a radio without `hal_radio_t.ref_trim`; `radio-features.md` 6.1), 36 tones_off (the Settings > Sound tones that are off, bits as `beep.tones_off`; stored as the menu stores them, `codeplug_keys_store`: each tone's key is written to the codeplug's settings area when it can be, `codeplug-settings.md` 5.2; busy when the codeplug holds a key that couldn't be updated; a bit past the tones is a bad argument), 37 gps (Settings > Location > GPS, 0 off, 1 on; stored and applied as the menu does: `board_t.gps` switches the module's power once it has been heard, [position.md](position.md) 2; unavailable without `CONFIG_GPS` or on a radio without a module), 38 zone_scan_dwell_ms (zone scan only, 25-500 in 25 ms steps; applied and stored like Tools > Zone scan speed; DMR stops keep at least 75 ms, `radio-features.md` 2). Out of range: bad argument |
++| 24 | id u8, value u16 | one radio setting (`radio_set_settings`: in effect at once and saved by the settings store, as from the settings screen; the ids marked "not stored" below are RAM only): 1 tot_s, 2 tot_warn_s, 3 bcl (0 off, 1 carrier, 2 wrong tone), 4 roger_beep, 5 tx_inhibit, 6 scan_resume (0 time, 1 carrier, 2 stop), 7 scan_hold_s, 8 scan_delay_ms, 9 scan_dwell_ms, 10 scan_priority, 11 beep_level (0-100), 12 key_beep, 13 vox (0 off, 1 channel, 2 all), 14 vox_level (0-10), 15 vox_tail_ms, 16 rx_save (0-3), 17 rx_save_idle_s, 18 battery_off_s, 19 scan_beep, 20 reply_s (0-30, 255 = the codeplug's hang times), 21 roam_rssi_dbm (-125..-60, two's complement), 22 roam_hyst_db (1-30), 23 roam_probe (0 passive, 1 wake), 24 roam_check_s (0 or 30-3600), 25 roam_beacon_s (0 or 10-600), 26 roam_beacon_len_s (1-10), 27 roam_survey (0 off, 1 synced, 2 per site), 28 rpt_beacon (0/1), 29 mic_gain (0-10, `radio_set_mic_gain`: the UI's stored setting is not changed, so a restart brings it back; unavailable when the setting does nothing in this build), 30 dual_delay_ms (0-10000), 31 enc_options (0-7, the vocoder's encode options `VOCODER_OPT_*` for the next frames, `ambeVoiceSetEncodeOptions`: not stored, so a restart or a change of Mic noise reduction or Mic AGC brings the settings' back; 0 gives the AMBE+2 hosts' plain 0x800 word; unavailable when the vocoder has no options, a bad argument in builds without DMR; `dmr-voice.md` 6), 32 zs_offers (0 off, 1 ask; `zone_share_set_offers`, not stored: a restart brings back the stored setting; unavailable without `CONFIG_ZONE_SHARE`; `zone-share.md` 5.1), 33 sfr_cwid (the SFR repeater's CW ID interval, `sfr.md` 4: 0 off, 1 5 min, 2 10 min, 3 15 min, 4 30 min; refused without `CONFIG_SFR_CWID`), 34 sfr_rx (an SFR user's receive mode, `sfr.md` 4: 0 repeater only, 1 first copy, 2 dual-path RX; 2 is refused without `CONFIG_SFR_DUALPATH_RX`), 35 ref_trim (the reference trim, ppb -10000..+10000 as two's complement, rounded to 100 ppb (0.1 ppm); `radio_set_ref_trim`: not stored, so a restart brings back the stored setting; unavailable on a radio without `hal_radio_t.ref_trim`; `radio-features.md` 6.1), 36 tones_off (the Settings > Sound tones that are off, bits as `beep.tones_off`; stored as the menu stores them, `codeplug_keys_store`: each tone's key is written to the codeplug's settings area when it can be, `codeplug-settings.md` 5.2; busy when the codeplug holds a key that couldn't be updated; a bit past the tones is a bad argument), 37 gps (Settings > Location > GPS, 0 off, 1 on; stored and applied as the menu does: `board_t.gps` switches the module's power once it has been heard, [position.md](position.md) 2; unavailable without `CONFIG_GPS` or on a radio without a module), 38 zone_scan_dwell_ms (zone scan only, 25-500 in 25 ms steps; applied and stored like Tools > Zone scan speed; DMR minimum 50 ms with a 75 ms fallback, `radio-features.md` 2). Out of range: bad argument |
+ | 25 | on u8: 1 network, 0 serial | switch the USB personality once the reply has gone out (`CONFIG_USB_NETWORK`; status 4 without it). The radio re-enumerates; in network mode this link answers over UDP to the radio's address, port 3334 (`docs/spec/usb-network.md`) |
+ | 26 | cmd u8 | `radio_req_roam` (CONFIG_DMR_ROAMING builds; status 4 without): 0 zone off, 1 zone on, 2 zone toggle (the current zone's roaming flag, stored), 3 roam now, 4 lock to this site, 5 unlock, 6 lock toggle ([dmr-roaming.md](dmr-roaming.md) 6.1) |
+ | 27 | flags u8, link IP u32 | the USB network settings, stored and applied at once (`docs/spec/usb-network.md` 5.4): bit 0 the network personality at power-on, bit 1 control station passthrough, bit 2 the fixed link pair; the radio's link address (0 = 192.168.10.1). Bits 1 and 2 need `CONFIG_DMR_CONTROL_STATION` (ignored without); UNAVAILABLE without `CONFIG_USB_NETWORK`. `rfoundry_debug.py radio usb-settings [boot] [passthrough] [fixed[=IP]]` |
+diff --git a/docs/spec/gotchas.md b/docs/spec/gotchas.md
+index 903170e..bb46fd2 100644
+--- a/docs/spec/gotchas.md
++++ b/docs/spec/gotchas.md
+@@ -878,8 +878,9 @@ pattern (16.5) and stopped when it was pulled out; whether a cable that sends do
+ Symptom: the zone scan never held on a DMR call already in progress (HIL 2026-10-10). Cause: the noise reading follows
+ the 30 ms bursts, so the reading at the end of the dwell, or any poll of the probe, often fell between two bursts and
+ the probe ended at once; and a 700 ms probe was shorter than a late entry that has to wait for a second superframe's LC
+-(about 1.1 s from the retune). Rule: DMR takes at least three status readings 25 ms apart on each stop, so an idle
+-slot cannot hide the whole signal. A carrier seen in the last 150 ms counts; bursts with the channel's color code
++(about 1.1 s from the retune). DMR zone and VFO scans sample between regular polls to cover both slots on a fast
++50 ms visit. With incomplete sampling they allow the third regular poll at 75 ms. A carrier seen in the last
++150 ms counts; bursts with the channel's color code
+ extend the probe to 1.5 s (`docs/spec/radio-features.md` 2).
+ 
+ **17.2 A DMR retune without a receiver restart keeps the last transmitter's slot timing.**
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index 3e9cf7b..9e39a93 100644
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -32,7 +32,7 @@ quick changes therefore never reads back a value from before its own last change
+ | `scan_hold_s` | 5 | time mode's hold |
+ | `scan_delay_ms` | 2000 | wait after a signal ends before moving on (a pause between overs) |
+ | `scan_dwell_ms` | 25 | VFO listen time per empty stop, with a 150 ms minimum for dual watch |
+-| `zone_scan_dwell_ms` | 25 | zone scan: independent empty-channel dwell, 25-500 ms in 25 ms steps; DMR stops keep at least 75 ms |
++| `zone_scan_dwell_ms` | 25 | zone scan: independent empty-channel dwell, 25-500 ms in 25 ms steps; DMR minimum 50 ms |
+ | `scan_priority` | off | zone scan: the start channel again after every 2 others |
+ | `scan_beep` | off | a short beep when the scan stops on a signal |
+ | `dual_delay_ms` | 1000 | dual watch on one receiver: its wait after a signal ends, in place of `scan_delay_ms` (0-10000; section 2.1) |
+@@ -74,8 +74,9 @@ Tools > Zone scan speed offers 25, 50, 75, 100, 150, 250 and 500 ms for empty ch
+ The choice is saved and applies during a zone scan. VFO and dual watch use `scan_dwell_ms`.
+ **Resume after call** in the same menu edits the existing `scan_delay_ms` setting for zone and VFO scans.
+ The new delay applies to a running scan. Dual watch uses its independent delay.
+-FM, P25, NXDN and YSF stops can use 25 ms. DMR needs at least 75 ms so the receiver gets three status readings
+-across the TDMA slots. Dual watch holds each frequency for at least 150 ms.
++FM, P25, NXDN and YSF stops can use 25 ms. DMR zone and VFO stops can advance at 50 ms. An extra RF reading on
++the modem tick helps distinguish an empty channel from the gap between simplex bursts. The scan uses its
++75 ms visit if the early reading or poll timing leaves the result uncertain. Dual watch uses at least 150 ms.
+ A signal is "active" when FM squelch opens (with the RX tone if the channel needs one) or DMR plays a call
+ (`dmr.state` rx). A carrier that isn't active yet earns a probe: one poll for FM without a tone, 350 ms for
+ FM with a tone (CTCSS detection takes 100 to 250 ms) and 450 ms for unsynchronized DMR. DMR modem lock takes 90 ms and
+diff --git a/docs/user/12-scan.md b/docs/user/12-scan.md
+index 0766efd..b4571cb 100644
+--- a/docs/user/12-scan.md
++++ b/docs/user/12-scan.md
+@@ -27,8 +27,9 @@ If dual watch is running, starting a scan stops it. The radio stays on the selec
+ 
+ - The scan visits the zone's channels in order, from the one it started on. It skips empty positions and channels
+   the codeplug marks to skip. FM, DMR, P25 and NXDN channels can be mixed. P25 trunked channels are skipped.
+-- **Tools > Zone scan speed** sets the wait on empty channels from 25 to 500 ms. Each DMR channel still gets at
+-  least 75 ms so the scan can hear a TDMA burst. An FM channel stops the scan when the squelch opens, with the
++- **Tools > Zone scan speed** sets the wait on empty channels from 25 to 500 ms. At the fastest setting, empty
++  DMR channels take 50 ms in zone or VFO scans. If the readings are inconclusive the radio listens for 75 ms.
++  An FM channel stops the scan when the squelch opens, with the
+   channel's tone if it needs one. DMR, P25 and NXDN channels stop it when the radio plays a call. On a signal
+   the radio can listen up to 1.5 s for a call it would play. It advances as soon as it identifies a call it would skip.
+ - Turn on [digital monitor](09-dmr.md) before you start the scan to stop on a call to any talkgroup, not only
+diff --git a/tests/host/radioFeaturesTest.c b/tests/host/radioFeaturesTest.c
+index eda412c..f24df11 100644
+--- a/tests/host/radioFeaturesTest.c
++++ b/tests/host/radioFeaturesTest.c
+@@ -37,6 +37,7 @@ typedef struct {
+ 	uint8_t noise;
+ 	subtone_t tone;		// the sub-audio the transmitter sends
+ 	bool tdma;		// DMR direct mode: on air every other 30 ms slot (the noise reading drops between bursts)
++	uint8_t phase_ms;	// offset of the transmitter relative to the radio's polling clock
+ 	int16_t dbm;		// the strength reading on it (0 = -80)
+ } sig_t;
+ 
+@@ -125,7 +126,8 @@ static void r_status(radio_status_t *st)
+ 	st->carrier = false;
+ 	st->tone_ok = hw.rx_tone.type == TONE_NONE;
+ 	for (int i = 0; i < MAX_SIG; i++) {
+-		if (hw.sig[i].hz != 0 && hw.sig[i].hz == hw.rx_hz && !(hw.sig[i].tdma && (now / 30u) % 2u != 0)) {
++		if (hw.sig[i].hz != 0 && hw.sig[i].hz == hw.rx_hz &&
++		    !(hw.sig[i].tdma && (now + hw.sig[i].phase_ms) % 60u >= 27u)) {
+ 			st->noise = hw.sig[i].noise;
+ 			st->rssi_dbm = hw.sig[i].dbm != 0 ? hw.sig[i].dbm : -80;
+ 			st->tone_ok = hw.rx_tone.type == TONE_NONE || same_tone(hw.rx_tone, hw.sig[i].tone);
+@@ -1375,11 +1377,11 @@ static void test_zone_scan_dwell_setting(void)
+ 	radio_sm_set_settings(&sm, &rs, now);
+ 	run(25);
+ 	CHECK(sm.view.zone_pos == 5 && sm.view.ch.mode == RADIO_MODE_DMR);
+-	run(2 * RADIO_POLL_MS);
++	run(RADIO_POLL_MS);
+ 	CHECK(sm.view.zone_pos == 5 && sm.scan.cfg.settle_ms == RADIO_SCAN_ZONE_SETTLE_MS &&
+ 	      sm.scan.cfg.dwell_ms == RADIO_SCAN_DMR_DWELL_MS);
+ 	run(RADIO_POLL_MS);
+-	CHECK(sm.view.zone_pos != 5);	// the third status sample covers a DMR burst even after two idle samples
++	CHECK(sm.view.zone_pos != 5);	// an empty DMR stop advances on the second regular poll
+ 	req(RREQ_SCAN, RSCAN_STOP);
+ 	// VFO can advance at 25 ms; dual watch holds each frequency for several status polls.
+ 	req(RREQ_VFO_SET, 146000000);
+@@ -1423,6 +1425,46 @@ static void test_zone_scan_timing_options(void)
+ 	}
+ }
+ 
++static void test_fast_dmr_scan(void)
++{
++	// The transmitter is asynchronous. Check every millisecond phase, including a burst
++	// between the two regular polls, on both alignments of the 10 and 25 ms task clocks.
++	for (unsigned alignment = 0; alignment <= RADIO_POLL_MS; alignment += RADIO_POLL_MS) {
++		for (uint8_t offset = 0; offset < 60; offset++) {
++			start();
++			run(alignment);
++			req(RREQ_ZONE_POS, 4);
++			signal_on(0, 438500000, 120, no_tone);	// only RSSI follows the burst
++			hw.sig[0].tdma = true;
++			hw.sig[0].phase_ms = offset;
++			req(RREQ_SCAN, RSCAN_ZONE);
++			run(RADIO_SCAN_DMR_FALLBACK_MS);
++			CHECK(sm.view.zone_pos == 5 && sm.scan.phase == SCAN_PH_PROBE);
++		}
++	}
++	// Delay the modem tick past the early sample. The two regular polls cannot prove silence.
++	start();
++	req(RREQ_ZONE_POS, 4);
++	req(RREQ_SCAN, RSCAN_ZONE);
++	now += RADIO_POLL_MS;
++	radio_sm_poll(&sm, now);
++	run(RADIO_POLL_MS);
++	CHECK(sm.view.zone_pos == 5);
++	run(RADIO_POLL_MS);
++	CHECK(sm.view.zone_pos == 6);
++
++	start();
++	req(RREQ_VFO_SET, 146000000);
++	req(RREQ_MODE, RADIO_MODE_DMR);
++	req2(RREQ_SCAN_VFO, 146000000, 146100000);
++	CHECK(sm.view.scan == SCAN_VFO && sm.view.ch.mode == RADIO_MODE_DMR);
++	uint32_t first = sm.view.ch.rx_hz;
++	run(RADIO_POLL_MS);
++	CHECK(sm.view.ch.rx_hz == first);
++	run(RADIO_POLL_MS);
++	CHECK(sm.view.ch.rx_hz != first);
++}
++
+ static void test_scan_boundaries_and_leds(void)
+ {
+ 	start();
+@@ -1877,8 +1919,8 @@ static void test_scan_dmr_mid_call(void)
+ 	req(RREQ_ZONE_POS, 6);
+ 	req(RREQ_SCAN, RSCAN_ZONE);
+ 	uint32_t steps = sm.scan.steps;
+-	run(1500);
+-	CHECK(sm.scan.steps - steps >= 9);
++	run(1000);
++	CHECK(sm.scan.steps - steps == 20);	// empty all-DMR zone at the fastest setting
+ 	req(RREQ_SCAN, RSCAN_STOP);
+ 
+ 	// A call to a talkgroup we don't listen to: no hold, and the scan goes on soon after it is known
+@@ -4331,6 +4373,7 @@ int main(void)
+ 	test_scan_ptt_and_modes();
+ 	test_zone_scan_dwell_setting();
+ 	test_zone_scan_timing_options();
++	test_fast_dmr_scan();
+ #if CONFIG_TONE_SCAN
+ 	test_tone_scan();
+ #endif
