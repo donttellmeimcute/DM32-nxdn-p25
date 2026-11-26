@@ -18,6 +18,7 @@
 #define PCM_PERIOD_US (AUDIO_BLOCK_MS * 1000u)
 #define MAX_CODEC_DEBT_US (2u * PCM_PERIOD_US)
 #define STACK_BYTES 8192u
+#define DSTAR_TX_BOOST_Q8 362u	// +3 dB before the AMBE encoder
 #define LOAD(field) __atomic_load_n(&(field), __ATOMIC_ACQUIRE)
 #define STORE(field, value) __atomic_store_n(&(field), (value), __ATOMIC_RELEASE)
 
@@ -124,14 +125,12 @@ typedef struct {
 static void encode_mic(dstar_ambe_t *codec, const int16_t *mic, int16_t *spk, uint8_t *raw)
 {
 	static const uint16_t q8[MIC_GAIN_STEPS + 1] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 643, 810 };
-	uint8_t step = radio_mic_gain();
-	if (step == MIC_GAIN_UNITY || mic_gain_on_board()) {
-		dstar_ambe_encode(codec, mic, raw);
-		return;
-	}
-	// The speaker is silent on TX. Borrow its block so gain costs no extra codec-window RAM.
+	uint16_t gain = DSTAR_TX_BOOST_Q8;
+	if (!mic_gain_on_board())
+		gain = (uint16_t)((gain * q8[radio_mic_gain()] + 128u) / 256u);
+	// The speaker is silent on TX. Borrow its block and saturate once after combining the gains.
 	for (unsigned i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
-		spk[i] = fxp_sat16(((int32_t)mic[i] * q8[step]) / 256);
+		spk[i] = fxp_sat16(((int32_t)mic[i] * gain) / 256);
 	dstar_ambe_encode(codec, spk, raw);
 	memset(spk, 0, AUDIO_BLOCK_SAMPLES * sizeof(*spk));
 }

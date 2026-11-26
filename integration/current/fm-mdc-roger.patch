@@ -1,0 +1,427 @@
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -57,6 +57,7 @@
+ 
+ typedef enum { RADIO_LED_NORMAL, RADIO_LED_SCAN_AMBER, RADIO_LED_OFF } radio_led_mode_t;
+ typedef enum { RADIO_PERMIT_DEFAULT, RADIO_PERMIT_CHIRP, RADIO_PERMIT_TRIPLE } radio_permit_style_t;
++enum { RADIO_FM_ROGER_OFF, RADIO_FM_ROGER_CLASSIC, RADIO_FM_ROGER_MDC };
+ 
+ // The radio core's settings (docs/spec/radio-features.md). The radio core loads them from the settings store at
+ // start-up (docs/spec/settings-store.md 3) and saves every change made with radio_set_settings
+@@ -65,7 +66,8 @@
+ 	uint8_t tot_warn_s;	// warning beep this long before the time-out, 0 = none
+ 	uint8_t bcl;		// radio_bcl_t
+ 	bool dmr_roger;		// local DMR voice end tone
+-	bool roger_beep;	// FM: a short tone pair at the end of each transmission (CONFIG_FM_TX_TONES)
++	uint8_t roger_beep;	// RADIO_FM_ROGER_*: off, transmit a tone pair, or send an MDC-1200 end ID
++	uint16_t fm_roger_mdc_id;	// fallback unit ID for the FM roger, 0 = unset
+ 	bool tx_inhibit;	// refuse every transmission
+ 	// Scan (CONFIG_SCAN)
+ 	uint8_t scan_resume;	// scan_resume_t (radio/scan.h): 0 time, 1 carrier, 2 stop
+diff --git a/core/settings/settings.h b/core/settings/settings.h
+--- a/core/settings/settings.h
++++ b/core/settings/settings.h
+@@ -268,6 +268,9 @@
+ 	uint8_t reserved_pin[2];
+ 	uint32_t cps_read_salt;	// zero disables the independent CPS read password
+ 	uint8_t cps_read_verifier[8];
++	uint16_t rs_fm_roger_mdc_id;	// fallback MDC-1200 unit ID, zero when unset
++	uint8_t rs_fm_roger_mdc;	// one selects the MDC roger instead of the legacy tone pair
++	uint8_t reserved_fm_roger;
+ } settings_t;
+ 
+ // Pages: settings_t is stored as records of SETTINGS_PAGE_BYTES each (settings-store.md 2.1). Only the pages its size
+diff --git a/core/settings/settings.c b/core/settings/settings.c
+--- a/core/settings/settings.c
++++ b/core/settings/settings.c
+@@ -29,7 +29,7 @@
+ _Static_assert(sizeof(settings_t) % 4 == 0, "settings_t has tail padding");
+ _Static_assert(offsetof(settings_t, dual_b) == SETTINGS_PAGE_BYTES, "page 1 starts at its first field");
+ _Static_assert(offsetof(settings_t, ref_trim_ppb) % 2 == 0, "ref_trim_ppb is aligned");
+-_Static_assert(sizeof(settings_t) == 456, "settings_t changed size: update docs/spec/settings-store.md 3 and this");
++_Static_assert(sizeof(settings_t) == 460, "settings_t changed size: update docs/spec/settings-store.md 3 and this");
+ 
+ static settings_t live;			// under the quick lock
+ static settings_t saved;		// what the newest record holds (or the defaults)
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -6205,18 +6205,29 @@
+ #endif
+ }
+ 
+-// The channel sends its ID at this point (CODEPLUG_ANI_PRE or _POST) and the board can
+-static bool mdc_wanted(const radio_sm_t *sm, uint8_t when)
++// A channel's configured identity takes precedence over the radio-wide FM roger ID.
++static uint16_t mdc_tx_id(const radio_sm_t *sm, uint8_t when)
+ {
+ 	const channel_t *ch = &sm->view.ch;
+-	return ch->mode == RADIO_MODE_FM && ch->ani_type == CODEPLUG_ANI_MDC1200 && (ch->ani_opts & when) != 0 &&
+-	       ch->ani_id != 0 && !sm->host_audio && !sm->hotspot && board.afsk != NULL && board.afsk->tx_start != NULL;
+-}
+-
+-static bool mdc_send(radio_sm_t *sm, uint8_t arg, uint8_t phase, uint32_t now_ms)
+-{
++	if (ch->mode != RADIO_MODE_FM || sm->host_audio || sm->hotspot || board.afsk == NULL ||
++	    board.afsk->tx_start == NULL)
++		return 0;
++	bool roger = when == CODEPLUG_ANI_POST && sm->set.roger_beep == RADIO_FM_ROGER_MDC;
++	if (ch->ani_type == CODEPLUG_ANI_MDC1200 && ch->ani_id != 0 && ((ch->ani_opts & when) != 0 || roger))
++		return ch->ani_id;
++	return roger ? sm->set.fm_roger_mdc_id : 0;
++}
++
++static bool mdc_send(radio_sm_t *sm, uint8_t when, uint8_t phase, uint32_t now_ms)
++{
++	uint16_t id = mdc_tx_id(sm, when);
++	if (id == 0) {
++		sm->mdc_phase = MDC_OFF;
++		return false;
++	}
++	uint8_t arg = when == CODEPLUG_ANI_POST ? MDC1200_ARG_PTT_POST : MDC1200_ARG_PTT_PRE;
+ 	uint8_t *tones = mdc_tone_buf();
+-	uint16_t n = mdc1200_tones(MDC1200_OP_PTT_ID, arg, sm->view.ch.ani_id, tones);
++	uint16_t n = mdc1200_tones(MDC1200_OP_PTT_ID, arg, id, tones);
+ 	uint8_t level = sm->view.ch.bw == RADIO_BW_25K ? RADIO_MDC_LEVEL_25K : RADIO_MDC_LEVEL_12K5;
+ 	if (!board.afsk->tx_start(tones, n, MDC1200_BAUD, MDC1200_MARK_HZ, MDC1200_SPACE_HZ, level)) {
+ 		sm->mdc_phase = MDC_OFF;
+@@ -6242,7 +6253,7 @@
+ 	if (sm->mdc_phase == MDC_PRE_WAIT) {
+ 		uint32_t wait = sm->view.ch.tx_tone.type != TONE_NONE ? RADIO_MDC_PRETIME_TONE_MS : RADIO_MDC_PRETIME_MS;
+ 		if (now_ms - sm->tx_start_ms >= wait) {
+-			mdc_send(sm, MDC1200_ARG_PTT_PRE, MDC_PRE, now_ms);
++			mdc_send(sm, CODEPLUG_ANI_PRE, MDC_PRE, now_ms);
+ 		}
+ 		return;
+ 	}
+@@ -7115,7 +7126,7 @@
+ 	}
+ #endif
+ #if CONFIG_MDC1200
+-	sm->mdc_phase = mdc_wanted(sm, CODEPLUG_ANI_PRE) ? MDC_PRE_WAIT : MDC_OFF;	// mdc_poll sends it
++	sm->mdc_phase = mdc_tx_id(sm, CODEPLUG_ANI_PRE) != 0 ? MDC_PRE_WAIT : MDC_OFF;	// mdc_poll sends it
+ #endif
+ 	changed(sm);
+ }
+@@ -7275,8 +7286,8 @@
+ static void fm_released(radio_sm_t *sm, bool roger, bool keyed, uint32_t now_ms)
+ {
+ #if CONFIG_FM_TX_TONES
+-	if (roger && !keyed && sm->set.roger_beep && sm->view.state == RS_TX && sm->view.ch.mode == RADIO_MODE_FM &&
+-			tx_tone(RADIO_ROGER_HZ1)) {
++	if (roger && !keyed && sm->set.roger_beep == RADIO_FM_ROGER_CLASSIC && sm->view.state == RS_TX &&
++	    sm->view.ch.mode == RADIO_MODE_FM && tx_tone(RADIO_ROGER_HZ1)) {
+ 		sm->roger_ms = now_ms != 0 ? now_ms : 1;
+ 		sm->view.roger = true;
+ 		changed(sm);
+@@ -7354,8 +7365,7 @@
+ 	// The user let go (not a time-out or a tone burst's end): the ID at the end goes out before the roger beep. An
+ 	// ID at the start that hadn't finished is dropped
+ 	mdc_cancel(sm);
+-	if (roger && !keyed && sm->view.state == RS_TX && mdc_wanted(sm, CODEPLUG_ANI_POST) &&
+-			mdc_send(sm, MDC1200_ARG_PTT_POST, MDC_POST, now_ms)) {
++	if (roger && !keyed && sm->view.state == RS_TX && mdc_send(sm, CODEPLUG_ANI_POST, MDC_POST, now_ms)) {
+ 		return;		// mdc_poll goes on from here
+ 	}
+ #endif
+@@ -8188,7 +8198,9 @@
+ 	s->tot_s = st->rs_tot_s;
+ 	s->tot_warn_s = st->rs_tot_warn_s;
+ 	s->bcl = st->rs_bcl;
+-	s->roger_beep = (st->rs_flags & SETTINGS_RS_ROGER_BEEP) != 0;
++	s->roger_beep = st->rs_fm_roger_mdc == 1 ? RADIO_FM_ROGER_MDC :
++		(st->rs_flags & SETTINGS_RS_ROGER_BEEP) != 0 ? RADIO_FM_ROGER_CLASSIC : RADIO_FM_ROGER_OFF;
++	s->fm_roger_mdc_id = st->rs_fm_roger_mdc_id;
+ 	s->dmr_roger = (st->rs_flags & SETTINGS_RS_DMR_ROGER) != 0;
+ 	s->tx_inhibit = (st->rs_flags & SETTINGS_RS_TX_INHIBIT) != 0;
+ 	s->scan_priority = (st->rs_flags & SETTINGS_RS_SCAN_PRIORITY) != 0;
+@@ -8221,7 +8233,7 @@
+ 	st->rs_tot_s = s->tot_s;
+ 	st->rs_tot_warn_s = s->tot_warn_s;
+ 	st->rs_bcl = s->bcl;
+-	st->rs_flags = (uint8_t)((s->roger_beep ? SETTINGS_RS_ROGER_BEEP : 0) | (s->tx_inhibit ? SETTINGS_RS_TX_INHIBIT : 0) |
++	st->rs_flags = (uint8_t)((s->roger_beep == RADIO_FM_ROGER_CLASSIC ? SETTINGS_RS_ROGER_BEEP : 0) | (s->tx_inhibit ? SETTINGS_RS_TX_INHIBIT : 0) |
+ 				 (s->scan_priority ? SETTINGS_RS_SCAN_PRIORITY : 0) |
+ 				 (s->scan_beep ? SETTINGS_RS_SCAN_BEEP : 0) | (s->key_beep ? SETTINGS_RS_KEY_BEEP : 0) |
+ 				 (s->talk_permit ? 0 : SETTINGS_RS_NO_TALK_PERMIT) | SETTINGS_RS_SCAN_DWELL_SET |
+@@ -8236,6 +8248,8 @@
+ 	st->rs_scan_lo_hz = s->scan_lo_hz;
+ 	st->rs_scan_hi_hz = s->scan_hi_hz;
+ 	st->rs_permit_style = s->permit_style;
++	st->rs_fm_roger_mdc = s->roger_beep == RADIO_FM_ROGER_MDC;
++	st->rs_fm_roger_mdc_id = s->fm_roger_mdc_id;
+ 	st->rs_vox = s->vox;
+ 	st->rs_vox_level = s->vox_level;
+ 	st->rs_vox_tail_ms = s->vox_tail_ms;
+diff --git a/core/ui/ui_svc.h b/core/ui/ui_svc.h
+--- a/core/ui/ui_svc.h
++++ b/core/ui/ui_svc.h
+@@ -469,6 +469,7 @@
+ 	UI_SET_DMR_REPLAY,	// session-only recording opt-in
+ 	UI_SET_SCAN_DELAY_MS,	// Tools > Zone scan speed: wait after a received call
+ 	UI_SET_DMR_ROGER,	// local Motorola-style PTT release tone
++	UI_SET_FM_ROGER_MDC_ID,
+ 	UI_SET_COUNT
+ } ui_setting_t;
+ 
+diff --git a/core/ui/ui_svc_storage.c b/core/ui/ui_svc_storage.c
+--- a/core/ui/ui_svc_storage.c
++++ b/core/ui/ui_svc_storage.c
+@@ -329,9 +329,14 @@
+ 		radio_get_settings(&rs);
+ 		return id == UI_SET_TALK_PERMIT ? rs.talk_permit : rs.scan_beep;
+ 	case UI_SET_PERMIT_STYLE:
++		radio_get_settings(&rs);
++		return rs.permit_style;
+ 	case UI_SET_ROGER_BEEP:
+ 		radio_get_settings(&rs);
+-		return id == UI_SET_PERMIT_STYLE ? rs.permit_style : rs.roger_beep;
++		return !CONFIG_MDC1200 && rs.roger_beep == RADIO_FM_ROGER_MDC ? RADIO_FM_ROGER_OFF : rs.roger_beep;
++	case UI_SET_FM_ROGER_MDC_ID:
++		radio_get_settings(&rs);
++		return rs.fm_roger_mdc_id;
+ 	case UI_SET_VFO_SCAN_LOW:
+ 	case UI_SET_VFO_SCAN_HIGH:
+ 		radio_get_settings(&rs);
+@@ -479,6 +484,7 @@
+ 	case UI_SET_RADIO_LED_MODE:
+ 	case UI_SET_PERMIT_STYLE:
+ 	case UI_SET_ROGER_BEEP:
++	case UI_SET_FM_ROGER_MDC_ID:
+ 	case UI_SET_VFO_SCAN_LOW:
+ 	case UI_SET_VFO_SCAN_HIGH:
+ 	case UI_SET_ZONE_SCAN_DWELL:
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -655,7 +655,11 @@
+ 		rs.permit_style = (uint8_t)v16;
+ 		break;
+ 	case UI_SET_ROGER_BEEP:
+-		rs.roger_beep = value != 0;
++		if (v16 <= (CONFIG_MDC1200 ? RADIO_FM_ROGER_MDC : RADIO_FM_ROGER_CLASSIC))
++			rs.roger_beep = (uint8_t)v16;
++		break;
++	case UI_SET_FM_ROGER_MDC_ID:
++		rs.fm_roger_mdc_id = v16;
+ 		break;
+ 	case UI_SET_DMR_ROGER:
+ 		rs.dmr_roger = value != 0;
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -7606,6 +7606,11 @@
+ 	TRX(DIGITAL_RX_LEVEL_12_DB, "-12 dB"), TRX(DIGITAL_RX_LEVEL_18_DB, "-18 dB")
+ };
+ #endif
++#if CONFIG_MDC1200
++static const int16_t v_fm_roger[] = { RADIO_FM_ROGER_OFF, RADIO_FM_ROGER_CLASSIC, RADIO_FM_ROGER_MDC };
++static const tr_id_t n_fm_roger[] = { TRN(VALUE_OFF, "Off"), TRN(SET_VALUE_FM_ROGER_CLASSIC, "Classic"),
++	TRX(SET_VALUE_FM_ROGER_XTS3000, "XTS 3000") };
++#endif
+ static const set_item_t s_sound[] = {
+ 	NUMBER(TRN(TITLE_VOLUME, "Volume"), "speaker loudness", UI_SET_VOLUME, 0, RADIO_VOLUME_MAX, 1, NULL),
+ 	TOGGLE(TRN(SET_LABEL_KEY_TONES, "Key tones"), "beep", UI_SET_KEY_TONES),
+@@ -7623,7 +7628,14 @@
+ 	TOGGLE(TRN(SET_LABEL_VIBRATE, "Vibrate"), "vibration motor silent", UI_SET_VIBRATE),
+ #endif
+ 	LIST(TRN(SET_LABEL_TALK_PERMIT_SOUND, "Talk permit sound"), "FM analog chirp", UI_SET_PERMIT_STYLE, v_permit, n_permit),
++#if CONFIG_MDC1200
++	LIST(TRN(SET_LABEL_ROGER_BEEP, "FM roger beep"), "transmit end tone MDC Motorola",
++	     UI_SET_ROGER_BEEP, v_fm_roger, n_fm_roger),
++	NUMBER(TRN(SET_LABEL_FM_ROGER_MDC_ID, "MDC roger ID"), "FM roger unit ID decimal",
++	       UI_SET_FM_ROGER_MDC_ID, 0, INT16_MAX, 1, NULL),
++#else
+ 	TOGGLE(TRN(SET_LABEL_ROGER_BEEP, "FM roger beep"), "transmit end tone", UI_SET_ROGER_BEEP),
++#endif
+ 	TOGGLE(TRN(SET_LABEL_DMR_ROGER, "DMR Motorola roger"), "local PTT release tone", UI_SET_DMR_ROGER),
+ #if CONFIG_DIGITAL_RX_TRIM
+ 	LIST(TRN(SET_LABEL_DIGITAL_RX_LEVEL, "Digital RX level"), "speaker loudness attenuation", UI_SET_DIGITAL_RX_TRIM,
+@@ -8190,7 +8202,10 @@
+ 		*lo = 0;
+ 		*hi = 65535;
+ 	}
+-
++#if CONFIG_MDC1200
++	if (s->id == UI_SET_FM_ROGER_MDC_ID)
++		*hi = UINT16_MAX;
++#endif
+ }
+ 
+ static void group_item(uint16_t i, ui_item_t *it)
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -3980,6 +3980,14 @@
+ msgid "FM roger beep"
+ msgstr "Pitido final FM"
+ 
++msgctxt "SET_VALUE_FM_ROGER_CLASSIC"
++msgid "Classic"
++msgstr "Cl�sico"
++
++msgctxt "SET_LABEL_FM_ROGER_MDC_ID"
++msgid "MDC roger ID"
++msgstr "ID MDC del Roger"
++
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DIGITAL_RX_LEVEL"
+ msgid "Digital RX level"
+diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+--- a/core/ui/lang/fr.po
++++ b/core/ui/lang/fr.po
+@@ -3972,6 +3972,14 @@
+ msgid "FM roger beep"
+ msgstr "Bip de fin FM"
+ 
++msgctxt "SET_VALUE_FM_ROGER_CLASSIC"
++msgid "Classic"
++msgstr "Classique"
++
++msgctxt "SET_LABEL_FM_ROGER_MDC_ID"
++msgid "MDC roger ID"
++msgstr "ID MDC du roger"
++
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DIGITAL_RX_LEVEL"
+ msgid "Digital RX level"
+diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+--- a/core/ui/lang/it.po
++++ b/core/ui/lang/it.po
+@@ -3972,6 +3972,14 @@
+ msgid "FM roger beep"
+ msgstr "Bip finale FM"
+ 
++msgctxt "SET_VALUE_FM_ROGER_CLASSIC"
++msgid "Classic"
++msgstr "Classico"
++
++msgctxt "SET_LABEL_FM_ROGER_MDC_ID"
++msgid "MDC roger ID"
++msgstr "ID MDC del roger"
++
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DIGITAL_RX_LEVEL"
+ msgid "Digital RX level"
+diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+--- a/core/ui/lang/zh.po
++++ b/core/ui/lang/zh.po
+@@ -3974,6 +3974,14 @@
+ msgid "FM roger beep"
+ msgstr "FM ?????"
+ 
++msgctxt "SET_VALUE_FM_ROGER_CLASSIC"
++msgid "Classic"
++msgstr "??"
++
++msgctxt "SET_LABEL_FM_ROGER_MDC_ID"
++msgid "MDC roger ID"
++msgstr "MDC ???? ID"
++
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DIGITAL_RX_LEVEL"
+ msgid "Digital RX level"
+diff --git a/docs/user/17-settings.md b/docs/user/17-settings.md
+--- a/docs/user/17-settings.md
++++ b/docs/user/17-settings.md
+@@ -42,7 +42,8 @@
+ | Talk permit tone | On, Off | On | The tone when a DMR transmission starts (MOTOTRBO-style chirp), and before a P25 or NXDN one (three 910 Hz beeps) ([DMR](09-dmr.md#the-talk-permit-tone)) | Works |
+ | Talk permit sound | Default, Chirp, Triple beep | Default | Pick a local sound for all supported modes. Chirp or Triple beep also enables a tone before the radio keys on FM. | Works |
+ | DMR Motorola roger | On, Off | Off | Plays a local three-note chirp after your DMR voice transmission ends | Works |
+-| FM roger beep | On, Off | Off | Send a tone pair over the air when PTT is released on FM. | On radios with an FM transmit tone |
++| FM roger beep | Off, Classic, XTS 3000 | Off | Classic sends two tones when PTT is released on FM. XTS 3000 sends an MDC-1200 end ID. | XTS 3000 requires MDC-1200 support |
++| MDC roger ID | 0 to 65535 (decimal) | 0 | Fallback unit ID for the XTS 3000 roger. A channel MDC ID takes precedence. With neither ID set, the radio sends no MDC roger. | Requires MDC-1200 support |
+ | Call end tone | On, Off | On | The two-note beep when a DMR call you heard ends | Works |
+ | TOT warning tone | On, Off | On | The beep a few seconds before the transmit time-out cuts a transmission | Works |
+ | Battery tone | On, Off | On | The beeps for a low and a critical battery | Works |
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -430,8 +430,9 @@
+ | Rule | Value |
+ | --- | --- |
+ | Start burst | after the carrier has been up 100 ms, 300 ms on a channel with a TX tone (the far squelch opens first) |
+-| End burst | at PTT release, before the roger beep and the sub-audio tail. Only when the user lets go: not at the time-out or after a 1750 Hz burst |
++| End burst | at PTT release, before the classic roger beep and the sub-audio tail. Only when the user lets go: not at the time-out or after a 1750 Hz burst |
+ | Level | `hal_afsk_t` level 50 on a 25 kHz channel (the board's nominal, about 3 kHz peak), 25 on 12.5 kHz |
++| MDC roger | sends the same end burst, including in the FM VFO. It takes the channel MDC unit ID or the configured fallback. A zero ID sends nothing. It replaces the classic tone pair and shares the channel end burst |
+ | PTT released during the start burst | the burst is cut; the end burst (if set) follows |
+ | PTT pressed again during the end burst | the burst is cut and the transmission goes on, with no second start burst |
+ | DTMF | no digit while a burst is pending or on the air |
+diff --git a/docs/spec/settings-store.md b/docs/spec/settings-store.md
+--- a/docs/spec/settings-store.md
++++ b/docs/spec/settings-store.md
+@@ -76,7 +76,7 @@
+ ### 2.1 Pages
+ 
+ `settings_t` is longer than one slot's payload, so it is stored as pages: page k holds bytes `236 * k` on.
+-`SETTINGS_PAGES` is the number its size needs (2 now, 456 bytes); the page field allows 16 (3776 bytes). Each page is
++`SETTINGS_PAGES` is the number its size needs (2 now, 460 bytes); the page field allows 16 (3776 bytes). Each page is
+ a record with its own length, so `settings_t` grows by appending fields, and a short page fills the fields it has.
+ 
+ | Rule | Why |
+@@ -138,7 +138,7 @@
+ | preferences | `brightness`, `backlight_s`, `beeps` (0 or 1), `hotspot_allowed`, `master_power`, `usb_mode` (the USB personality at power-on: 0 serial, 1 network; `usb-network.md` 1), `accent` (in the old `reserved1`'s first byte: bits 0-2 the highlight color, 0 the theme's own, 1 red, 2 orange, 3 yellow, 4 teal, 5 light blue, 6 purple, 7 pink; bit 3 set: the status strip not filled; bits 4-5 the crash report mode; bits 6-7 the vocoder's mic options, bit 6 noise reduction off and bit 7 AGC on (`dmr-voice.md` 6), so a record from before them reads as noise reduction on and AGC off; 0 = the defaults, the theme's highlight and the strip filled with it; `ui.md` 8) |
+ | identity | `unused_dmr_id` (was an own DMR ID override; ignored: the own ID is the codeplug's, which Settings > My radio writes), `radio_name[16]` ("" = the codeplug's callsign) |
+ | privacy keys | `privacy_key[4]`, `privacy_type[4]`, `privacy_active` (appended for dmr-voice) |
+-| radio core settings | `rs_tot_s rs_tot_warn_s rs_bcl rs_flags` (roger beep, TX inhibit, scan priority, scan beep, key beep, no talk permit tone: 0 = on, as before; bit 6 `SETTINGS_RS_SCAN_DWELL_SET`: the dwell was saved with the fast-scan firmware, so an old record without it migrates only the legacy 150 ms default to 75 ms) `rs_scan_resume rs_scan_hold_s rs_beep_level rs_scan_delay_ms rs_scan_dwell_ms rs_vox rs_vox_level rs_vox_tail_ms rs_rx_save rs_stored rs_rx_save_idle_s rs_battery_off_s rs_backlight_dim_s rs_backlight_off_s` (appended for radio-features) |
++| radio core settings | `rs_tot_s rs_tot_warn_s rs_bcl rs_flags` (roger beep, TX inhibit, scan priority, scan beep, key beep, no talk permit tone: 0 = on, as before; bit 6 `SETTINGS_RS_SCAN_DWELL_SET`: the dwell was saved with the fast-scan firmware, so an old record without it migrates only the legacy 150 ms default to 75 ms) `rs_fm_roger_mdc rs_fm_roger_mdc_id` (MDC roger selection and fallback unit ID) `rs_scan_resume rs_scan_hold_s rs_beep_level rs_scan_delay_ms rs_scan_dwell_ms rs_vox rs_vox_level rs_vox_tail_ms rs_rx_save rs_stored rs_rx_save_idle_s rs_battery_off_s rs_backlight_dim_s rs_backlight_off_s` (appended for radio-features) |
+ | DMR data settings | `ds_ars_server ds_flags` (radio check reply, call alert ACK, LRRP reply, SMS format ETSI short data, radio check ETSI form, UDP compression off, UDP compression all, SMS format ETSI IP text) `ds_stored` (appended for dmr-data; the ETSI bits for dmr-ext and dispatch, 0 = as before: a record with neither SMS format bit sends TMS, while the default without a record is ETSI IP text, `dmr-data.md` 8), `ds_ip_cnf` (in the old reserved4: confirmed IP tries in bits 0-3, 0 = the default 4; bits 4-5 0 rules, 1 off, 2 all; bit 6 set: the radio check reply bit is the user's choice, clear: a record from before the reply default became On, which answers) and `ds_ip_rule[2]` (appended at the end for sap3: 0 unused, a radio ID, or 0x80000000 \| a UDP port); the two compression bits 0 = auto ([dmr-data.md](dmr-data.md) 11, 12). Page 1: `ds_ip_gateway`, the IP gateway's off-net route (`ipGatewayId`: a gateway radio's DMR ID in bits 0-23, 0 = off-net packets dropped; a record without it reads 0, as before; [usb-network.md](usb-network.md) 3.1) |
+ | UI settings | `rs_reply_s` (the reply window in s, 0..30; `SETTINGS_UNSET8` = the codeplug's hang times; a radio core setting), `mic_gain` (0..10, default 5 = the board's levels; `radio_set_mic_gain`, radio-features.md 3.6), `auto_lock_s` (0 = off), `long_press_ms`, `repeat_ms` (0 = the input layer's defaults), `gps` (Settings > Location > GPS: `ui_svc_apply` hands it to `board_gps_enable` and `position_gps_enable`, at start-up and on each change, see position.md 2), `pos_format`, `pos_send_s` (stored for a GPS owner, act on nothing yet) (appended for glue) |
+ | DMR emergency | `em_dst em_mode em_flags` (target is a radio, ETSI alarm FID, no alert tone) `em_alarm_tries em_hot_mic_s em_stored` (appended for dmr-ext, `dmr-emergency.md` 5) |
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -1943,6 +1943,43 @@
+ 
+ static void set_roger(radio_settings_t *s) { s->roger_beep = true; }
+ 
++static void test_fm_mdc_roger(void)
++{
++	reset();
++	radio_settings_t s = sm.set;
++	s.roger_beep = RADIO_FM_ROGER_MDC;
++	s.fm_roger_mdc_id = 0xBEEF;
++	radio_sm_set_settings(&sm, &s, now);
++	radio_sm_init(&sm, now);
++	CHECK(sm.set.roger_beep == RADIO_FM_ROGER_MDC && sm.set.fm_roger_mdc_id == 0xBEEF);
++	req(RREQ_VFO_SET, CH_HZ);
++	CHECK(sm.view.vfo && sm.view.ch.mode == RADIO_MODE_FM);
++	req(RREQ_PTT, 1);
++	run(250);
++	CHECK(hw.starts == 0);
++	req(RREQ_PTT, 0);
++	CHECK(hw.starts == 1 && hw.keyed && mdc_sent(MDC1200_ARG_PTT_POST, 0xBEEF));
++	run(300);
++	CHECK(sm.view.state == RS_IDLE && !hw.keyed && hw.tone_hz == 0 && !sm.view.roger);
++
++	mdc_channel(CODEPLUG_ANI_POST, 0x1A2B);
++	radio_sm_set_settings(&sm, &s, now);
++	req(RREQ_PTT, 1);
++	run(250);
++	req(RREQ_PTT, 0);
++	CHECK(hw.starts == 1 && mdc_sent(MDC1200_ARG_PTT_POST, 0x1A2B));
++	run(500);
++	CHECK(hw.starts == 1 && sm.view.state == RS_IDLE && hw.tone_hz == 0);
++
++	reset();
++	s.fm_roger_mdc_id = 0;
++	radio_sm_set_settings(&sm, &s, now);
++	req(RREQ_PTT, 1);
++	run(250);
++	req(RREQ_PTT, 0);
++	CHECK(hw.starts == 0 && sm.view.state == RS_IDLE && !hw.keyed);
++}
++
+ static void test_mdc_ptt_id(void)
+ {
+ 	// A channel without an ID type: PTT sends nothing
+@@ -2226,6 +2263,7 @@
+ {
+ #if CONFIG_MDC1200
+ 	test_mdc_ptt_id();
++	test_fm_mdc_roger();
+ #if CONFIG_APRS_RX
+ 	test_mdc_decode();
+ #endif
