@@ -160,12 +160,13 @@ diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
 index 188452d..a61d13e 100644
 --- a/tests/host/sim/ui_sim.c
 +++ b/tests/host/sim/ui_sim.c
-@@ -1234,3 +1234,4 @@ static void changed(void)
+@@ -1297,4 +1297,5 @@ static void changed(void)
+ 	view.bcast = radio_bcast_band(view.ch.rx_hz);
  	view.vfo_step_hz = sim_step == 833 ? 8333u : sim_step > 0 ? (uint32_t)sim_step * 10u :
 -			   view.ch.bw == RADIO_BW_25K ? 25000u : 12500u;
 +			   view.ch.mode == RADIO_MODE_DSTAR ? 6250u :
 +			   view.ch.bw == RADIO_BW_25K ? 25000u : 12500u;
- 	view.vfo_step_auto = sim_step == 0;
+ 	if (view.bcast) {
 @@ -2984,6 +2985,7 @@ static bool check(const char *kv, char *err, size_t len)
  	else if (strcmp(key, "mode") == 0) snprintf(got, sizeof got, "%s", view.ch.mode == RADIO_MODE_DMR ? "dmr" :
  								     view.ch.mode == RADIO_MODE_P25 ? "p25" :
