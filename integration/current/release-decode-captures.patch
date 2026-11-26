@@ -49,7 +49,7 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  	};
  	static const uint8_t nxdn_unit[] = { 0xD7, 0x11 };	// 4567, the CPS unit ID
  
-@@ -11959,23 +11978,16 @@
+@@ -11959,23 +11978,20 @@
  			p.unit_id = 4567;
  			p.tx_dst = 123;
  			radio_req_p25_settings(&p);
@@ -62,6 +62,10 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  		req(RREQ_MODE, mode);
  		if (mode == RADIO_MODE_YSF) {
  			radio_ysf_settings_t y;
++			// Select the restored independent W/N profile before choosing voice format.
++			CHECK(ui_svc_vfo_mode(RADIO_MODE_YSF, cases[i].profile == YSF_DT_VOICE_FR ?
++			      VFO_VARIANT_FIRST : VFO_VARIANT_SECOND));
++			run(50);
 +			CHECK(ui_svc_ysf_dt(cases[i].profile));
 +			run(50);
 -			CHECK(radio_ysf_in_force(&y) && !strcmp(y.src, "XE1ABC"));
@@ -78,7 +82,7 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  		aud.feed = aud.feed_signal = air_clock_handoff = true;
  		p25VoiceResetStats();
  		ambeVoiceResetStats();
-@@ -11995,10 +12007,7 @@
+@@ -11995,10 +12011,7 @@
  		req(RREQ_PTT, 0);
  		run(750);
  		CHECK(!hw.keyed && fair[0].underruns == 0);
@@ -90,7 +94,7 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  		air_audio_start_fail = true;
  		req(RREQ_PTT, 1);
  		run(100);
-@@ -12064,11 +12073,13 @@
+@@ -12064,11 +12077,13 @@
  	sm.set.talk_permit = false;
  	aud.feed = true;
  	aud.feed_signal = true;
@@ -105,7 +109,7 @@ diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
  	CHECK(!hw.keyed && sm.view.state != RS_TX);
  	m17VoiceGetStats(&vs);
  	CHECK(vs.tx_encoded >= 20 && vs.tx_frames >= 8 && vs.alloc_fails == 0);
-@@ -12268,7 +12279,7 @@
+@@ -12268,7 +12283,7 @@
  
  int main(int argc, char **argv)
  {
