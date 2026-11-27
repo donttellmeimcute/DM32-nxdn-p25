@@ -7,6 +7,18 @@ are complete.
 
 ## Host test
 
+The firmware build driver now runs the native regression before fetching or
+building the target. Run just that check with
+`python3 tools/build_current.py --monitor-cw-tests-only` (set `HOSTCC` if needed).
+This does not enable the features in a radio image.
+
+`monitor_session.h` defines the radio-task adapter contract. It acquires RX
+ownership before tuning and keeps the TX interlock asserted on a restoration
+failure until recovery succeeds. Mock tests exercise these paths. The actual
+radio task must implement the callbacks and enforce the interlock at every TX
+producer; the adapter by itself is not a physical TX interlock.
+
+
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -pedantic -Os -fsanitize=undefined test.c -o /tmp/dm32-mc-test
 /tmp/dm32-mc-test
