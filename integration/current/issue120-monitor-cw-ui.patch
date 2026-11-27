@@ -1,0 +1,2108 @@
+diff --git a/Makefile b/Makefile
+index a3d6e9b2b4d26d46b1d0ebd896c4556a05a32483..1de29024bb50e0ded210294cfaca9899458d35ef 100644
+--- a/Makefile
++++ b/Makefile
+@@ -378,7 +378,9 @@ $(shell python3 tools/gen_about.py AUTHORS platform/$(PLATFORM)/THIRD_PARTY $(BU
+ # The language tables (tools/i18n.py, core/ui/lang/*.po) and the text keys every file that includes i18n.h needs
+ # (tr_keys.h, rewritten only when a key changed: the dependency files rebuild those); i18n.o is rebuilt when the tables
+ # changed. A failure stops the build: the old tables would link without a word
+-I18N_GEN := $(shell python3 tools/i18n.py --gen $(BUILD)/gen/lang_tables.h || echo i18n-failed)
++I18N_OMIT := $(if $(filter y,$(CONFIG_MONITOR_SCAN)),,--without-monitor-scan) \
++             $(if $(filter y,$(CONFIG_CW)),,--without-cw)
++I18N_GEN := $(shell python3 tools/i18n.py --gen $(BUILD)/gen/lang_tables.h $(I18N_OMIT) || echo i18n-failed)
+ ifneq ($(filter i18n-failed,$(I18N_GEN)),)
+ $(error tools/i18n.py --gen failed (above))
+ endif
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+index 108dc51f2b38c6f2da48cf4f1fc1a5fa74ae4577..502b85c9302a34bd176ab29ab227e1c484b5ef95 100644
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -3640,6 +3640,16 @@ msgctxt "RSSI_GRAPH_TITLE"
+ msgid "RSSI graph"
+ msgstr "Gráfica RSSI"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_TITLE"
++msgid "Monitor Scan"
++msgstr "Escaneo cercano"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TITLE"
++msgid "Morse"
++msgstr "Morse"
++
+ #: core/ui/ui_menus.c
+ msgctxt "WORD_DUAL_WATCH"
+ msgid "Dual watch"
+@@ -3660,6 +3670,196 @@ msgctxt "TONE_SCAN_WHY_FM"
+ msgid "Select an FM channel and stop scanning"
+ msgstr "Selecciona un canal FM y detén el escaneo"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_UNKNOWN"
++msgid "Unidentified"
++msgstr "Sin identificar"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_DIGITAL"
++msgid "Digital"
++msgstr "Digital"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ALL"
++msgid "All modes"
++msgstr "Todos los modos"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RESTORE_FAULT"
++msgid "Restore failed. TX locked."
++msgstr "Error al volver. TX bloqueado."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RECEIVING"
++msgid "Listening. TX locked."
++msgstr "Escuchando. TX bloqueado."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSED"
++msgid "Paused. TX locked."
++msgstr "En pausa. TX bloqueado."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_VERIFYING"
++msgid "Checking the signal"
++msgstr "Verificando señal"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SWEEPING"
++msgid "Sweeping. TX locked."
++msgstr "Escaneando. TX bloqueado."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START"
++msgid "Start sweep"
++msgstr "Iniciar escaneo"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_BAND"
++msgid "Band"
++msgstr "Banda"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STEP"
++msgid "Frequency step"
++msgstr "Paso de frecuencia"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_THRESHOLD"
++msgid "RSSI threshold"
++msgstr "Umbral RSSI"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_CONTINUE"
++msgid "Continue"
++msgstr "Continuar"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSE"
++msgid "Pause"
++msgstr "Pausar"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SKIP"
++msgid "Skip frequency"
++msgstr "Omitir frecuencia"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_FM"
++msgid "Save as FM RX Only"
++msgstr "Guardar FM solo RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE"
++msgid "Save RX Only"
++msgstr "Guardar solo RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STOP"
++msgid "Stop sweep"
++msgstr "Detener escaneo"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STATION"
++msgid "Station"
++msgstr "Estación"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_POSTED"
++msgid "Saving RX-only channel"
++msgstr "Guardando canal solo RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START_FAILED"
++msgid "Sweep couldn't start"
++msgstr "No inició el escaneo"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ENTER_FREQ"
++msgid "Type MHz digits, then OK"
++msgstr "Escribe MHz y pulsa OK"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_WRONG_RANGE"
++msgid "Frequency outside sweep band"
++msgstr "Frecuencia fuera de banda"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_REFUSED"
++msgid "Need idle narrow FM for RX"
++msgstr "Usa FM estrecha sin actividad"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY_HINT"
++msgid "Hold Monitor for local tone"
++msgstr "Mantén Monitor para oír tono"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_LOCAL"
++msgid "Local playback only"
++msgstr "Solo reproducción local"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_ENVELOPE"
++msgid "RSSI envelope RX"
++msgstr "RX por envolvente RSSI"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_RX"
++msgid "Decode Morse"
++msgstr "Decodificar Morse"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TEXT"
++msgid "Decoded text"
++msgstr "Texto recibido"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_SPEED"
++msgid "Speed"
++msgstr "Velocidad"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PITCH"
++msgid "Sidetone"
++msgstr "Tono local"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY"
++msgid "Practice key"
++msgstr "Tecla de práctica"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CQ"
++msgid "Play CQ"
++msgstr "Reproducir CQ"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CALL"
++msgid "Play callsign"
++msgstr "Reproducir indicativo"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_73"
++msgid "Play 73"
++msgstr "Reproducir 73"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CUSTOM"
++msgid "Play message"
++msgstr "Reproducir mensaje"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PLAY_FAILED"
++msgid "Couldn't play Morse message"
++msgstr "No se pudo reproducir Morse"
++
++#: core/ui/ui_menus.c
++msgctxt "SIGNAL_TOOLS_TITLE"
++msgid "Signal tools"
++msgstr "Señales"
++
+ #: core/ui/ui_menus.c
+ msgctxt "TONE_SCAN_ROW_CTCSS"
+ msgid "Search CTCSS"
+@@ -5558,6 +5758,11 @@ msgctxt "QUICK_TITLE"
+ msgid "Quick"
+ msgstr "Rápido"
+ 
++#: core/ui/ui_screens.c
++msgctxt "SIGNAL_TOOLS_HINT"
++msgid "# Signal tools"
++msgstr "# Señales"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_HINT"
+ msgid "1-9 change  Hold OK save"
+diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+index a1e850dbffa0b0009722f9ca6d21dcd25e915bd2..9ff97acec055a33d1b130346339cffeb6fa5b746 100644
+--- a/core/ui/lang/fr.po
++++ b/core/ui/lang/fr.po
+@@ -3632,6 +3632,16 @@ msgctxt "RSSI_GRAPH_TITLE"
+ msgid "RSSI graph"
+ msgstr "Courbe RSSI"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_TITLE"
++msgid "Monitor Scan"
++msgstr "Balayage de proximité"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TITLE"
++msgid "Morse"
++msgstr "Morse"
++
+ #: core/ui/ui_menus.c
+ msgctxt "WORD_DUAL_WATCH"
+ msgid "Dual watch"
+@@ -3652,6 +3662,196 @@ msgctxt "TONE_SCAN_WHY_FM"
+ msgid "Select an FM channel and stop scanning"
+ msgstr "Choisissez un canal FM et arrêtez le balayage"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_UNKNOWN"
++msgid "Unidentified"
++msgstr "Non identifié"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_DIGITAL"
++msgid "Digital"
++msgstr "Numérique"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ALL"
++msgid "All modes"
++msgstr "Tous les modes"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RESTORE_FAULT"
++msgid "Restore failed. TX locked."
++msgstr "Restauration échouée. TX bloquée."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RECEIVING"
++msgid "Listening. TX locked."
++msgstr "Écoute. TX bloquée."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSED"
++msgid "Paused. TX locked."
++msgstr "En pause. TX bloquée."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_VERIFYING"
++msgid "Checking the signal"
++msgstr "Vérification du signal"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SWEEPING"
++msgid "Sweeping. TX locked."
++msgstr "Balayage. TX bloquée."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START"
++msgid "Start sweep"
++msgstr "Lancer le balayage"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_BAND"
++msgid "Band"
++msgstr "Bande"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STEP"
++msgid "Frequency step"
++msgstr "Pas de fréquence"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_THRESHOLD"
++msgid "RSSI threshold"
++msgstr "Seuil RSSI"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_CONTINUE"
++msgid "Continue"
++msgstr "Reprendre"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSE"
++msgid "Pause"
++msgstr "Pause"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SKIP"
++msgid "Skip frequency"
++msgstr "Sauter la fréquence"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_FM"
++msgid "Save as FM RX Only"
++msgstr "Mémoriser FM RX seul"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE"
++msgid "Save RX Only"
++msgstr "Mémoriser RX seul"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STOP"
++msgid "Stop sweep"
++msgstr "Arrêter le balayage"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STATION"
++msgid "Station"
++msgstr "Station"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_POSTED"
++msgid "Saving RX-only channel"
++msgstr "Enregistrement du canal RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START_FAILED"
++msgid "Sweep couldn't start"
++msgstr "Balayage impossible"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ENTER_FREQ"
++msgid "Type MHz digits, then OK"
++msgstr "Saisir les MHz puis OK"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_WRONG_RANGE"
++msgid "Frequency outside sweep band"
++msgstr "Fréquence hors bande"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_REFUSED"
++msgid "Need idle narrow FM for RX"
++msgstr "FM étroite au repos requise"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY_HINT"
++msgid "Hold Monitor for local tone"
++msgstr "Maintenir Monitor pour le son"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_LOCAL"
++msgid "Local playback only"
++msgstr "Écoute locale seule"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_ENVELOPE"
++msgid "RSSI envelope RX"
++msgstr "RX par enveloppe RSSI"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_RX"
++msgid "Decode Morse"
++msgstr "Décoder le Morse"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TEXT"
++msgid "Decoded text"
++msgstr "Texte reçu"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_SPEED"
++msgid "Speed"
++msgstr "Vitesse"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PITCH"
++msgid "Sidetone"
++msgstr "Tonalité locale"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY"
++msgid "Practice key"
++msgstr "Touche d'exercice"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CQ"
++msgid "Play CQ"
++msgstr "Jouer CQ"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CALL"
++msgid "Play callsign"
++msgstr "Jouer l'indicatif"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_73"
++msgid "Play 73"
++msgstr "Jouer 73"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CUSTOM"
++msgid "Play message"
++msgstr "Jouer un message"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PLAY_FAILED"
++msgid "Couldn't play Morse message"
++msgstr "Lecture du Morse impossible"
++
++#: core/ui/ui_menus.c
++msgctxt "SIGNAL_TOOLS_TITLE"
++msgid "Signal tools"
++msgstr "Signaux"
++
+ #: core/ui/ui_menus.c
+ msgctxt "TONE_SCAN_ROW_CTCSS"
+ msgid "Search CTCSS"
+@@ -5550,6 +5750,11 @@ msgctxt "QUICK_TITLE"
+ msgid "Quick"
+ msgstr "Rapide"
+ 
++#: core/ui/ui_screens.c
++msgctxt "SIGNAL_TOOLS_HINT"
++msgid "# Signal tools"
++msgstr "# Signaux"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_HINT"
+ msgid "1-9 change  Hold OK save"
+diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+index dd3ff7090784e84a6fda5b790501efbdc1aa0aaf..965896fd6dd855eb8d8a3f9b77526ba774513951 100644
+--- a/core/ui/lang/it.po
++++ b/core/ui/lang/it.po
+@@ -3632,6 +3632,16 @@ msgctxt "RSSI_GRAPH_TITLE"
+ msgid "RSSI graph"
+ msgstr "Grafico RSSI"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_TITLE"
++msgid "Monitor Scan"
++msgstr "Scansione vicina"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TITLE"
++msgid "Morse"
++msgstr "Morse"
++
+ #: core/ui/ui_menus.c
+ msgctxt "WORD_DUAL_WATCH"
+ msgid "Dual watch"
+@@ -3652,6 +3662,196 @@ msgctxt "TONE_SCAN_WHY_FM"
+ msgid "Select an FM channel and stop scanning"
+ msgstr "Seleziona un canale FM e interrompi la scansione"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_UNKNOWN"
++msgid "Unidentified"
++msgstr "Non identificato"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_DIGITAL"
++msgid "Digital"
++msgstr "Digitale"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ALL"
++msgid "All modes"
++msgstr "Tutti i modi"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RESTORE_FAULT"
++msgid "Restore failed. TX locked."
++msgstr "Ripristino fallito. TX bloccata."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RECEIVING"
++msgid "Listening. TX locked."
++msgstr "In ascolto. TX bloccata."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSED"
++msgid "Paused. TX locked."
++msgstr "In pausa. TX bloccata."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_VERIFYING"
++msgid "Checking the signal"
++msgstr "Verifica del segnale"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SWEEPING"
++msgid "Sweeping. TX locked."
++msgstr "Scansione. TX bloccata."
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START"
++msgid "Start sweep"
++msgstr "Avvia scansione"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_BAND"
++msgid "Band"
++msgstr "Banda"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STEP"
++msgid "Frequency step"
++msgstr "Passo di frequenza"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_THRESHOLD"
++msgid "RSSI threshold"
++msgstr "Soglia RSSI"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_CONTINUE"
++msgid "Continue"
++msgstr "Continua"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSE"
++msgid "Pause"
++msgstr "Pausa"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SKIP"
++msgid "Skip frequency"
++msgstr "Salta frequenza"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_FM"
++msgid "Save as FM RX Only"
++msgstr "Salva FM solo RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE"
++msgid "Save RX Only"
++msgstr "Salva solo RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STOP"
++msgid "Stop sweep"
++msgstr "Ferma scansione"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STATION"
++msgid "Station"
++msgstr "Stazione"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_POSTED"
++msgid "Saving RX-only channel"
++msgstr "Salvataggio canale solo RX"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START_FAILED"
++msgid "Sweep couldn't start"
++msgstr "Avvio scansione non riuscito"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ENTER_FREQ"
++msgid "Type MHz digits, then OK"
++msgstr "Digita i MHz, poi OK"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_WRONG_RANGE"
++msgid "Frequency outside sweep band"
++msgstr "Frequenza fuori banda"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_REFUSED"
++msgid "Need idle narrow FM for RX"
++msgstr "Serve FM stretta a riposo"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY_HINT"
++msgid "Hold Monitor for local tone"
++msgstr "Tieni Monitor per il tono"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_LOCAL"
++msgid "Local playback only"
++msgstr "Solo riproduzione locale"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_ENVELOPE"
++msgid "RSSI envelope RX"
++msgstr "RX con inviluppo RSSI"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_RX"
++msgid "Decode Morse"
++msgstr "Decodifica Morse"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TEXT"
++msgid "Decoded text"
++msgstr "Testo ricevuto"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_SPEED"
++msgid "Speed"
++msgstr "Velocità"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PITCH"
++msgid "Sidetone"
++msgstr "Tono locale"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY"
++msgid "Practice key"
++msgstr "Tasto di pratica"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CQ"
++msgid "Play CQ"
++msgstr "Riproduci CQ"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CALL"
++msgid "Play callsign"
++msgstr "Riproduci nominativo"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_73"
++msgid "Play 73"
++msgstr "Riproduci 73"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CUSTOM"
++msgid "Play message"
++msgstr "Riproduci messaggio"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PLAY_FAILED"
++msgid "Couldn't play Morse message"
++msgstr "Riproduzione Morse non riuscita"
++
++#: core/ui/ui_menus.c
++msgctxt "SIGNAL_TOOLS_TITLE"
++msgid "Signal tools"
++msgstr "Segnali"
++
+ #: core/ui/ui_menus.c
+ msgctxt "TONE_SCAN_ROW_CTCSS"
+ msgid "Search CTCSS"
+@@ -5550,6 +5750,11 @@ msgctxt "QUICK_TITLE"
+ msgid "Quick"
+ msgstr "Rapido"
+ 
++#: core/ui/ui_screens.c
++msgctxt "SIGNAL_TOOLS_HINT"
++msgid "# Signal tools"
++msgstr "# Segnali"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_HINT"
+ msgid "1-9 change  Hold OK save"
+diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+index d53559b82080e014f9c21ae90e92931b916e327a..1f453f3406566a69dc385a5031d299ada6477ed1 100644
+--- a/core/ui/lang/zh.po
++++ b/core/ui/lang/zh.po
+@@ -3634,6 +3634,16 @@ msgctxt "RSSI_GRAPH_TITLE"
+ msgid "RSSI graph"
+ msgstr "RSSI 信号"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_TITLE"
++msgid "Monitor Scan"
++msgstr "近距离扫描"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TITLE"
++msgid "Morse"
++msgstr "Morse"
++
+ #: core/ui/ui_menus.c
+ msgctxt "WORD_DUAL_WATCH"
+ msgid "Dual watch"
+@@ -3654,6 +3664,196 @@ msgctxt "TONE_SCAN_WHY_FM"
+ msgid "Select an FM channel and stop scanning"
+ msgstr "选择 FM 信道，停止扫描"
+ 
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_UNKNOWN"
++msgid "Unidentified"
++msgstr "未识别"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_DIGITAL"
++msgid "Digital"
++msgstr "数字"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ALL"
++msgid "All modes"
++msgstr "所有模式"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RESTORE_FAULT"
++msgid "Restore failed. TX locked."
++msgstr "恢复失败，发射锁定"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_RECEIVING"
++msgid "Listening. TX locked."
++msgstr "接收中，发射锁定"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSED"
++msgid "Paused. TX locked."
++msgstr "已暂停，发射锁定"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_VERIFYING"
++msgid "Checking the signal"
++msgstr "检查信号"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SWEEPING"
++msgid "Sweeping. TX locked."
++msgstr "扫描中，发射锁定"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START"
++msgid "Start sweep"
++msgstr "开始扫描"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_BAND"
++msgid "Band"
++msgstr "频段"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STEP"
++msgid "Frequency step"
++msgstr "频率步进"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_THRESHOLD"
++msgid "RSSI threshold"
++msgstr "RSSI 限值"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_CONTINUE"
++msgid "Continue"
++msgstr "继续"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_PAUSE"
++msgid "Pause"
++msgstr "暂停"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SKIP"
++msgid "Skip frequency"
++msgstr "跳过频率"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_FM"
++msgid "Save as FM RX Only"
++msgstr "保存为 FM 仅接收"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE"
++msgid "Save RX Only"
++msgstr "保存为仅接收"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STOP"
++msgid "Stop sweep"
++msgstr "停止扫描"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_STATION"
++msgid "Station"
++msgstr "电台"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_SAVE_POSTED"
++msgid "Saving RX-only channel"
++msgstr "正在保存接收信道"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_START_FAILED"
++msgid "Sweep couldn't start"
++msgstr "无法开始扫描"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_ENTER_FREQ"
++msgid "Type MHz digits, then OK"
++msgstr "输入 MHz 后按 OK"
++
++#: core/ui/ui_menus.c
++msgctxt "MSCAN_WRONG_RANGE"
++msgid "Frequency outside sweep band"
++msgstr "频率超出范围"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_REFUSED"
++msgid "Need idle narrow FM for RX"
++msgstr "FM 12.5 kHz 空闲"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY_HINT"
++msgid "Hold Monitor for local tone"
++msgstr "长按 Monitor 播放本地音"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_LOCAL"
++msgid "Local playback only"
++msgstr "仅本地播放"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_ENVELOPE"
++msgid "RSSI envelope RX"
++msgstr "RSSI 信号检测"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_RX"
++msgid "Decode Morse"
++msgstr "Morse 解码"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_TEXT"
++msgid "Decoded text"
++msgstr "接收文本"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_SPEED"
++msgid "Speed"
++msgstr "速度"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PITCH"
++msgid "Sidetone"
++msgstr "本地音频"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_KEY"
++msgid "Practice key"
++msgstr "本地按键"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CQ"
++msgid "Play CQ"
++msgstr "播放 CQ"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CALL"
++msgid "Play callsign"
++msgstr "播放呼号"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_73"
++msgid "Play 73"
++msgstr "播放 73"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_CUSTOM"
++msgid "Play message"
++msgstr "播放消息"
++
++#: core/ui/ui_menus.c
++msgctxt "MORSE_TOOL_PLAY_FAILED"
++msgid "Couldn't play Morse message"
++msgstr "无法播放 Morse"
++
++#: core/ui/ui_menus.c
++msgctxt "SIGNAL_TOOLS_TITLE"
++msgid "Signal tools"
++msgstr "信号工具"
++
+ #: core/ui/ui_menus.c
+ msgctxt "TONE_SCAN_ROW_CTCSS"
+ msgid "Search CTCSS"
+@@ -5552,6 +5752,11 @@ msgctxt "QUICK_TITLE"
+ msgid "Quick"
+ msgstr "快捷"
+ 
++#: core/ui/ui_screens.c
++msgctxt "SIGNAL_TOOLS_HINT"
++msgid "# Signal tools"
++msgstr "# 信号工具"
++
+ #: core/ui/ui_screens.c
+ msgctxt "QUICK_HINT"
+ msgid "1-9 change  Hold OK save"
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index db4f3f820b874ce146ce483dd22059e6118b72b5..96ffe7cec0adc6e48b6f14f14f26b88552469685 100644
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -162,7 +162,7 @@ static void update_focus_target(void)
+ 		ui_svc_focus_target(0, false);
+ }
+ 
+-#if CONFIG_BACKLIGHT_TEST || CONFIG_TONE_SCAN || CONFIG_STARTUP_PIN
++#if CONFIG_BACKLIGHT_TEST || CONFIG_TONE_SCAN || CONFIG_STARTUP_PIN || CONFIG_MONITOR_SCAN || CONFIG_CW
+ // Screens from the top down to stack level `from` run their leave hooks.
+ static void left(uint8_t from)
+ {
+@@ -1850,6 +1850,12 @@ bool ui_quick_key(const input_event_t *ev)
+ 	}
+ 	switch (ev->action) {
+ 	case ACT_CONTEXT:
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++		if (press && view->vfo && !ui_st.quick_edit) {
++			ui_push(SCR_SIGNAL_TOOLS, 0);
++			return true;
++		}
++#endif
+ 		if (press && ui_st.quick_edit && kind == QT_TONE) {
+ 			// Tone (both) -> TX -> RX -> both; the editor starts from that direction's tone
+ 			ui_st.tone_target = ui_st.tone_target == RADIO_TONE_BOTH ? RADIO_TONE_TX :
+@@ -2661,7 +2667,14 @@ static void use_tick(const radio_view_t *v)
+ {
+ 	if (soft_off)
+ 		return;	// asleep: the wake key restarts the period (soft_off_exit)
+-	if (v->state != RS_IDLE || v->scan != 0 || v->hotspot || v->bcast) {
++	bool signal_tool = false;
++#if CONFIG_MONITOR_SCAN
++	signal_tool = v->monitor_scan.state != MC_OFF || v->monitor_scan.restore_fault;
++#endif
++#if CONFIG_CW
++	signal_tool = signal_tool || v->cw.active || v->cw.preview || v->cw.key_armed;
++#endif
++	if (v->state != RS_IDLE || v->scan != 0 || v->hotspot || v->bcast || signal_tool) {
+ 		last_use_ms = now;
+ 		off_warned = false;
+ 	}
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index d4520f2d6a09623840dc38c82880ddaf5137b408..2a464c42f2c8c1d3b43f1e742188b515adb8863a 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -37,6 +37,9 @@
+ #include "radio/ref_trim.h"
+ #include "radio/radio_am.h"
+ #include "radio/radio_bands.h"
++#if CONFIG_MONITOR_SCAN
++#include "radio/monitor_cw.h"
++#endif
+ #include "input/keyassign.h"
+ #if CONFIG_HOTSPOT || CONFIG_USB_NETWORK
+ #include "hostlink/hostlink.h"
+@@ -7031,7 +7034,7 @@ void ui_crash_tick(uint32_t now_ms)
+ // Every tool keeps its number on every radio and build, so a key path (OK 6 7: Diagnostics; tests/hil/test_ui.py and the
+ // user guide) is the same everywhere. Numbers 3, 4 and 5 are reserved in this firmware.
+ enum { T_SCAN, T_POSITION, T_HOTSPOT, T_USB_NET, T_SFR, T_ROAM, T_DIAG, T_APRS, T_BATTERY, T_ZONE_OFFER,
+-       T_ZONE_SCAN, T_RX_EXT, T_VFO_SCAN_LOW, T_VFO_SCAN_HIGH, T_TONE_SCAN, T_RSSI_GRAPH, T_COUNT };
++       T_ZONE_SCAN, T_RX_EXT, T_VFO_SCAN_LOW, T_VFO_SCAN_HIGH, T_TONE_SCAN, T_RSSI_GRAPH, T_MONITOR_SCAN, T_CW, T_COUNT };
+ 
+ // Defined with the generic settings groups below; appended to Tools so every existing tool keeps its number
+ #if CONFIG_SCAN && CONFIG_UI_SETTINGS
+@@ -7046,6 +7049,20 @@ static bool tool_shown(uint16_t i)
+ 		return false;
+ 	if (i == T_RSSI_GRAPH)
+ 		return CONFIG_RSSI_GRAPH;
++	if (i == T_MONITOR_SCAN) {
++#if CONFIG_MONITOR_SCAN
++		return true;
++#else
++		return false;
++#endif
++	}
++	if (i == T_CW) {
++#if CONFIG_CW
++		return true;
++#else
++		return false;
++#endif
++	}
+ 	if (i == T_TONE_SCAN)
+ 		return CONFIG_TONE_SCAN && board.radio != NULL && board.radio->rx_tone_test != NULL;
+ #if CONFIG_ZONE_SHARE
+@@ -7107,7 +7124,14 @@ static void tools_item(uint16_t row, ui_item_t *it)
+ 		TRN(TOOLS_ROW_ZONE_SCAN_SPEED, "Zone scan speed"),
+ 		TRN(SET_LABEL_RX_PAST_BANDS, "RX past bands"),
+ 		TRN(TOOLS_ROW_SCAN_LOW, "Scan low"), TRN(TOOLS_ROW_SCAN_HIGH, "Scan high"),
+-		TRN(TONE_SCAN_TITLE, "Tone search"), TRN(RSSI_GRAPH_TITLE, "RSSI graph") };
++		TRN(TONE_SCAN_TITLE, "Tone search"), TRN(RSSI_GRAPH_TITLE, "RSSI graph"),
++#if CONFIG_MONITOR_SCAN
++		[T_MONITOR_SCAN] = TRN(MSCAN_TITLE, "Monitor Scan"),
++#endif
++#if CONFIG_CW
++		[T_CW] = TRN(MORSE_TOOL_TITLE, "Morse"),
++#endif
++	};
+ 	uint16_t i = tools_row(row);
+ 	if (i >= T_COUNT)
+ 		return;
+@@ -7257,6 +7281,12 @@ static void tools_select(uint16_t row, bool hold)
+ 			ui_push(SCR_TONE_SCAN, 0);
+ 		break;
+ 	}
++#endif
++	#if CONFIG_MONITOR_SCAN
++	case T_MONITOR_SCAN: ui_push(SCR_MONITOR_SCAN, 0); break;
++#endif
++#if CONFIG_CW
++	case T_CW: ui_push(SCR_MORSE, 0); break;
+ #endif
+ 	case T_POSITION: ui_push(CONFIG_GPS_SKY ? SCR_GPS : SCR_INFO, INFO_POSITION); break;
+ #if CONFIG_RSSI_GRAPH
+@@ -7280,6 +7310,645 @@ static const ui_scr_def_t tools_screen = {
+ 	.count = tools_count, .item = tools_item, .select = tools_select,
+ };
+ 
++#if CONFIG_MONITOR_SCAN
++enum { MS_START, MS_BAND, MS_LO, MS_HI, MS_STEP, MS_RSSI, MS_FILTER, MS_CONFIG_COUNT };
++enum { MS_PAUSE, MS_SKIP, MS_SAVE, MS_STOP, MS_FREQ, MS_SIGNAL, MS_MODE, MS_CC, MS_TS, MS_TG, MS_ID,
++       MS_SOURCE, MS_ACTIVE_COUNT };
++static const uint32_t monitor_steps[] = { 6250, 12500, 25000, 50000, 100000 };
++static uint32_t monitor_lo, monitor_hi;
++static uint8_t monitor_band, monitor_step = 1, monitor_filter, monitor_edit, monitor_length;
++static int16_t monitor_threshold = -75;
++static char monitor_digits[UI_ENTRY_MAX + 1u];
++
++static bool monitor_supported_band(uint8_t i)
++{
++	const band_t *band = &board.bands[i];
++	return band->tx && band != board.manual_fm_tx_band && band->hi_hz > band->lo_hz;
++}
++
++static void monitor_set_band(uint8_t band)
++{
++	monitor_band = band;
++	monitor_lo = board.bands[band].lo_hz;
++	monitor_hi = board.bands[band].hi_hz;
++}
++
++static void monitor_enter(void)
++{
++	monitor_edit = 0;
++	if (monitor_lo != 0 && monitor_band < board_band_count() && monitor_supported_band(monitor_band))
++		return;
++	monitor_lo = 0;
++	for (uint8_t i = 0; i < board_band_count(); ++i) {
++		if (monitor_supported_band(i) &&
++		    (monitor_lo == 0 || (ui_view()->ch.rx_hz >= board.bands[i].lo_hz &&
++					 ui_view()->ch.rx_hz <= board.bands[i].hi_hz))) {
++			monitor_set_band(i);
++		}
++	}
++}
++
++static bool monitor_active(void)
++{
++	const radio_monitor_view_t *m = &ui_view()->monitor_scan;
++	return m->state != MC_OFF || m->restore_fault;
++}
++
++static const char *monitor_mode(uint8_t mode)
++{
++	switch (mode) {
++	case MC_FM: return "FM?";
++	case MC_DMR: return "DMR";
++	case MC_P25: return "P25 P1";
++	case MC_NXDN48: return "NXDN48";
++	case MC_NXDN96: return "NXDN96";
++	case MC_YSF: return "YSF";
++	case MC_M17: return "M17";
++	case MC_DSTAR: return "D-STAR";
++	case MC_CW: return "CW RSSI";
++	default: return TR(MSCAN_UNKNOWN, "Unidentified");
++	}
++}
++
++static uint8_t monitor_filter_count(void)
++{
++#if CONFIG_CW
++	return 4;
++#else
++	return 3;
++#endif
++}
++
++static const char *monitor_filter_name(void)
++{
++	switch (monitor_filter) {
++	case 1: return "FM";
++	case 2: return TR(MSCAN_DIGITAL, "Digital");
++	case 3: return "CW";
++	default: return TR(MSCAN_ALL, "All modes");
++	}
++}
++
++static const char *monitor_body(void)
++{
++	const radio_monitor_view_t *m = &ui_view()->monitor_scan;
++	if (m->restore_fault)
++		return TR(MSCAN_RESTORE_FAULT, "Restore failed. TX locked.");
++	switch (m->state) {
++	case MC_HELD: return TR(MSCAN_RECEIVING, "Listening. TX locked.");
++	case MC_PAUSED: return TR(MSCAN_PAUSED, "Paused. TX locked.");
++	case MC_VERIFY: return TR(MSCAN_VERIFYING, "Checking the signal");
++	case MC_LISTEN:
++	case MC_SETTLE: return TR(MSCAN_SWEEPING, "Sweeping. TX locked.");
++	default: return NULL;
++	}
++}
++
++static uint16_t monitor_count(void)
++{
++	return monitor_active() ? MS_ACTIVE_COUNT : MS_CONFIG_COUNT;
++}
++
++static void monitor_config_item(uint16_t i, ui_item_t *it)
++{
++	static const tr_id_t names[] = {
++		TRN(MSCAN_START, "Start sweep"), TRN(MSCAN_BAND, "Band"),
++		TRN(TOOLS_ROW_SCAN_LOW, "Scan low"), TRN(TOOLS_ROW_SCAN_HIGH, "Scan high"),
++		TRN(MSCAN_STEP, "Frequency step"), TRN(MSCAN_THRESHOLD, "RSSI threshold"), TRN(LABEL_MODE, "Mode"),
++	};
++	str_copy(it->label, sizeof it->label, tr(names[i]));
++	sbuf_t b;
++	sb_init(&b, it->value, sizeof it->value);
++	if (monitor_edit == i) {
++		it->flags |= UI_ITEM_EDIT;
++		if (i == MS_LO || i == MS_HI) {
++			sb_str(&b, monitor_digits);
++			sb_chr(&b, '_');
++			return;
++		}
++	}
++	switch (i) {
++	case MS_BAND:
++		if (monitor_lo != 0) {
++			sb_u32(&b, board.bands[monitor_band].lo_hz / 1000000u, 1);
++			sb_chr(&b, '-');
++			sb_u32(&b, board.bands[monitor_band].hi_hz / 1000000u, 1);
++			sb_str(&b, " MHz");
++		}
++		break;
++	case MS_LO: sb_freq(&b, monitor_lo); break;
++	case MS_HI: sb_freq(&b, monitor_hi); break;
++	case MS_STEP:
++		sb_u32(&b, monitor_steps[monitor_step] / 1000u, 1);
++		if (monitor_step < 2)
++			sb_str(&b, monitor_step == 0 ? ".25" : ".5");
++		sb_str(&b, " kHz");
++		break;
++	case MS_RSSI:
++		sb_i32(&b, monitor_threshold);
++		sb_str(&b, " dBm");
++		break;
++	case MS_FILTER: sb_str(&b, monitor_filter_name()); break;
++	default: break;
++	}
++}
++
++static void monitor_item(uint16_t i, ui_item_t *it)
++{
++	if (!monitor_active()) {
++		monitor_config_item(i, it);
++		return;
++	}
++	const radio_monitor_view_t *m = &ui_view()->monitor_scan;
++	sbuf_t b;
++	sb_init(&b, it->value, sizeof it->value);
++	const char *label;
++	switch (i) {
++	case MS_PAUSE:
++		label = m->state == MC_PAUSED || m->state == MC_HELD ? TR(MSCAN_CONTINUE, "Continue") : TR(MSCAN_PAUSE, "Pause");
++		break;
++	case MS_SKIP: label = TR(MSCAN_SKIP, "Skip frequency"); break;
++	case MS_SAVE:
++		label = m->state == MC_HELD && (m->mode == MC_UNKNOWN || m->mode == MC_CW) ?
++			TR(MSCAN_SAVE_FM, "Save as FM RX Only") : TR(MSCAN_SAVE, "Save RX Only");
++		if (m->state != MC_HELD)
++			it->flags |= UI_ITEM_DIM;
++		break;
++	case MS_STOP: label = TR(MSCAN_STOP, "Stop sweep"); break;
++	case MS_FREQ:
++		label = TR(APRS_LABEL_FREQUENCY, "Frequency");
++		sb_freq(&b, m->hz);
++		break;
++	case MS_SIGNAL:
++		label = "RSSI";
++		if (m->rssi_dbm >= -150 && m->rssi_dbm <= 0) {
++			sb_i32(&b, m->rssi_dbm);
++			sb_str(&b, " dBm");
++		}
++		break;
++	case MS_MODE:
++		label = TR(LABEL_MODE, "Mode");
++		sb_str(&b, monitor_mode(m->mode));
++		break;
++	case MS_CC:
++		label = "CC";
++		if (m->cc != UINT8_MAX)
++			sb_u32(&b, m->cc, 1);
++		break;
++	case MS_TS:
++		label = "TS";
++		if (m->ts != 0)
++			sb_u32(&b, m->ts, 1);
++		break;
++	case MS_TG:
++		label = "TG";
++		if (m->tg != UINT32_MAX)
++			sb_u32(&b, m->tg, 1);
++		break;
++	case MS_ID:
++		label = m->mode == MC_P25 ? "NAC" : m->mode == MC_YSF ? "DG-ID" :
++			m->mode == MC_M17 ? "CAN" : m->mode == MC_NXDN48 || m->mode == MC_NXDN96 ? "RAN" : "ID";
++		if (m->id != UINT16_MAX) {
++			if (m->mode == MC_P25)
++				sb_hex(&b, m->id, 3);
++			else
++				sb_u32(&b, m->id, 1);
++		}
++		break;
++	default:
++		label = TR(MSCAN_STATION, "Station");
++		sb_str(&b, m->source);
++		break;
++	}
++	str_copy(it->label, sizeof it->label, label);
++	if (i >= MS_FREQ)
++		it->flags |= UI_ITEM_DIM;
++	if (m->restore_fault && i != MS_STOP)
++		it->flags |= UI_ITEM_DIM;
++}
++
++static bool monitor_post_saved(uint16_t slot, const radio_monitor_view_t *m, channel_t *ch)
++{
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF || CONFIG_DSTAR
++	ui_air_conv_t air = {0};
++#endif
++	switch (m->mode) {
++	case MC_UNKNOWN:
++	case MC_CW:
++	case MC_FM: ch->mode = RADIO_MODE_FM; break;
++#if CONFIG_DMR
++	case MC_DMR:
++		ch->mode = RADIO_MODE_DMR;
++		ch->color_code = m->cc <= 15u ? m->cc : 1u;
++		ch->timeslot = m->ts == 2u ? 2u : 1u;
++		break;
++#endif
++#if CONFIG_P25
++	case MC_P25:
++		ch->mode = RADIO_MODE_P25;
++		air.p25.rx_nac = m->id <= 0xFFFu ? m->id : P25_NAC_ANY;
++		air.p25.tx_nac = P25_NAC_DEFAULT;
++		return ui_svc_write_channel_air_own(slot, ch, 0, &air);
++#endif
++#if CONFIG_NXDN
++	case MC_NXDN48:
++	case MC_NXDN96:
++		ch->mode = RADIO_MODE_NXDN;
++		air.nxdn.rate9600 = m->mode == MC_NXDN96;
++		air.nxdn.rx_ran = m->id <= 63u ? (uint8_t)m->id : NXDN_CP_TX_RAN_DEFAULT;
++		air.nxdn.tx_ran = NXDN_CP_TX_RAN_DEFAULT;
++		return ui_svc_write_channel_air_own(slot, ch, 0, &air);
++#endif
++#if CONFIG_YSF
++	case MC_YSF:
++		ch->mode = RADIO_MODE_YSF;
++		air.ysf.rx_dgid = m->id <= 99u ? (uint8_t)m->id : 0;
++		air.ysf.narrow = m->narrow;
++		strcpy(air.ysf.dest, YSF_CP_DEST_ALL);
++		return ui_svc_write_channel_air_own(slot, ch, 0, &air);
++#endif
++#if CONFIG_M17 && (CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF || CONFIG_DSTAR)
++	case MC_M17:
++		ch->mode = RADIO_MODE_M17;
++		air.m17.can = m->id <= 15u ? (uint8_t)m->id : 0;
++		strcpy(air.m17.dest, M17_DEST_ALL);
++		return ui_svc_write_channel_air_own(slot, ch, 0, &air);
++#endif
++#if CONFIG_DSTAR
++	case MC_DSTAR:
++		ch->mode = RADIO_MODE_DSTAR;
++		return ui_svc_write_channel_air_own(slot, ch, 0, &air);
++#endif
++	default: return false;
++	}
++	return ui_svc_write_channel(slot, ch, 0);
++}
++
++static void monitor_save(void)
++{
++	const radio_monitor_view_t *m = &ui_view()->monitor_scan;
++	if (m->state != MC_HELD)
++		return;
++	uint16_t slot = codeplug_free_channel();
++	if (slot == 0) {
++		ui_toast(TR(TOAST_NO_FREE_CHANNEL, "No free channel"));
++		return;
++	}
++	channel_t ch = { .rx_hz = m->hz, .tx_hz = m->hz, .rx_only = true, .bw = RADIO_BW_12K5,
++			 .power = CODEPLUG_POWER_DEFAULT, .system = CODEPLUG_SYSTEM_NONE };
++	sbuf_t b;
++	sb_init(&b, ch.name, sizeof ch.name);
++	sb_freq(&b, m->hz);
++#if CONFIG_DMR
++	if (m->tg != UINT32_MAX)
++		ch.contact = codeplug_contact_find_index(m->tg, true, NULL);
++#endif
++	if (monitor_post_saved(slot, m, &ch))
++		ui_toast(TR(MSCAN_SAVE_POSTED, "Saving RX-only channel"));
++	else
++		ui_toast(TR(TOAST_SAVE_FAILED, "Couldn't save: try again"));
++}
++
++static void monitor_select(uint16_t i, bool hold)
++{
++	(void)hold;
++	const radio_monitor_view_t *m = &ui_view()->monitor_scan;
++	if (monitor_active()) {
++		if (i == MS_STOP) {
++			radio_req_monitor_scan(RADIO_MONITOR_STOP);
++			ui_frame()->focus = 0;
++			ui_frame()->top = 0;
++		} else if (!m->restore_fault && i == MS_SAVE) {
++			monitor_save();
++		} else if (!m->restore_fault && i == MS_SKIP) {
++			radio_req_monitor_scan(RADIO_MONITOR_SKIP);
++		} else if (!m->restore_fault && i == MS_PAUSE) {
++			radio_req_monitor_scan(m->state == MC_PAUSED || m->state == MC_HELD ?
++				RADIO_MONITOR_RESUME : RADIO_MONITOR_PAUSE);
++		}
++		return;
++	}
++	if (i == MS_START) {
++		static const uint8_t filters[] = {
++#if CONFIG_CW
++			MC_BOTH | MC_MORSE,
++#else
++			MC_BOTH,
++#endif
++			MC_ANALOG, MC_DIGITAL, MC_MORSE,
++		};
++		const radio_view_t *v = ui_view();
++		bool idle = v->state == RS_IDLE && !v->hotspot && !v->scan && !radio_listen_band(v->ch.rx_hz);
++#if CONFIG_CW
++		idle = idle && !v->cw.active && !v->cw.preview && !v->cw.key_armed;
++#endif
++		if (!idle || monitor_lo == 0 || monitor_lo > monitor_hi ||
++		    !radio_req_monitor_scan_start(monitor_lo, monitor_hi, monitor_steps[monitor_step],
++						  monitor_threshold, filters[monitor_filter]))
++			ui_toast(TR(MSCAN_START_FAILED, "Sweep couldn't start"));
++		return;
++	}
++	monitor_edit = (uint8_t)i;
++	monitor_length = 0;
++	monitor_digits[0] = 0;
++	if (i == MS_LO || i == MS_HI)
++		ui_toast(TR(MSCAN_ENTER_FREQ, "Type MHz digits, then OK"));
++}
++
++static void monitor_adjust(int direction)
++{
++	switch (monitor_edit) {
++	case MS_BAND: {
++		uint8_t count = board_band_count();
++		uint8_t band = monitor_band;
++		for (uint8_t i = 0; i < count; ++i) {
++			band = (uint8_t)((band + count + direction) % count);
++			if (monitor_supported_band(band)) {
++				monitor_set_band(band);
++				break;
++			}
++		}
++		break;
++	}
++	case MS_STEP: {
++		const int count = sizeof monitor_steps / sizeof monitor_steps[0];
++		monitor_step = (uint8_t)((monitor_step + count + direction) % count);
++		break;
++	}
++	case MS_RSSI:
++		if (monitor_threshold + direction >= -120 && monitor_threshold + direction <= -30)
++			monitor_threshold = (int16_t)(monitor_threshold + direction);
++		break;
++	case MS_FILTER:
++		monitor_filter = (uint8_t)((monitor_filter + monitor_filter_count() + direction) % monitor_filter_count());
++		break;
++	default: break;
++	}
++}
++
++static bool monitor_key(const input_event_t *ev)
++{
++	if (monitor_edit == 0 || monitor_active())
++		return false;
++	bool frequency = monitor_edit == MS_LO || monitor_edit == MS_HI;
++	if (ev->gesture == GESTURE_PRESS && ev->action == ACT_BACK) {
++		monitor_edit = 0;
++		return true;
++	}
++	if (ev->gesture == GESTURE_PRESS && ev->action == ACT_SELECT) {
++		if (frequency && monitor_length) {
++			uint32_t value = ui_freq_entry_hz(monitor_digits, monitor_length);
++			if (value == 0)
++				return true;
++			if (monitor_band >= board_band_count() || !monitor_supported_band(monitor_band) || value < board.bands[monitor_band].lo_hz ||
++			    value > board.bands[monitor_band].hi_hz ||
++			    (monitor_edit == MS_LO ? value > monitor_hi : value < monitor_lo)) {
++				ui_toast(TR(MSCAN_WRONG_RANGE, "Frequency outside sweep band"));
++				return true;
++			}
++			if (monitor_edit == MS_LO)
++				monitor_lo = value;
++			else
++				monitor_hi = value;
++		}
++		monitor_edit = 0;
++		return true;
++	}
++	if (frequency && ev->gesture == GESTURE_PRESS && ev->action >= ACT_DIGIT_0 && ev->action <= ACT_DIGIT_9) {
++		ui_freq_entry_digit(monitor_digits, &monitor_length, (char)('0' + ev->action - ACT_DIGIT_0));
++		return true;
++	}
++	if (!frequency && (ev->gesture == GESTURE_PRESS || ev->gesture == GESTURE_REPEAT) &&
++	    (ev->action == ACT_NAV_UP || ev->action == ACT_NAV_DOWN)) {
++		monitor_adjust(ev->action == ACT_NAV_UP ? 1 : -1);
++		return true;
++	}
++	return false;
++}
++
++static const char *monitor_title(void)
++{
++	static char title[25];
++	const radio_monitor_view_t *m = &ui_view()->monitor_scan;
++	if (!monitor_active() || m->hz == 0)
++		return NULL;
++	sbuf_t b;
++	sb_init(&b, title, sizeof title);
++	sb_freq(&b, m->hz);
++	if (m->state == MC_HELD && m->mode != MC_UNKNOWN) {
++		sb_chr(&b, ' ');
++		sb_str(&b, monitor_mode(m->mode));
++	}
++	return title;
++}
++
++static void monitor_leave(void)
++{
++	radio_req_monitor_scan(RADIO_MONITOR_STOP);
++	monitor_edit = 0;
++}
++
++static const ui_scr_def_t monitor_scan_screen = {
++	.name = "monitor-scan", .flags = SF_LIST | SF_FIELD, .prefix = TRN(MSCAN_TITLE, "Monitor Scan"),
++	.hint = TRN(HINT_BACK, "Back"), .enter = monitor_enter, .leave = monitor_leave, .count = monitor_count,
++	.item = monitor_item, .title = monitor_title, .body = monitor_body, .select = monitor_select, .key = monitor_key,
++};
++#endif
++
++#if CONFIG_CW
++enum { MORSE_RX, MORSE_TEXT, MORSE_SPEED, MORSE_PITCH, MORSE_KEY, MORSE_CQ, MORSE_CALL, MORSE_73,
++#if CONFIG_CHANNEL_EDIT
++       MORSE_CUSTOM,
++#endif
++       MORSE_COUNT };
++static uint8_t morse_speed = 15;
++static uint16_t morse_pitch = 650;
++static uint8_t morse_edit = 0;
++
++static uint16_t morse_count(void) { return MORSE_COUNT; }
++
++static void morse_enter(void)
++{
++	morse_edit = 0;
++	const radio_view_t *v = ui_view();
++	if (v->cw.wpm >= 5 && v->cw.wpm <= 40)
++		morse_speed = v->cw.wpm;
++	if (v->cw.pitch_hz >= 400 && v->cw.pitch_hz <= 1000)
++		morse_pitch = v->cw.pitch_hz;
++}
++
++static const char *morse_body(void)
++{
++	if (ui_view()->cw.refused)
++		return TR(MORSE_TOOL_REFUSED, "Need idle narrow FM for RX");
++	if (ui_view()->cw.key_armed)
++		return TR(MORSE_TOOL_KEY_HINT, "Hold Monitor for local tone");
++	if (ui_view()->cw.preview)
++		return TR(MORSE_TOOL_LOCAL, "Local playback only");
++	return TR(MORSE_TOOL_ENVELOPE, "RSSI envelope RX");
++}
++
++static void morse_item(uint16_t i, ui_item_t *it)
++{
++	static const tr_id_t labels[] = {
++		TRN(MORSE_TOOL_RX, "Decode Morse"),
++		TRN(MORSE_TOOL_TEXT, "Decoded text"),
++		TRN(MORSE_TOOL_SPEED, "Speed"),
++		TRN(MORSE_TOOL_PITCH, "Sidetone"),
++		TRN(MORSE_TOOL_KEY, "Practice key"),
++		TRN(MORSE_TOOL_CQ, "Play CQ"),
++		TRN(MORSE_TOOL_CALL, "Play callsign"),
++		TRN(MORSE_TOOL_73, "Play 73"),
++#if CONFIG_CHANNEL_EDIT
++		TRN(MORSE_TOOL_CUSTOM, "Play message"),
++#endif
++	};
++	str_copy(it->label, sizeof it->label, tr(labels[i]));
++	sbuf_t b;
++	sb_init(&b, it->value, sizeof it->value);
++	switch (i) {
++	case MORSE_RX:
++		sb_str(&b, ui_view()->cw.active ? TR(VALUE_ON, "On") : TR(VALUE_OFF, "Off"));
++		break;
++	case MORSE_TEXT:
++		sb_str(&b, ui_view()->cw.text);
++		it->flags |= UI_ITEM_DIM;
++		break;
++	case MORSE_SPEED:
++		sb_u32(&b, morse_speed, 1);
++		sb_str(&b, " WPM");
++		break;
++	case MORSE_KEY:
++		sb_str(&b, ui_view()->cw.key_armed ? TR(VALUE_ON, "On") : TR(VALUE_OFF, "Off"));
++		if (!ui_has_action(ACT_MONITOR))
++			it->flags |= UI_ITEM_DIM;
++		break;
++	case MORSE_PITCH:
++		sb_u32(&b, morse_pitch, 1);
++		sb_str(&b, " Hz");
++		break;
++	default: break;
++	}
++	if (morse_edit == i && (i == MORSE_SPEED || i == MORSE_PITCH))
++		it->flags |= UI_ITEM_EDIT;
++}
++
++#if CONFIG_CHANNEL_EDIT
++static char morse_message[CODEPLUG_NAME_LEN + 1u];
++
++static void morse_play_text(void)
++{
++	if (*morse_message != '\0' &&
++	    !radio_req_cw_text(morse_message, (uint8_t)strlen(morse_message), morse_speed, morse_pitch))
++		ui_toast(TR(MORSE_TOOL_PLAY_FAILED, "Couldn't play Morse message"));
++}
++#endif
++
++static void morse_select(uint16_t i, bool hold)
++{
++	(void)hold;
++	switch (i) {
++	case MORSE_RX:
++		radio_req_cw(ui_view()->cw.active ? CW_RX_STOP : CW_RX_START, morse_speed, morse_pitch);
++		break;
++	case MORSE_SPEED:
++	case MORSE_PITCH: morse_edit = (uint8_t)i; break;
++	case MORSE_KEY:
++		if (ui_has_action(ACT_MONITOR))
++			radio_req_cw(CW_KEY_ARM, morse_speed, morse_pitch);
++		break;
++	case MORSE_CQ: radio_req_cw(CW_PREVIEW_CQ, morse_speed, morse_pitch); break;
++	case MORSE_CALL: radio_req_cw(CW_PREVIEW_CALL, morse_speed, morse_pitch); break;
++	case MORSE_73: radio_req_cw(CW_PREVIEW_73, morse_speed, morse_pitch); break;
++#if CONFIG_CHANNEL_EDIT
++	case MORSE_CUSTOM: ui_menu_text_open(morse_message, CODEPLUG_NAME_LEN, morse_play_text); break;
++#endif
++	default: break;
++	}
++}
++
++static bool morse_key(const input_event_t *ev)
++{
++	if (morse_edit == 0)
++		return false;
++	if (ev->gesture == GESTURE_PRESS && ev->action == ACT_BACK) {
++		morse_enter();
++		return true;
++	}
++	if (ev->gesture == GESTURE_PRESS && ev->action == ACT_SELECT) {
++		radio_req_cw(CW_CONFIG, morse_speed, morse_pitch);
++		morse_edit = 0;
++		return true;
++	}
++	if (ev->gesture != GESTURE_PRESS && ev->gesture != GESTURE_REPEAT && ev->action != ACT_ENC_STEP)
++		return false;
++	int dir = ev->action == ACT_NAV_UP ? 1 : ev->action == ACT_NAV_DOWN ? -1 :
++		ev->action == ACT_ENC_STEP ? ev->value : 0;
++	if (dir == 0)
++		return false;
++	if (morse_edit == MORSE_SPEED) {
++		int speed = morse_speed + dir;
++		morse_speed = (uint8_t)(speed < 5 ? 5 : speed > 40 ? 40 : speed);
++	} else {
++		int pitch = morse_pitch + dir * 25;
++		morse_pitch = (uint16_t)(pitch < 400 ? 400 : pitch > 1000 ? 1000 : pitch);
++	}
++	return true;
++}
++
++static void morse_leave(void) { radio_req_cw(CW_CANCEL, morse_speed, morse_pitch); }
++
++static const ui_scr_def_t morse_screen = {
++	.name = "morse", .flags = SF_LIST | SF_FIELD, .prefix = TRN(MORSE_TOOL_TITLE, "Morse"),
++	.hint = TRN(HINT_BACK, "Back"), .body = morse_body, .count = morse_count, .item = morse_item,
++	.select = morse_select, .key = morse_key, .enter = morse_enter, .leave = morse_leave,
++};
++#endif
++
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++static uint16_t signal_tools_count(void)
++{
++#if CONFIG_MONITOR_SCAN && CONFIG_CW
++	return 2;
++#else
++	return 1;
++#endif
++}
++
++static void signal_tools_item(uint16_t i, ui_item_t *it)
++{
++#if CONFIG_MONITOR_SCAN
++	if (i == 0) {
++		str_copy(it->label, sizeof it->label, TR(MSCAN_TITLE, "Monitor Scan"));
++		return;
++	}
++#endif
++#if CONFIG_CW
++	str_copy(it->label, sizeof it->label, TR(MORSE_TOOL_TITLE, "Morse"));
++#endif
++}
++
++static void signal_tools_select(uint16_t i, bool hold)
++{
++	(void)hold;
++#if CONFIG_MONITOR_SCAN
++	if (i == 0) {
++		ui_push(SCR_MONITOR_SCAN, 0);
++		return;
++	}
++#endif
++#if CONFIG_CW
++	ui_push(SCR_MORSE, 0);
++#endif
++}
++
++static const ui_scr_def_t signal_tools_screen = {
++	.name = "signal-tools", .flags = SF_LIST | SF_FIELD, .prefix = TRN(SIGNAL_TOOLS_TITLE, "Signal tools"),
++	.hint = TRN(HINT_BACK, "Back"), .count = signal_tools_count, .item = signal_tools_item,
++	.select = signal_tools_select,
++};
++#endif
++
+ #if CONFIG_TONE_SCAN
+ static uint16_t tone_scan_count(void) { return 3; }
+ 
+@@ -8922,6 +9591,15 @@ const ui_scr_def_t *const ui_scr[SCR_COUNT] = {
+ #if CONFIG_RSSI_GRAPH
+ 	[SCR_RSSI_GRAPH] = &ui_rssi_graph_screen,
+ #endif
++#if CONFIG_MONITOR_SCAN
++	[SCR_MONITOR_SCAN] = &monitor_scan_screen,
++#endif
++#if CONFIG_CW
++	[SCR_MORSE] = &morse_screen,
++#endif
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++	[SCR_SIGNAL_TOOLS] = &signal_tools_screen,
++#endif
+ #endif
+ #if CONFIG_CRASH_SCREEN
+ 	[SCR_CRASH] = &crash_screen,
+diff --git a/core/ui/ui_nav.h b/core/ui/ui_nav.h
+index 9be6f5254b3fa12dd871691ec87ca6df2f67beeb..62bc744086d8243e2181d07808b8cfd2a2a2215a 100644
+--- a/core/ui/ui_nav.h
++++ b/core/ui/ui_nav.h
+@@ -55,6 +55,15 @@ typedef enum {
+ #endif
+ #if CONFIG_RSSI_GRAPH
+ 	SCR_RSSI_GRAPH,
++#endif
++#if CONFIG_MONITOR_SCAN
++	SCR_MONITOR_SCAN,
++#endif
++#if CONFIG_CW
++	SCR_MORSE,
++#endif
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++	SCR_SIGNAL_TOOLS,
+ #endif
+ 	SCR_COUNT
+ } ui_scr_t;
+@@ -119,7 +128,7 @@ typedef struct {
+ 	bool (*key)(const input_event_t *ev);		// screen keys before the list's own (true: used)
+ 	void (*draw)(void);				// own drawing instead of the list
+ 	void (*enter)(void);				// on push
+-#if CONFIG_BACKLIGHT_TEST || CONFIG_TONE_SCAN
++#if CONFIG_BACKLIGHT_TEST || CONFIG_TONE_SCAN || CONFIG_MONITOR_SCAN || CONFIG_CW
+ 	void (*leave)(void);				// on leaving the stack (BACK, Home, replaced)
+ #endif
+ 	const ui_filter_def_t *filter;			// SF_FILTER: the rows before filtering (NULL: not a filtered list)
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index ceadbe3954101395bb5d9a36e22719cf822d8d1e..1d6f0cb9ea9619a05058d537732aa8f4cb96df8a 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -4787,6 +4787,17 @@ static const char *quick_split_hint(const radio_view_t *v, const ui_state_t *s,
+ 	return buf;
+ }
+ 
++static bool quick_signal_hint(const radio_view_t *v, const ui_state_t *s)
++{
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++	return v->vfo && !s->quick_edit;
++#else
++	(void)v;
++	(void)s;
++	return false;
++#endif
++}
++
+ // 128x64: a numbered list with the same numbers (wireframe 128x64). The list and the tiles each have their own
+ // frame, so the list's deep draw doesn't sit on the tiles' (the ui task's stack is tight)
+ static void __attribute__((noinline)) draw_quick_list(const radio_view_t *v, const ui_state_t *s)
+@@ -4800,6 +4811,9 @@ static void __attribute__((noinline)) draw_quick_list(const radio_view_t *v, con
+ 	ui_list_t l = { TR(QUICK_TITLE, "Quick"), v->vfo ? "VFO" : v->ch.name, NULL, NULL, UI_QUICK_TILES,
+ 		quick_list_focus, &top,
+ 			quick_list_item, NULL, split_hint != NULL ? split_hint :
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++				quick_signal_hint(v, s) ? TR(SIGNAL_TOOLS_HINT, "# Signal tools") :
++#endif
+ 				TR(QUICK_HINT, "1-9 change  Hold OK save"), false };
+ 	ui_draw_list(v, s, &l);
+ }
+@@ -4816,7 +4830,7 @@ static void __attribute__((noinline)) draw_quick_tiles(const radio_view_t *v, co
+ 	// Title row keeps the state pill (P2)
+ 	int top = ui_draw_top(v, s, TR(QUICK_TITLE, "Quick"), name);
+ 	int bottom = h;
+-	if (s->toast != NULL || split_hint != NULL || h >= UI_TALL_PX)
++	if (s->toast != NULL || split_hint != NULL || h >= UI_TALL_PX || quick_signal_hint(v, s))
+ 		bottom = L->hint_y;
+ 	int gh = bottom - top;
+ 	const font_t *lf = L->small;
+@@ -4881,6 +4895,10 @@ static void __attribute__((noinline)) draw_quick_tiles(const radio_view_t *v, co
+ 		ui_draw_hint(s->toast, true);
+ 	else if (split_hint != NULL)
+ 		ui_draw_hint(quick_split_hint(v, s, label, sizeof label), false);	// the tiles used label
++#if CONFIG_MONITOR_SCAN || CONFIG_CW
++	else if (quick_signal_hint(v, s))
++		ui_draw_hint(TR(SIGNAL_TOOLS_HINT, "# Signal tools"), false);
++#endif
+ 	else if (h >= UI_TALL_PX)
+ 		ui_draw_hint(TR(QUICK_HINT_ALL_SETTINGS, "0 All settings  Hold OK save"), false);
+ }
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 5b32768990f8c62f80f7a00111ca1c2dd486a834..ac1bce6a11c85704ca2d05e7e74df9b09d0f5712 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -804,6 +804,11 @@ UIDEPS  := $(UIAPP) $(ABOUT_H) $(LANG_H) $(wildcard $(CORE)/ui/*.h $(CORE)/ui/fo
+ uiFlowTest: UIFLAGS += -DCONFIG_M17=1
+ TESTS   += uiFlowTest uiFlowTestNoColor uiFlowTestNxdnScrambler uiSim
+ 
++# Explicit target: built after the optional radio API patches are loaded, without RF hardware.
++uiSignalToolsTest: uiSignalToolsTest.c $(UIDEPS)
++	$(CC) $(UIFLAGS) -DCONFIG_MONITOR_SCAN=1 -DCONFIG_CW=1 -DCONFIG_P25=1 -DCONFIG_NXDN=1 -DCONFIG_YSF=1 \
++		-o $@ uiSignalToolsTest.c $(UIAPP) -lz -lm
++
+ TESTS += uiFlowTestReplay
+ uiFlowTestReplay: uiFlowTest.c $(UIDEPS)
+ 	$(CC) $(UIFLAGS) -DCONFIG_P25=1 -DCONFIG_P25_TRUNK=1 -DCONFIG_NXDN=1 -DCONFIG_YSF=1 -DCONFIG_DMR_REPLAY=1 -o $@ uiFlowTest.c $(UIAPP) -lz -lm
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 5c5561837179d8b9049dc84be2a4dd2c27db0099..2a9b269d9c5e6d31837d86d3b26df911f68e0e40 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -818,6 +818,13 @@ bool ui_svc_write_channel_air(uint16_t number, const channel_t *ch, uint16_t fro
+ 	return true;
+ }
+ 
++#if CONFIG_MONITOR_SCAN
++bool ui_svc_write_channel_air_own(uint16_t number, const channel_t *ch, uint16_t from, const ui_air_conv_t *conv)
++{
++	return ui_svc_write_channel_air(number, ch, from, conv);
++}
++#endif
++
+ // The block saved with channel number, NULL: none
+ static const ui_air_conv_t *sim_air(uint16_t number)
+ {
+@@ -1256,6 +1263,9 @@ bool codeplug_contacts_each(codeplug_contact_fn fn, void *ctx)
+ 
+ uint16_t codeplug_contact_find_index(uint32_t id, bool group, contact_t *out)
+ {
++	contact_t c;
++	if (out == NULL)
++		out = &c;
+ 	for (uint16_t i = 1; id != 0 && i <= CODEPLUG_CONTACTS_MAX; i++) {
+ 		if (codeplug_contact(i, out) && out->id == id && (out->type != CONTACT_PRIVATE) == group)
+ 			return i;
+@@ -1665,8 +1675,90 @@ uint8_t ui_svc_vfo_copy(const radio_view_t *v)
+ 	sim_vfo(true);
+ 	return VFO_COPY_OK;
+ }
++#if CONFIG_MONITOR_SCAN
++static uint32_t sim_monitor_hi, sim_monitor_step;
++
++bool radio_req_monitor_scan_start(uint32_t lo, uint32_t hi, uint32_t step, int16_t threshold, uint8_t filter)
++{
++	if (lo > hi || step == 0 || !filter || threshold < -150 || threshold > -30 || view.state == RS_TX || view.scan)
++		return false;
++	view.monitor_scan = (radio_monitor_view_t){
++		.hz = lo, .state = MC_LISTEN, .rssi_dbm = -160,
++		.id = UINT16_MAX, .tg = UINT32_MAX, .cc = UINT8_MAX,
++	};
++	sim_monitor_hi = hi;
++	sim_monitor_step = step;
++	changed();
++	return true;
++}
++
++void radio_req_monitor_scan(uint8_t command)
++{
++	radio_monitor_view_t *m = &view.monitor_scan;
++	if (m->state == MC_OFF)
++		return;
++	switch (command) {
++	case RADIO_MONITOR_STOP: m->state = MC_OFF; break;
++	case RADIO_MONITOR_PAUSE: m->state = MC_PAUSED; break;
++	case RADIO_MONITOR_SKIP:
++	case RADIO_MONITOR_RESUME:
++		m->state = MC_LISTEN;
++		m->mode = MC_UNKNOWN;
++		m->hz = sim_monitor_hi - m->hz >= sim_monitor_step ? m->hz + sim_monitor_step : sim_monitor_hi;
++		break;
++	default: break;
++	}
++	changed();
++}
++#endif
++
++#if CONFIG_CW
++void radio_req_cw(uint8_t command, uint8_t wpm, uint16_t pitch)
++{
++	view.cw.wpm = wpm;
++	view.cw.pitch_hz = pitch;
++	switch (command) {
++	case CW_RX_START:
++		view.cw.refused = view.ch.mode != RADIO_MODE_FM || view.ch.bw != RADIO_BW_12K5;
++		view.cw.active = !view.cw.refused;
++		break;
++	case CW_CANCEL:
++		view.cw.key_armed = view.cw.preview = false;
++		/* fall through */
++	case CW_RX_STOP: view.cw.refused = view.cw.active = false; break;
++	case CW_PREVIEW_CQ:
++	case CW_PREVIEW_CALL:
++	case CW_PREVIEW_73:
++	case CW_PREVIEW_TEXT: view.cw.preview = true; break;
++	case CW_KEY_ARM: view.cw.key_armed = !view.cw.key_armed; break;
++	case CW_KEY_DOWN: view.cw.preview = view.cw.key_armed; break;
++	case CW_KEY_UP: view.cw.preview = false; break;
++	default: break;
++	}
++	changed();
++}
++
++bool radio_req_cw_text(const char *text, uint8_t len, uint8_t wpm, uint16_t pitch)
++{
++	if (!text || !len)
++		return false;
++	radio_req_cw(CW_PREVIEW_TEXT, wpm, pitch);
++	return true;
++}
++#endif
++
+ void radio_req_monitor(bool down)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (view.monitor_scan.state != MC_OFF)
++		return;
++#endif
++#if CONFIG_CW
++	if (view.cw.key_armed) {
++		radio_req_cw(down ? CW_KEY_DOWN : CW_KEY_UP, view.cw.wpm, view.cw.pitch_hz);
++		return;
++	}
++#endif
+ 	to_selected();
+ 	// As the radio core (#19): on DMR, P25 and NXDN a short press toggles digital monitor on its release; FM holds it open
+ 	if ((view.ch.mode == RADIO_MODE_DMR || view.ch.mode == RADIO_MODE_P25 || view.ch.mode == RADIO_MODE_NXDN) &&
+@@ -1758,6 +1850,10 @@ void radio_req_reply_cancel(void) { view.dmr.reply_active = false; reply_until =
+ 
+ static void ptt(bool down)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (view.monitor_scan.state != MC_OFF)
++		return;
++#endif
+ 	if (down) {
+ 		to_selected();	// the radio core transmits on the selected channel
+ 		if (view.bcast || view.ch.rx_only) {
+@@ -3256,6 +3352,33 @@ static bool run_token(char *t, char *err, size_t len)
+ 		advance(ms + TICK_MS);
+ 		return true;
+ 	}
++#if CONFIG_MONITOR_SCAN
++	if (strcmp(t, "monhit") == 0 && arg != NULL) {
++		radio_monitor_view_t *m = &view.monitor_scan;
++		if (m->state == MC_OFF || strtoul(arg, NULL, 10) != m->hz)
++			return false;
++		m->state = MC_HELD;
++		m->mode = MC_DMR;
++		m->rssi_dbm = -56;
++		m->tg = 3100;
++		m->cc = 0;
++		m->ts = 2;
++		changed();
++		advance(100);
++		return true;
++	}
++#endif
++#if CONFIG_CW
++	if (strcmp(t, "cwdecoded") == 0 && arg != NULL) {
++		if (!view.cw.active)
++			return false;
++		strncpy(view.cw.text, arg, sizeof view.cw.text - 1u);
++		view.cw.text[sizeof view.cw.text - 1u] = 0;
++		changed();
++		advance(100);
++		return true;
++	}
++#endif
+ 	if (strcmp(t, "pttdown") == 0) {	// PTT held until pttup (for a look at the TX screen)
+ 		presses++;
+ 		input_event_t ev = { ACT_PTT, GESTURE_DOWN, 0, false };
+diff --git a/tests/host/uiSignalToolsTest.c b/tests/host/uiSignalToolsTest.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..851105352780357af57683953d9d5a40938cb73f
+--- /dev/null
++++ b/tests/host/uiSignalToolsTest.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include <stdio.h>
++#include "sim/ui_sim.h"
++#include "radio/monitor_cw.h"
++
++static unsigned failures;
++
++#define CHECK(condition) do { \
++	if (!(condition)) { \
++		fprintf(stderr, "line %u: %s\n", __LINE__, #condition); \
++		++failures; \
++	} \
++} while (0)
++
++static bool run(const char *script)
++{
++	char message[160];
++	if (sim_run(script, message, sizeof message))
++		return true;
++	fprintf(stderr, "script %s: %s\n", script, message);
++	++failures;
++	return false;
++}
++
++static void monitor_test(const sim_geom_t *screen)
++{
++	sim_reset(screen, SIM_MAP_K);
++	const uint32_t previous = sim_view()->ch.rx_hz;
++	if (!run("vfokey quick ctx expect:screen=signal-tools ok expect:screen=monitor-scan"))
++		return;
++	if (!run("down down ok 1 4 4 ok up up ok wait:200"))
++		return;
++	CHECK(sim_view()->monitor_scan.hz == 144000000 && sim_view()->monitor_scan.state == MC_LISTEN);
++	CHECK(run("ptt ok"));
++	CHECK(sim_rec.tx_count == 0 && sim_view()->monitor_scan.state == MC_PAUSED);
++	CHECK(run("ok monhit:144012500 wait:200"));
++	CHECK(sim_view()->monitor_scan.state == MC_HELD);
++	CHECK(run("down down ok"));
++	channel_t saved;
++	CHECK(sim_rec.codeplug_writes == 1);
++	CHECK(codeplug_channel(41, &saved) && saved.rx_only && saved.rx_hz == 144012500 &&
++	      saved.rx_hz == saved.tx_hz && saved.color_code == 0 && saved.timeslot == 2);
++	CHECK(run("up ok wait:200"));
++	CHECK(sim_view()->monitor_scan.hz == 144025000 && sim_view()->monitor_scan.state == MC_LISTEN);
++	CHECK(run("long:back expect:screen=home"));
++	CHECK(sim_view()->monitor_scan.state == MC_OFF);
++	// The scanner's temporary hit is separate from the selected VFO/zone.
++	CHECK(sim_view()->ch.rx_hz != saved.rx_hz && previous != saved.rx_hz);
++}
++
++static void morse_test(const sim_geom_t *screen)
++{
++	sim_reset(screen, SIM_MAP_K);
++	if (!run("vfokey dlmode:fm quick 8 ctx expect:screen=signal-tools down ok expect:screen=morse"))
++		return;
++	CHECK(run("ok cwdecoded:CQ wait:200"));
++	CHECK(sim_view()->cw.active);
++	CHECK(run("down down ok up ok down ok up ok"));
++	CHECK(sim_view()->cw.wpm == 16 && sim_view()->cw.pitch_hz == 675);
++	CHECK(run("down ok mon"));
++	CHECK(sim_view()->cw.key_armed && !sim_view()->cw.preview && sim_rec.tx_count == 0);
++	CHECK(run("down ok wait:200"));
++	CHECK(sim_view()->cw.preview && sim_rec.tx_count == 0);
++	CHECK(run("long:back expect:screen=home"));
++	CHECK(!sim_view()->cw.active && !sim_view()->cw.preview && !sim_view()->cw.key_armed);
++}
++
++int main(void)
++{
++	const sim_geom_t *screen = sim_geom_find("160x128");
++	if (screen == NULL)
++		return 1;
++	monitor_test(screen);
++	morse_test(screen);
++	if (failures)
++		return 1;
++	puts("Monitor Scan and Morse UI flows passed");
++	return 0;
++}
+diff --git a/tools/i18n.py b/tools/i18n.py
+index 2d083e41cba49fab2de54e78b6a585ea8d77aaa2..3c67a4307e30c0b4733b943610092c07289f0574 100755
+--- a/tools/i18n.py
++++ b/tools/i18n.py
+@@ -733,13 +733,15 @@ def string_table(strings):
+     return bytes(blob), offs
+ 
+ 
+-def tables(found=None):
++def tables(found=None, omit=()):
+     """What core/ui/i18n.c reads. Every key has a number: 0 none, then the keys the catalogs translate (TR, TRN), by
+     name, then the TRX ones, by name. The English table has every key's text; each language the translated keys', ""
+     where it has none (or the English itself). Flash per string: the text and its NUL per language, plus 2 bytes per
+     LANG_STRIDE strings. Returns (ids {key: number}, translated (the first TRX number), english (text, offsets),
+     [(code, name, name in this build, latin name, switch, {number: translation}, text, offsets, wide)])"""
+     source, trx = extract(found)
++    source = [entry for entry in source if not entry[0].startswith(omit)]
++    trx = [(key, text) for key, text in trx if not key.startswith(omit)]
+     english = {k: t for k, t, _ in source}
+     english.update(trx)
+     order = [None] + sorted(k for k, _, _ in source) + sorted(k for k, _ in trx)
+@@ -836,9 +838,9 @@ def write_if_changed(path, text):
+ KEYS_HEADER = "tr_keys.h"
+ 
+ 
+-def generate(out_path, found=None):
++def generate(out_path, found=None, omit=()):
+     """OUT.h: the tables core/ui/i18n.c includes; tr_keys.h beside it: the keys' numbers, which i18n.h includes"""
+-    ids, translated, english, built = tables(found)
++    ids, translated, english, built = tables(found, omit)
+     keys = ["// Generated by tools/i18n.py from the marks in core/; do not edit",
+             "// A key's number (i18n.h): the ones the catalogs translate, then the TRX ones",
+             "#ifndef TR_KEYS_H", "#define TR_KEYS_H", "", "enum {"]
+@@ -907,8 +909,14 @@ def generate(out_path, found=None):
+ def main():
+     args = sys.argv[1:]
+     try:
+-        if args[:1] == ["--gen"] and len(args) == 2:
+-            generate(args[1])
++        if args[:1] == ["--gen"] and len(args) >= 2:
++            optional = {"--without-monitor-scan": "MSCAN_", "--without-cw": "MORSE_TOOL_"}
++            if set(args[2:]) - optional.keys():
++                raise I18nError("unknown generator option: %s" % " ".join(args[2:]))
++            omit = [optional[flag] for flag in args[2:]]
++            if len(set(omit)) == len(optional):
++                omit.append("SIGNAL_TOOLS_")
++            generate(args[1], omit=tuple(omit))
+             return 0
+         if args[:1] == ["--new"] and len(args) in (3, 4):
+             code, name = args[1], args[2]

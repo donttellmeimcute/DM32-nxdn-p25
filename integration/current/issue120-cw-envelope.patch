@@ -1,0 +1,936 @@
+diff --git a/core/radio/beep.c b/core/radio/beep.c
+index 793e739..6dbcf2c 100644
+--- a/core/radio/beep.c
++++ b/core/radio/beep.c
+@@ -2,8 +2,11 @@
+ // Copyright (c) 2026 The RadioFoundry Authors
+ // Beeps and alert tones (beep.h)
+ #include <string.h>
+-#include "radio/beep.h"
+ #include "config.h"
++#include "radio/beep.h"
++#if CONFIG_CW
++#include "radio/morse.h"
++#endif
+ 
+ #if CONFIG_BEEP
+ 
+@@ -92,6 +95,21 @@ static const int16_t beep_sine[64] = {
+ static const hal_audio_t *aud;
+ static beep_stats_t stats;
+ 
++#if CONFIG_CW
++#define BEEP_MORSE ((beep_t)(BEEP_COUNT + 1u))
++#define MORSE_MANUAL_MAX_MS 2000u
++static struct {
++	morse_t sequence;
++	uint16_t pitch;
++} cw_req[2];
++static uint8_t cw_slot, cw_next;
++static morse_t cw_sequence;
++static beep_seg_t cw_segment;
++static uint16_t cw_pitch;
++static int32_t cw_amp;
++static bool cw_manual;
++#endif
++
+ #if CONFIG_SIG_TONES
+ // Custom patterns (BEEP_CUSTOM): two copies, alternating
+ static beep_seg_t cust[2][BEEP_CUSTOM_MAX];
+@@ -186,7 +204,11 @@ bool beep_streaming(void)
+ 
+ void beep_play(beep_t b, uint8_t level, bool shared)
+ {
+-	if (b <= BEEP_NONE || (b >= BEEP_COUNT && (!CONFIG_SIG_TONES || b != BEEP_CUSTOM)) || level == 0) {
++	bool custom = CONFIG_SIG_TONES && b == BEEP_CUSTOM;
++#if CONFIG_CW
++	custom = custom || b == BEEP_MORSE;
++#endif
++	if (b <= BEEP_NONE || (b >= BEEP_COUNT && !custom) || level == 0) {
+ 		return;
+ 	}
+ 	stats.last = (uint8_t)b;
+@@ -253,6 +275,35 @@ void beep_play_custom(const beep_seg_t *segs, uint8_t n, uint8_t level, bool sha
+ }
+ #endif
+ 
++#if CONFIG_CW
++void beep_morse(const char *text, uint8_t len, uint8_t wpm, uint16_t pitch_hz, uint8_t level)
++{
++	if (text == NULL || pitch_hz < 400u || pitch_hz > 1000u ||
++	    wpm < MORSE_WPM_MIN || wpm > MORSE_WPM_MAX || level == 0)
++		return;
++	uint8_t slot = cw_next;
++	cw_next ^= 1u;
++	// The manual key's empty text still uses the same request and audio generation counters.
++	morse_start(&cw_req[slot].sequence, text, len, wpm, 0);
++	cw_req[slot].pitch = pitch_hz;
++	cw_slot = slot;
++	beep_play(BEEP_MORSE, level, false);
++}
++
++bool beep_morse_busy(void)
++{
++	return req_pattern == BEEP_MORSE && beep_busy();
++}
++
++void beep_morse_cancel(void)
++{
++	if (req_pattern == BEEP_MORSE) {
++		req_pattern = BEEP_NONE;
++		STORE(req_seq, (uint8_t)(req_seq + 1u));
++	}
++}
++#endif
++
+ void beep_service(bool shared, uint32_t now_ms)
+ {
+ 	last_now = now_ms;
+@@ -378,6 +429,16 @@ static bool tone_mix(int16_t *spk)
+ 		cb_pattern = req_pattern;
+ 		const beep_seg_t *segs;
+ 		uint8_t count;
++#if CONFIG_CW
++		if (cb_pattern == BEEP_MORSE) {
++			cw_sequence = cw_req[cw_slot].sequence;
++			cw_pitch = cw_req[cw_slot].pitch;
++			cw_manual = cw_sequence.len == 0;
++			cw_amp = (int32_t)req_level * AMP_PER_LEVEL;
++			segs = NULL;
++			count = 0;
++		} else
++#endif
+ #if CONFIG_SIG_TONES
+ 		if (cb_pattern == BEEP_CUSTOM) {
+ 			segs = cust[req_slot];
+@@ -401,6 +462,22 @@ static bool tone_mix(int16_t *spk)
+ 	stats.blocks++;
+ 	for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+ 		int32_t v;
++#if CONFIG_CW
++		if (cb_pattern == BEEP_MORSE && !beep_gen_more(&cb_gen)) {
++			bool key;
++			uint8_t units;
++			if (cw_manual) {
++				cw_manual = false;
++				cw_segment = (beep_seg_t){ cw_pitch, MORSE_MANUAL_MAX_MS };
++			} else if (morse_preview_next(&cw_sequence, &key, &units)) {
++				cw_segment = (beep_seg_t){ key ? cw_pitch : 0, (uint16_t)(units * cw_sequence.dot_ms) };
++			} else {
++				cb_active = false;
++				return true;
++			}
++			beep_gen_start(&cb_gen, &cw_segment, 1, cw_amp);
++		}
++#endif
+ 		if (!beep_gen_next(&cb_gen, &v)) {
+ 			cb_active = false;
+ 			return true;	// the rest of this block is left as it was
+@@ -408,7 +485,11 @@ static bool tone_mix(int16_t *spk)
+ 		int32_t out = spk[i] + v;
+ 		spk[i] = (int16_t)(out > 32767 ? 32767 : out < -32768 ? -32768 : out);
+ 	}
+-	if (!beep_gen_more(&cb_gen)) {
++	if (
++#if CONFIG_CW
++	    cb_pattern != BEEP_MORSE &&
++#endif
++	    !beep_gen_more(&cb_gen)) {
+ 		cb_active = false;	// ended exactly at the block's end
+ 	}
+ 	return true;
+diff --git a/core/radio/beep.h b/core/radio/beep.h
+index 5f64cca..024adf5 100644
+--- a/core/radio/beep.h
++++ b/core/radio/beep.h
+@@ -91,6 +91,12 @@ void beep_play(beep_t b, uint8_t level, bool shared);
+ // so the caller's array may go. Two copies alternate: a pattern still playing is not rewritten under the audio side.
+ // Built with CONFIG_SIG_TONES only
+ void beep_play_custom(const beep_seg_t *segs, uint8_t n, uint8_t level, bool shared);
++#if CONFIG_CW
++// Only local PCM. A zero-length message is a straight key with a two-second watchdog.
++void beep_morse(const char *text, uint8_t len, uint8_t wpm, uint16_t pitch_hz, uint8_t level);
++bool beep_morse_busy(void);
++void beep_morse_cancel(void);
++#endif
+ // Every radio poll: stop the beep's own stream once the pattern is over (shared: the voice stream took over), and
+ // let the amplifier go once its hang has run out
+ void beep_service(bool shared, uint32_t now_ms);
+diff --git a/core/radio/cw_rx.c b/core/radio/cw_rx.c
+new file mode 100644
+index 0000000..c04d3d1
+--- /dev/null
++++ b/core/radio/cw_rx.c
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#include "radio/cw_rx.h"
++#include "radio/morse.h"
++
++#define RSSI_HYSTERESIS_DB 6
++
++bool cw_rx_init(struct cw_rx *rx, unsigned wpm, int16_t threshold_dbm)
++{
++	*rx = (struct cw_rx){ 0 };
++	if (wpm < MORSE_WPM_MIN || wpm > MORSE_WPM_MAX || threshold_dbm < -150 || threshold_dbm > -30)
++		return false;
++	rx->dot_ms = morse_dot_ms((uint8_t)wpm);
++	rx->threshold_dbm = threshold_dbm;
++	rx->code = 1;
++	return true;
++}
++
++static void reset_letter(struct cw_rx *rx)
++{
++	rx->code = 1;
++	rx->marks = 0;
++	rx->letters = 0;
++	rx->word_pending = false;
++}
++
++static char letter(uint8_t code)
++{
++	static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-=?.,";
++	for (unsigned i = 0; alphabet[i] != '\0'; i++) {
++		if (morse_code(alphabet[i]) == code)
++			return alphabet[i];
++	}
++	return 0;
++}
++
++static char idle(struct cw_rx *rx, uint32_t units)
++{
++	if (rx->code > 1 && units >= 25u) {
++		uint8_t code = rx->code;
++		char c = letter(code);
++		rx->code = 1;
++		if (c == 0) {
++			reset_letter(rx);
++		} else {
++			if (rx->letters < UINT8_MAX)
++				rx->letters++;
++			uint8_t marks = 0;
++			for (; code > 1; code >>= 1)
++				marks++;
++			rx->marks = rx->marks > UINT8_MAX - marks ? UINT8_MAX : (uint8_t)(rx->marks + marks);
++			rx->word_pending = true;
++		}
++		return c;
++	}
++	if (rx->word_pending && units >= 65u) {
++		rx->word_pending = false;
++		return ' ';
++	}
++	return 0;
++}
++
++char cw_rx_sample(struct cw_rx *rx, uint32_t now_ms, int16_t rssi_dbm, bool valid)
++{
++	if (rx->dot_ms == 0)
++		return 0;
++	if (!valid || now_ms - rx->sampled_at > rx->dot_ms / 2u) {
++		rx->initialized = false;
++		reset_letter(rx);
++	}
++	if (!valid)
++		return 0;
++	rx->sampled_at = now_ms;
++	bool keyed = rssi_dbm >= rx->threshold_dbm - (rx->keyed && rx->initialized ? RSSI_HYSTERESIS_DB : 0);
++	if (!rx->initialized) {
++		rx->initialized = true;
++		rx->keyed = keyed;
++		rx->edge_at = now_ms;
++		rx->complete_mark = false;
++		return 0;
++	}
++	uint32_t span = now_ms - rx->edge_at;
++	// Clamp long idle spans before converting to tenths of a dot.
++	uint32_t units = span > 10u * rx->dot_ms ? 100u : span * 10u / rx->dot_ms;
++	if (keyed == rx->keyed)
++		return keyed ? 0 : idle(rx, units);
++	rx->keyed = keyed;
++	rx->edge_at = now_ms;
++	if (keyed) {
++		char c = idle(rx, units);
++		// Noise bursts separated by a gap below half a dot invalidate the current letter.
++		if (rx->code > 1 && units < 5u)
++			reset_letter(rx);
++		rx->complete_mark = true;
++		return c;
++	}
++	if (!rx->complete_mark)
++		return 0;
++	bool dash = units >= 23u && units <= 40u;
++	bool dot = units >= 5u && units <= 17u;
++	if ((!dot && !dash) || rx->code >= 64u) {
++		reset_letter(rx);
++		return 0;
++	}
++	rx->code = (uint8_t)(rx->code << 1 | (dash ? 1u : 0u));
++	return 0;
++}
++
++bool cw_rx_evidence(const struct cw_rx *rx)
++{
++	return rx->letters >= 2 && rx->marks >= 4;
++}
+diff --git a/core/radio/cw_rx.h b/core/radio/cw_rx.h
+new file mode 100644
+index 0000000..a198382
+--- /dev/null
++++ b/core/radio/cw_rx.h
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#ifndef RADIO_CW_RX_H
++#define RADIO_CW_RX_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++// RF envelope decoding for keyed carriers using fresh, unsmoothed RSSI.
++// It neither recovers a BFO beat nor distinguishes the source of keying.
++struct cw_rx {
++	uint32_t sampled_at;
++	uint32_t edge_at;
++	int16_t threshold_dbm;
++	uint16_t dot_ms;
++	uint8_t code;
++	uint8_t letters;
++	uint8_t marks;
++	bool initialized;
++	bool keyed;
++	bool complete_mark;
++	bool word_pending;
++};
++
++bool cw_rx_init(struct cw_rx *rx, unsigned wpm, int16_t threshold_dbm);
++// Returns a letter, a word separator, or zero. Invalid samples break continuity.
++char cw_rx_sample(struct cw_rx *rx, uint32_t now_ms, int16_t rssi_dbm, bool valid);
++bool cw_rx_evidence(const struct cw_rx *rx);
++
++#endif
+diff --git a/core/radio/morse.c b/core/radio/morse.c
+index 553849a..46d7ed6 100644
+--- a/core/radio/morse.c
++++ b/core/radio/morse.c
+@@ -2,6 +2,7 @@
+ // Copyright (c) 2026 The RadioFoundry Authors
+ // Morse timing (morse.h)
+ #include <string.h>
++#include "config.h"
+ #include "radio/morse.h"
+ 
+ // ITU-R M.1677-1 characters: a leading 1 marker, then the elements MSB first (0 dot, 1 dash)
+@@ -162,3 +163,10 @@ bool morse_poll(morse_t *m, uint32_t now_ms)
+ 	}
+ 	return m->key;
+ }
++
++#if CONFIG_CW
++bool morse_preview_next(morse_t *m, bool *key, uint8_t *units)
++{
++	return next_segment(m, key, units);
++}
++#endif
+diff --git a/core/radio/morse.h b/core/radio/morse.h
+index b7ab0a6..8fa5ecf 100644
+--- a/core/radio/morse.h
++++ b/core/radio/morse.h
+@@ -42,4 +42,9 @@ void morse_start(morse_t *m, const char *text, uint8_t len, uint8_t wpm, uint32_
+ // Run with the time (every few ms): true while the key is down. m->done once the last element has ended
+ bool morse_poll(morse_t *m, uint32_t now_ms);
+ 
++#if CONFIG_CW
++// For an audio-rate consumer to render the next segment sample-exactly.
++bool morse_preview_next(morse_t *m, bool *key, uint8_t *units);
++#endif
++
+ #endif
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+index a686a71..35cf33f 100644
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -488,6 +488,16 @@ typedef struct {
+ 	bool tot_warning;	// TX: the time-out is near (tot_warn_s)
+ 	bool tone_burst;	// TX: the 1750 Hz burst is on
+ 	bool roger;		// TX: the roger beep is being sent after the PTT release
++#if CONFIG_CW
++#define CW_RX_TEXT_MAX 24u
++	struct {
++		char text[CW_RX_TEXT_MAX + 1u];
++		uint16_t pitch_hz;
++		int16_t rssi_dbm;
++		uint8_t wpm;
++		bool active, preview, evidence, refused, key_armed;
++	} cw;
++#endif
+ 	// DTMF (CONFIG_DTMF; radio-features.md 3.7)
+ 	bool dtmf_ready;	// a digit key would send its tone now (FM TX with PTT held, nothing else on the air)
+ 	char dtmf;		// the digit sounding, 0 = none
+@@ -631,6 +641,14 @@ void radio_req_bandwidth(radio_bw_t bw);
+ #if CONFIG_TONE_SCAN
+ void radio_req_tone_scan(radio_tscan_cmd_t cmd);
+ #endif
++#if CONFIG_CW
++enum {
++	CW_CONFIG, CW_RX_START, CW_RX_STOP, CW_PREVIEW_CQ, CW_PREVIEW_CALL, CW_PREVIEW_73,
++	CW_KEY_DOWN, CW_KEY_UP, CW_PREVIEW_TEXT, CW_CANCEL, CW_KEY_ARM
++};
++void radio_req_cw(uint8_t action, uint8_t wpm, uint16_t pitch_hz);
++bool radio_req_cw_text(const char *text, uint8_t len, uint8_t wpm, uint16_t pitch_hz);
++#endif
+ void radio_req_tone(uint8_t which, subtone_t tone);	// which: RADIO_TONE_TX, RADIO_TONE_RX or RADIO_TONE_BOTH
+ #if CONFIG_DMR || CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
+ // The current channel's or the VFO's mode (radio_mode_t): FM, DMR, P25 (CONFIG_P25), NXDN (CONFIG_NXDN) or YSF
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 45179c4..811636f 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -8833,6 +8833,10 @@ void radio_sm_init(radio_sm_t *sm, uint32_t now_ms)
+ #endif
+ 
+ 	memset(sm, 0, sizeof(*sm));
++#if CONFIG_CW
++	sm->view.cw.wpm = MORSE_WPM_DEFAULT;
++	sm->view.cw.pitch_hz = MORSE_TONE_HZ_DEFAULT;
++#endif
+ 	sm->audio_out = -1;
+ 	sm->green_out = -1;
+ #if CONFIG_BCAST_FM
+@@ -9335,6 +9339,10 @@ static void monitor_view_update(radio_sm_t *sm)
+ static bool monitor_acquire(void *ctx)
+ {
+ 	radio_sm_t *sm = ctx;
++#if CONFIG_CW
++	if (sm->view.cw.active || sm->view.cw.preview || sm->view.cw.key_armed || sm->cw_audio_guard)
++		return false;
++#endif
+ 	if (sm->view.state != RS_IDLE || sm->ptt || sm->hotspot || sm->standby || sm->power_off_req ||
+ 	    BENCH_HELD(sm) || radio_listen_band(sm->view.ch.rx_hz) || board.radio->monitor_rx_only == NULL)
+ 		return false;
+@@ -9702,6 +9710,183 @@ static void monitor_tick(radio_sm_t *sm, uint32_t now_ms)
+ }
+ #endif
+ 
++#if CONFIG_CW
++#define CW_ENVELOPE_DBM (-105)
++
++static bool cw_tool_available(const radio_sm_t *sm)
++{
++#if CONFIG_MONITOR_SCAN
++	if (sm->monitor_session.owns_rx)
++		return false;
++#endif
++	if (sm->standby || sm->hotspot || BENCH_HELD(sm) || sm->ptt || sm->view.scan ||
++	    sm->view.bcast || sm->view.am || sm->view.ch.mode != RADIO_MODE_FM ||
++	    sm->view.ch.bw != RADIO_BW_12K5 ||
++	    (sm->view.state != RS_IDLE && sm->view.state != RS_RX))
++		return false;
++#if CONFIG_APRS_AFSK
++	if (sm->aprs_phase != APRS_RF_OFF)
++		return false;
++#endif
++	return true;
++}
++
++static bool cw_tool_in_use(const radio_sm_t *sm)
++{
++	return sm->view.cw.active || sm->view.cw.preview || sm->view.cw.key_armed;
++}
++
++static void cw_tool_stop(radio_sm_t *sm)
++{
++	beep_morse_cancel();
++	sm->view.cw.active = false;
++	sm->view.cw.preview = false;
++	sm->view.cw.key_armed = false;
++	sm->view.cw.evidence = false;
++	changed(sm);
++}
++
++static void cw_tool_config(radio_sm_t *sm, uint32_t control)
++{
++	uint8_t wpm = (uint8_t)(control >> 8);
++	uint16_t pitch = (uint16_t)(control >> 16);
++	if (wpm >= MORSE_WPM_MIN && wpm <= MORSE_WPM_MAX && wpm != sm->view.cw.wpm) {
++		sm->view.cw.wpm = wpm;
++		cw_rx_init(&sm->cw_envelope, wpm, CW_ENVELOPE_DBM);
++		sm->view.cw.evidence = false;
++	}
++	if (pitch >= 400u && pitch <= 1000u)
++		sm->view.cw.pitch_hz = pitch;
++}
++
++static void cw_tool_preview(radio_sm_t *sm, const char *text, uint8_t len)
++{
++	if (!cw_tool_available(sm) || voice_streaming() || beep_morse_busy() ||
++	    (len != 0 && morse_units(text, len) == 0) || beep_level_now(sm) == 0) {
++		sm->view.cw.refused = true;
++		return;
++	}
++	beep_morse(text, len, sm->view.cw.wpm, sm->view.cw.pitch_hz, beep_level_now(sm));
++	sm->view.cw.preview = beep_morse_busy();
++	sm->cw_audio_guard = sm->cw_audio_guard || sm->view.cw.preview;
++	sm->view.cw.refused = !sm->view.cw.preview;
++}
++
++void radio_sm_cw_text(radio_sm_t *sm, const char *text, uint8_t len, uint32_t control)
++{
++#if CONFIG_MONITOR_SCAN
++	if (sm->monitor_session.owns_rx)
++		return;
++#endif
++	cw_tool_config(sm, control);
++	if (text != NULL && len != 0 && len <= MORSE_TEXT_MAX)
++		cw_tool_preview(sm, text, len);
++	else
++		sm->view.cw.refused = true;
++	changed(sm);
++}
++
++static void cw_tool_request(radio_sm_t *sm, uint32_t control)
++{
++	cw_tool_config(sm, control);
++	sm->view.cw.refused = false;
++	switch ((uint8_t)control) {
++	case CW_CONFIG:
++		break;
++	case CW_RX_START:
++		if (cw_tool_available(sm)) {
++			sm->cw_hz = sm->view.ch.rx_hz;
++			cw_rx_init(&sm->cw_envelope, sm->view.cw.wpm, CW_ENVELOPE_DBM);
++			sm->view.cw.text[0] = '\0';
++			sm->view.cw.evidence = false;
++			sm->view.cw.active = true;
++		} else {
++			sm->view.cw.refused = true;
++		}
++		break;
++	case CW_RX_STOP:
++		sm->view.cw.active = false;
++		sm->view.cw.evidence = false;
++		break;
++	case CW_CANCEL:
++		cw_tool_stop(sm);
++		return;
++	case CW_KEY_ARM:
++		if (sm->view.cw.key_armed) {
++			sm->view.cw.key_armed = false;
++			beep_morse_cancel();
++			sm->view.cw.preview = false;
++		} else if (cw_tool_available(sm)) {
++			sm->view.cw.key_armed = true;
++		} else {
++			sm->view.cw.refused = true;
++		}
++		break;
++	case CW_KEY_DOWN:
++		cw_tool_preview(sm, "", 0);
++		break;
++	case CW_KEY_UP:
++		beep_morse_cancel();
++		sm->view.cw.preview = false;
++		break;
++	case CW_PREVIEW_CQ:
++		cw_tool_preview(sm, "CQ CQ", 5);
++		break;
++	case CW_PREVIEW_73:
++		cw_tool_preview(sm, "73", 2);
++		break;
++	case CW_PREVIEW_CALL: {
++		char name[CODEPLUG_NAME_LEN + 1u];
++		codeplug_radio_name(name);
++		uint8_t len = 0;
++		while (len < CODEPLUG_NAME_LEN && name[len] != '\0')
++			len++;
++		if (len != 0)
++			cw_tool_preview(sm, name, len);
++		else
++			sm->view.cw.refused = true;
++		break;
++	}
++	default:
++		sm->view.cw.refused = true;
++		break;
++	}
++	changed(sm);
++}
++
++static void cw_tool_tick(radio_sm_t *sm, uint32_t now_ms)
++{
++	if (sm->cw_audio_guard && !permit_busy() && !beep_streaming())
++		sm->cw_audio_guard = false;
++	if (!cw_tool_in_use(sm))
++		return;
++	if (!cw_tool_available(sm) || (sm->view.cw.active && sm->cw_hz != sm->view.ch.rx_hz)) {
++		cw_tool_stop(sm);
++		return;
++	}
++	if (sm->view.cw.preview && !beep_morse_busy()) {
++		sm->view.cw.preview = false;
++		changed(sm);
++	}
++	if (!sm->view.cw.active || sm->view.rx_sleeping)
++		return;
++	radio_status_t status;
++	board.radio->status(&status);
++	sm->view.cw.rssi_dbm = status.rssi_dbm;
++	char c = cw_rx_sample(&sm->cw_envelope, now_ms, status.rssi_dbm, status.rssi_dbm < 0);
++	sm->view.cw.evidence = cw_rx_evidence(&sm->cw_envelope);
++	if (c != 0) {
++		char *text = sm->view.cw.text;
++		unsigned len = strlen(text);
++		if (len == CW_RX_TEXT_MAX)
++			memmove(text, text + 1, --len);
++		text[len] = c;
++		text[len + 1u] = '\0';
++		changed(sm);
++	}
++}
++#endif
++
+ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ {
+ #if CONFIG_MONITOR_SCAN
+@@ -9733,6 +9918,23 @@ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ 	// channel, so it neither gives way to nor cancels anything either
+ 	bool alert = req->type == RREQ_BEEP || req->type == RREQ_VIBRATE || req->type == RREQ_VOLUME ||
+ 		     req->type == RREQ_VOLUME_OVERRIDE || req->type == RREQ_VOLUME_HOLD;
++#if CONFIG_CW
++	if (req->type == RREQ_CW_TOOL) {
++		cw_tool_request(sm, (uint32_t)req->arg);
++		return;
++	}
++	if (cw_tool_in_use(sm) && !alert) {
++		if (req->type == RREQ_MONITOR && sm->view.cw.key_armed) {
++			cw_tool_request(sm, req->arg == 1 ? CW_KEY_DOWN : CW_KEY_UP);
++			return;
++		}
++		cw_tool_stop(sm);
++		if (req->type == RREQ_PTT && req->arg != 0)
++			return;	// the first press exits receive/practice only
++	}
++	if (sm->cw_audio_guard && req->type == RREQ_PTT && req->arg != 0)
++		return;	// a rapid re-key waits until no practice PCM is queued
++#endif
+ #if CONFIG_TONE_SCAN
+ 	if (!alert && req->type != RREQ_TONE_SCAN && req->type != RREQ_DMR_FOCUS && req->type != RREQ_SETTINGS &&
+ 	    sm->view.tone_scan_phase != RADIO_TSCAN_IDLE) {
+@@ -10620,6 +10822,10 @@ static void battery_poll(radio_sm_t *sm, uint32_t now_ms)
+ #if CONFIG_BATTERY_SAVE
+ static bool save_allowed(const radio_sm_t *sm, uint32_t now_ms)
+ {
++#if CONFIG_CW
++	if (cw_tool_in_use(sm))
++		return false;
++#endif
+ #if CONFIG_TONE_SCAN
+ 	if (tone_scan_active(sm))
+ 		return false;
+@@ -10712,6 +10918,10 @@ static uint8_t close_polls(void)
+ #if CONFIG_VOX
+ static bool vox_enabled(const radio_sm_t *sm)
+ {
++#if CONFIG_CW
++	if (cw_tool_in_use(sm) || sm->cw_audio_guard)
++		return false;
++#endif
+ 	if (sm->set.vox == RADIO_VOX_OFF || sm->set.vox_level == 0 || sm->view.ch.mode != RADIO_MODE_FM || sm->hotspot ||
+ 			board.power == NULL || board.power->mic_level == NULL) {
+ 		return false;
+@@ -10853,7 +11063,10 @@ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms)
+ 		return;
+ 	}
+ #if CONFIG_APRS
+-	aprs_poll(sm, now_ms);	// before battery saving: beacons are due while the receiver sleeps too
++#if CONFIG_CW
++	if (!cw_tool_in_use(sm) && !sm->cw_audio_guard)
++#endif
++		aprs_poll(sm, now_ms);	// before battery saving: beacons are due while the receiver sleeps too
+ #endif
+ #if CONFIG_FM && CONFIG_BEEP
+ 	fm_permit_poll(sm, now_ms);
+@@ -11176,6 +11389,9 @@ void radio_sm_tick(radio_sm_t *sm, uint32_t now_ms)
+ #if RADIO_SM_CW
+ 	cw_service(sm, now_ms);
+ #endif
++#if CONFIG_CW
++	cw_tool_tick(sm, now_ms);
++#endif
+ #if CONFIG_DMR
+ 	if (sm->dmr_running) {
+ 		dmr_call_poll(now_ms);
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index 95f4a43..d832052 100644
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -17,6 +17,9 @@
+ #include "radio/scan.h"
+ #include "radio/battery.h"
+ #include "radio/morse.h"
++#if CONFIG_CW
++#include "radio/cw_rx.h"
++#endif
+ #include "radio/radio_cwid.h"
+ #include "radio/beep.h"	// beep_seg_t
+ #include "radio/sigtone.h"	// SIG_STEPS
+@@ -200,6 +203,9 @@ typedef enum {
+ 	RREQ_NXDN_SET,		// radio_task.c: the pending NXDN settings were copied (radio_nxdn_set_settings); applied here
+ 	RREQ_YSF_SET,		// radio_task.c: the pending YSF settings were copied (radio_ysf_set_settings); applied here
+ 	RREQ_TONE_SCAN,		// arg: radio_tscan_cmd_t
++#if CONFIG_CW
++	RREQ_CW_TOOL,		// action, WPM and pitch packed in arg
++#endif
+ 	RREQ_STANDBY,		// soft off: arg 1 receiver asleep, speaker quiet, no transmission; 0 awake again
+ 	RREQ_DMR_REPLAY,	// arg: radio_dmr_replay_cmd_t
+ #if CONFIG_MONITOR_SCAN
+@@ -591,6 +597,11 @@ typedef struct {
+ 	uint8_t t3_send_burst[1 + T3_UDT_BLOCKS_MAX][T3_CSBK_BYTES];
+ 	uint32_t t3_now;		// the clock at the last t3_tick (for the data service's start, which has none)
+ #endif
++#if CONFIG_CW
++	struct cw_rx cw_envelope;
++	uint32_t cw_hz;
++	bool cw_audio_guard;
++#endif
+ #if CONFIG_DMR_ROAMING
+ 	roam_t roam;
+ 	uint8_t roam_zones[SETTINGS_ROAM_ZONE_BYTES];	// the roaming zones (settings_t.roam_zones)
+@@ -633,6 +644,9 @@ void radio_sm_t3_brief(radio_sm_t *sm);
+ #endif
+ void radio_sm_init(radio_sm_t *sm, uint32_t now_ms);
+ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms);
++#if CONFIG_CW
++void radio_sm_cw_text(radio_sm_t *sm, const char *text, uint8_t len, uint32_t control);
++#endif
+ // Every RADIO_POLL_MS: status, squelch, audio, LEDs, TX time-out
+ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms);
+ 
+diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
+index f4afdc0..b5427be 100644
+--- a/core/radio/radio_task.c
++++ b/core/radio/radio_task.c
+@@ -67,6 +67,10 @@ static radio_settings_t shared_settings;	// the published copy, under view_lock
+ // settings are the ones in force soon, so radio_get_settings answers with them
+ static uint32_t settings_sent, settings_taken, settings_published;
+ static radio_view_t shared_view;	// the published copy, under view_lock
++#if CONFIG_CW
++static char cw_pending_text[MORSE_TEXT_MAX];	// one text submission at a time, under view_lock
++static uint8_t cw_pending_len;
++#endif
+ #if CONFIG_P25
+ static radio_p25_settings_t pending_p25;	// radio_req_p25_settings -> the radio task, under view_lock
+ #endif
+@@ -255,6 +259,17 @@ static void radio_task(void *arg)
+ 					monitor_start_pending = false;
+ 					xSemaphoreGive(view_lock);
+ 					radio_sm_monitor_start(&sm, &cfg, hal_millis());
++#endif
++#if CONFIG_CW
++				} else if (req.type == RREQ_CW_TOOL && (uint8_t)req.arg == CW_PREVIEW_TEXT) {
++					char text[MORSE_TEXT_MAX];
++					xSemaphoreTake(view_lock, portMAX_DELAY);
++					uint8_t len = cw_pending_len;
++					memcpy(text, cw_pending_text, len);
++					cw_pending_len = 0;
++					xSemaphoreGive(view_lock);
++					if (len != 0)
++						radio_sm_cw_text(&sm, text, len, (uint32_t)req.arg);
+ #endif
+ 				} else if (req.type == RREQ_SETTINGS) {
+ 					radio_settings_t set;
+@@ -439,6 +454,36 @@ radio_vfo_copy_t radio_req_vfo_copy_checked(void)
+ 	return r;
+ }
+ void radio_req_vfo_set(uint32_t hz) { post(RREQ_VFO_SET, (int32_t)hz, 0); }
++#if CONFIG_CW
++static int32_t cw_control(uint8_t action, uint8_t wpm, uint16_t pitch_hz)
++{
++	return (int32_t)((uint32_t)pitch_hz << 16 | (uint32_t)wpm << 8 | action);
++}
++
++void radio_req_cw(uint8_t action, uint8_t wpm, uint16_t pitch_hz)
++{
++	if (action != CW_PREVIEW_TEXT && action <= CW_KEY_ARM)
++		post(RREQ_CW_TOOL, cw_control(action, wpm, pitch_hz), pdMS_TO_TICKS(50));
++}
++
++bool radio_req_cw_text(const char *text, uint8_t len, uint8_t wpm, uint16_t pitch_hz)
++{
++	if (text == NULL || len == 0 || len > MORSE_TEXT_MAX || requests == NULL || view_lock == NULL)
++		return false;
++	xSemaphoreTake(view_lock, portMAX_DELAY);
++	bool queued = false;
++	if (cw_pending_len == 0) {
++		memcpy(cw_pending_text, text, len);
++		cw_pending_len = len;
++		radio_req_t req = { .type = RREQ_CW_TOOL, .arg = cw_control(CW_PREVIEW_TEXT, wpm, pitch_hz) };
++		queued = send(&req, 0);
++		if (!queued)
++			cw_pending_len = 0;
++	}
++	xSemaphoreGive(view_lock);
++	return queued;
++}
++#endif
+ void radio_req_vfo_tx(uint32_t hz) { post(RREQ_VFO_TX, (int32_t)hz, 0); }
+ void radio_req_vfo_step_size(uint32_t hz) { post(RREQ_VFO_STEP_SIZE, (int32_t)hz, 0); }
+ // PTT and monitor edges must not be lost (a lost release would keep transmitting until the time-out)
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 4f83803..63a63b2 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -366,6 +366,17 @@ radioCoreTestMonitor: $(RCORE) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/
+ 		-DCONFIG_MONITOR_SCAN=1 -o $@ $(RCORE) -lm
+ endif
+ 
++TESTS += radioCoreTestCw
++RCCW := $(RCORE) $(CORE)/radio/cw_rx.c
++radioCoreTestCw: $(RCCW) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/ui/ui_svc.h
++	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
++		-DCONFIG_CW=1 -o $@ $(RCCW) -lm
++
++TESTS += radioCoreTestMonitorCw
++radioCoreTestMonitorCw: $(RCCW) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/ui/ui_svc.h
++	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
++		-DCONFIG_MONITOR_SCAN=1 -DCONFIG_CW=1 -o $@ $(RCCW) -lm
++
+ # The same with the DMR VFO off (CONFIG_VFO_DMR=0): the VFO stays analog and nothing about it changes
+ TESTS   += radioCoreTestNoVfoDmr
+ radioCoreTestNoVfoDmr: $(RCORE) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/dmr/dmrDataService.h \
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index b12ccee..b691bdd 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12539,11 +12539,132 @@ static void test_monitor_scan(void)
+ 	CHECK(hw.rx_hz >= 400000000 && (hw.rx_hz - wide.lo) % wide.step == 0);
+ 	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
+ 	CHECK(!scan_hw_rx_only);
++#if CONFIG_CW
++	req(RREQ_BANDWIDTH, RADIO_BW_12K5);
++	req(RREQ_CW_TOOL, CW_RX_START);
++	CHECK(sm.view.cw.active);
++	CHECK(!radio_sm_monitor_start(&sm, &cfg, now) && !scan_hw_rx_only && sm.view.cw.active);
++	req(RREQ_CW_TOOL, CW_CANCEL);
++	CHECK(radio_sm_monitor_start(&sm, &cfg, now));
++	req(RREQ_CW_TOOL, CW_RX_START);
++	radio_sm_cw_text(&sm, "CQ", 2, CW_PREVIEW_TEXT);
++	CHECK(!sm.view.cw.active && !sm.view.cw.preview && scan_hw_rx_only);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++	CHECK(!scan_hw_rx_only);
++#endif
++}
++#endif
++
++#if CONFIG_CW
++static uint32_t cw_control_arg(unsigned wpm, unsigned pitch, unsigned action)
++{
++	return pitch << 16 | wpm << 8 | action;
++}
++
++static void test_cw_rssi_edges(void)
++{
++	struct cw_rx rx;
++	CHECK(!cw_rx_init(&rx, 41, -105));
++	CHECK(!cw_rx_init(&rx, 20, -25));
++	CHECK(cw_rx_init(&rx, 20, -105));
++	// A dot across the tick wrap. The mark stays asserted in the 6 dB hysteresis band.
++	uint32_t begin = UINT32_MAX - 25u;
++	CHECK(cw_rx_sample(&rx, begin - 10u, -130, true) == 0);
++	CHECK(cw_rx_sample(&rx, begin, -90, true) == 0);
++	for (unsigned elapsed = 10; elapsed < 60; elapsed += 10)
++		CHECK(cw_rx_sample(&rx, begin + elapsed, -109, true) == 0);
++	CHECK(cw_rx_sample(&rx, begin + 60u, -130, true) == 0);
++	for (unsigned elapsed = 70; elapsed < 210; elapsed += 10)
++		CHECK(cw_rx_sample(&rx, begin + elapsed, -130, true) == 0);
++	CHECK(cw_rx_sample(&rx, begin + 210u, -130, true) == 'E');
++	CHECK(!cw_rx_evidence(&rx));
++	CHECK(cw_rx_sample(&rx, begin + 220u, -90, true) == 0);
++	CHECK(cw_rx_sample(&rx, begin + 300u, -130, true) == 0); // samples went missing
++	for (unsigned elapsed = 310; elapsed < 500; elapsed += 10)
++		CHECK(cw_rx_sample(&rx, begin + elapsed, -130, true) == 0);
++	CHECK(!cw_rx_evidence(&rx));
++}
++
++static void test_cw_tool(void)
++{
++	static const uint8_t speeds[] = { 5, 20, 40 };
++	static const char message[] = "CQ 73";
++	setup_codeplug();
++	start();
++	uint32_t hz = hw.rx_hz;
++	for (unsigned i = 0; i < sizeof speeds; i++) {
++		uint8_t wpm = speeds[i];
++		req(RREQ_CW_TOOL, (int32_t)cw_control_arg(wpm, 650, CW_RX_START));
++		CHECK(sm.view.cw.active && sm.view.cw.wpm == wpm && sm.view.cw.pitch_hz == 650);
++		morse_t sender;
++		morse_start(&sender, message, sizeof message - 1u, wpm, now + 300);
++		uint32_t end = now + 400u + (morse_units(message, sizeof message - 1u) + 8u) * sender.dot_ms;
++		while (now < end) {
++			hw.st.rssi_dbm = morse_poll(&sender, now) ? -75 : -130;
++			radio_sm_tick(&sm, now);
++			now += RADIO_TICK_MS;
++		}
++		CHECK(strncmp(sm.view.cw.text, message, sizeof message - 1u) == 0);
++		CHECK(sm.view.cw.evidence && hw.rx_hz == hz && !hw.keyed);
++		req(RREQ_CW_TOOL, CW_RX_STOP);
++		CHECK(!sm.view.cw.active && hw.rx_hz == hz);
++	}
++
++	// A carrier which never keys off does not yield Morse evidence. PTT exits the receive tool.
++	req(RREQ_CW_TOOL, CW_RX_START);
++	hw.st.rssi_dbm = -70;
++	run(2000);
++	CHECK(sm.view.cw.active && !sm.view.cw.evidence && sm.view.cw.text[0] == '\0');
++	int tx_calls = hw.tx_calls;
++	req(RREQ_PTT, 1);
++	req(RREQ_PTT, 0);
++	CHECK(!sm.view.cw.active && hw.tx_calls == tx_calls && hw.rx_hz == hz);
++
++	// The monitor button is only a local manual key while this tool has armed it.
++	req(RREQ_CW_TOOL, CW_KEY_ARM);
++	CHECK(sm.view.cw.key_armed);
++	req(RREQ_MONITOR, 1);
++	CHECK(sm.view.cw.preview && aud.started && !hw.keyed);
++	int16_t mic[AUDIO_BLOCK_SAMPLES] = {0}, spk[AUDIO_BLOCK_SAMPLES];
++	aud.cb(mic, spk, aud.ctx);
++	aud.cb(mic, spk, aud.ctx);
++	bool audible = false;
++	for (unsigned i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
++		audible = audible || spk[i] != 0;
++	CHECK(audible);
++	req(RREQ_MONITOR, 0);
++	aud.cb(mic, spk, aud.ctx);
++	for (unsigned i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
++		CHECK(spk[i] == 0);
++	CHECK(!sm.view.cw.preview && hw.tx_calls == tx_calls);
++
++	// Arbitrary text shares the local speaker path and is interrupted before ordinary PTT can key RF.
++	radio_sm_cw_text(&sm, "QTH", 3, cw_control_arg(30, 1000, CW_PREVIEW_TEXT));
++	CHECK(sm.view.cw.preview && sm.view.cw.wpm == 30 && sm.view.cw.pitch_hz == 1000);
++	req(RREQ_PTT, 1);
++	req(RREQ_PTT, 0);
++	CHECK(!sm.view.cw.key_armed && !sm.view.cw.preview && hw.tx_calls == tx_calls && hw.rx_hz == hz);
++	CHECK(sm.cw_audio_guard);
++	req(RREQ_PTT, 1);
++	req(RREQ_PTT, 0);
++	CHECK(hw.tx_calls == tx_calls);
++	aud.feed = true;
++	run(350);
++	aud.feed = false;
++	CHECK(!sm.cw_audio_guard);
++	sm.set.talk_permit = false;
++	req(RREQ_PTT, 1);
++	CHECK(hw.tx_calls == tx_calls + 1 && hw.keyed);
++	req(RREQ_PTT, 0);
+ }
+ #endif
+ 
+ int main(int argc, char **argv)
+ {
++#if CONFIG_CW
++	test_cw_rssi_edges();
++	test_cw_tool();
++#endif
+ #if (CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF) || CONFIG_M17 || CONFIG_DSTAR
+ 	if (argc == 2)
+ 		interop_dir = argv[1];

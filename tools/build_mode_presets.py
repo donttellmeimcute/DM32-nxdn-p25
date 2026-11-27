@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 lyra XE1POC
-"""Compile and package the DM-32UV digital mode combinations not covered by the three presets."""
+"""Package the DM-32UV digital mode combinations and explicit experimental builds."""
 
 import argparse
 import itertools
@@ -10,8 +10,11 @@ import os
 from pathlib import Path
 import subprocess
 
+from build_current import EXPERIMENTAL_MODULES
+
 MODES = ("p25", "nxdn", "ysf", "m17", "dstar")
 PREBUILT = {frozenset(MODES), frozenset(MODES[:3]), frozenset()}
+SWITCHES = {**{mode: mode.upper() for mode in MODES}, **EXPERIMENTAL_MODULES}
 
 
 def mode_variants():
@@ -27,6 +30,17 @@ def mode_variants():
             yield "modes-" + "-".join(selected), modes
 
 
+def experimental_variants():
+    # Keep experimental artifacts off the default release matrix. Build both
+    # single-module choices and the combined choice for each standard preset.
+    modules = tuple(EXPERIMENTAL_MODULES)
+    for modes in ((), MODES[:3], MODES):
+        for count in range(1, len(modules) + 1):
+            for extra in itertools.combinations(modules, count):
+                selected = modes + extra
+                yield "modes-" + "-".join(selected), frozenset(selected)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tree", type=Path, required=True, help="prepared firmware tree with the D-STAR patch")
@@ -35,16 +49,19 @@ def main():
     parser.add_argument("--git", required=True)
     parser.add_argument("--cross", required=True)
     parser.add_argument("--jobs", type=int, default=4)
-    variants = dict(mode_variants())
+    stable = dict(mode_variants())
+    experimental = dict(experimental_variants())
+    variants = {**stable, **experimental}
+    parser.add_argument("--experimental", action="store_true", help="also build experimental RX tools for the three presets")
     parser.add_argument("--only", action="append", choices=tuple(variants), help="build a specific combination")
     args = parser.parse_args()
     tree = args.tree.resolve()
     output = args.out.resolve()
     commit_time = subprocess.check_output(["git", "show", "-s", "--format=%ct", args.git], cwd=tree, text=True).strip()
-    for variant in args.only or variants:
+    for variant in args.only or (variants if args.experimental else stable):
         modes = variants[variant]
         config = ["# SPDX-License-Identifier: GPL-3.0-or-later", "# Copyright (c) 2026 lyra XE1POC"]
-        config.extend(f"CONFIG_{mode.upper()} ?= {'y' if mode in modes else 'n'}" for mode in MODES)
+        config.extend(f"CONFIG_{name} ?= {'y' if mode in modes else 'n'}" for mode, name in SWITCHES.items())
         config.extend(("CONFIG_NET_HTTP ?= n", "CONFIG_SFR ?= n", "CONFIG_MDC1200 ?= y"))
         (tree / "config" / "variants" / f"{variant}.mk").write_text("\n".join(config) + "\n", encoding="utf-8")
         subprocess.run([
@@ -60,8 +77,10 @@ def main():
         manifest_path = output / f"rfoundry-dm32-{variant}-{args.version}.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         enabled = set(manifest["features"].split(","))
-        actual = {mode for mode in MODES if mode.upper() in enabled}
-        if actual != modes or not {"DMR", "FM", "APRS", "MDC1200", "RSSI_GRAPH"} <= enabled:
+        disabled = set(manifest["off"].split(","))
+        actual = {mode for mode, name in SWITCHES.items() if name in enabled}
+        missing_off = {name for mode, name in SWITCHES.items() if mode not in modes} - disabled
+        if actual != modes or missing_off or not {"DMR", "FM", "APRS", "MDC1200", "RSSI_GRAPH"} <= enabled:
             raise SystemExit(f"{variant}: manifest does not match the requested mode configuration")
 
 

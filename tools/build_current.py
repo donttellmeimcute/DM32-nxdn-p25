@@ -14,6 +14,8 @@ import os
 import shutil
 from pathlib import Path
 import subprocess
+import tempfile
+import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = 'e89121e97a314f0ddd0475f848713ba10710d7db'
@@ -25,6 +27,7 @@ OPTIONAL_MODULES = {
 	'aprs': 'APRS', 'dstar': 'DSTAR', 'm17': 'M17', 'mdc1200': 'MDC1200',
 	'nxdn': 'NXDN', 'p25': 'P25', 'rssi-graph': 'RSSI_GRAPH', 'ysf': 'YSF',
 }
+EXPERIMENTAL_MODULES = {'monitor-scan': 'MONITOR_SCAN', 'cw': 'CW'}
 PATCHES = (
 	'base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch', 'ysf-tx-pcm.patch',
 	'ysf-vfo-identity.patch',
@@ -225,7 +228,24 @@ def prepare(tree, dstar=False):
 		run('git', 'apply', '--binary', PATCH_DIR / 'issue117-dstar-mic-gain-tests-docs.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
+	run('git', 'apply', '--binary', PATCH_DIR / 'issue120-module-config.patch', cwd=tree)
+	for header in ('monitor_cw.h', 'monitor_session.h'):
+		shutil.copyfile(ROOT / 'experimental/monitor-cw' / header, tree / 'core/radio' / header)
+	for patch in ('monitor-scan-runtime.patch', 'issue120-cw-envelope.patch', 'issue120-monitor-cw-ui.patch',
+	              'monitor-scan-air-validation.patch'):
+		run('git', 'apply', '--binary', PATCH_DIR / patch, cwd=tree)
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
+
+
+def check_monitor_cw():
+	"""Run portable RX scan and Morse tests using a native compiler, not C-SKY."""
+	root = ROOT / 'experimental/monitor-cw'
+	with tempfile.TemporaryDirectory(prefix='dm32-monitor-cw-') as tmp:
+		binary = Path(tmp) / 'monitor-cw-test'
+		run(*shlex.split(os.environ.get('HOSTCC', 'cc')), '-std=c11',
+		    '-Wall', '-Wextra', '-Werror', '-pedantic', '-Os',
+		    root / 'test.c', '-o', binary)
+		run(binary)
 
 
 def main():
@@ -237,13 +257,21 @@ def main():
 	ap.add_argument('--variant', choices=RELEASE_VARIANTS, default='full', help='firmware preset')
 	ap.add_argument('--without', action='append', choices=OPTIONAL_MODULES, default=[], metavar='MODULE',
 	                help='omit a module (repeatable): ' + ', '.join(OPTIONAL_MODULES))
+	ap.add_argument('--with', dest='with_modules', action='append', choices=EXPERIMENTAL_MODULES, default=[],
+	                metavar='EXPERIMENTAL_MODULE',
+	                help='enable an experimental module (repeatable): ' + ', '.join(EXPERIMENTAL_MODULES))
 	ap.add_argument('--dstar', action=argparse.BooleanOptionalAction, default=True,
 	                help='build experimental D-STAR DV for the VFO and stored channels (RF unverified)')
 	ap.add_argument('--no-m17', action='store_true', help='build with CONFIG_M17=n (M17 voice; Codec 2 real time on the MCU unverified)')
 	ap.add_argument('--no-mdc1200', action='store_true', help='build with CONFIG_MDC1200=n (MDC-1200 ID on FM channels)')
 	ap.add_argument('--bench-tx-1p25m', action='store_true',
 	                help='write the 220–230 MHz bench build with a separate name and output directory')
+	ap.add_argument('--monitor-cw-tests-only', action='store_true',
+	                help='run native Monitor Scan/CW regression tests without fetching or building firmware')
 	args = ap.parse_args()
+	check_monitor_cw()
+	if args.monitor_cw_tests_only:
+		return
 	tree = args.tree.resolve()
 	disabled = set(args.without)
 	if not args.dstar or args.variant != 'full' or 'p25' in disabled:
@@ -265,11 +293,13 @@ def main():
 		variant_suffix = '' if args.variant == 'full' else '-' + args.variant
 		bench_options = (f'BUILD=build/dm32{variant_suffix}-bench-1p25m',)
 		version += '-bench-1p25m'
-	preset = 'custom' if args.without or not args.dstar or args.no_m17 or args.no_mdc1200 or bench_options else args.variant
+	custom = args.without or args.with_modules or not args.dstar or args.no_m17 or args.no_mdc1200 or bench_options
+	preset = 'custom' if custom else args.variant
 	options = {name: 'n' for key, name in OPTIONAL_MODULES.items() if key in disabled}
 	options['M17'] = 'n' if 'm17' in disabled else 'y'
 	options['MDC1200'] = 'n' if 'mdc1200' in disabled else 'y'
 	options['DSTAR'] = 'y' if dstar else 'n'
+	options.update({name: 'y' if key in args.with_modules else 'n' for key, name in EXPERIMENTAL_MODULES.items()})
 	run('make', '-j%d' % args.jobs, 'BOARD=dm32', 'CROSS=' + args.cross, 'GITVERSION=' + version,
 	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'RFOUNDRY_PRESET=' + preset, *variant, *bench_options,
 	    *(f'CONFIG_{name}={value}' for name, value in options.items()), *dstar_options, 'all', 'stack-check', cwd=tree)
