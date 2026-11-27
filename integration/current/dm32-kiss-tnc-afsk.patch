@@ -1,0 +1,248 @@
+diff --git a/boards/dm32/radio_dm32.c b/boards/dm32/radio_dm32.c
+index a984bdc..3055313 100644
+--- a/boards/dm32/radio_dm32.c
++++ b/boards/dm32/radio_dm32.c
+@@ -348,10 +348,10 @@ static bool monitor_rx_only(bool on)
+ static bool afsk_tx_route(bool on);
+ static void aprs_listen_route(bool on);
+ 
+-// PCM amplitude per AFSK level step: 50 (nominal) = 2750, about 3 kHz peak. Bench, 25 kHz: 2925 gave 3.3 kHz peak;
+-// 5850 and up are limited at 5.1 kHz peak, 4.5 kHz on the tones
++// PCM amplitude with the microphone off the analog FM path (RadioFoundry #875). A level of 50 gives
++// PCM amplitude 450, about 3.2 kHz peak with Bell 202 tones at 25 kHz channel width.
+ static const hrc_afsk_board_t afsk_board = {
+-	.tx_route = afsk_tx_route, .listen = aprs_listen_route, .amp_per_level = 55,
++	.tx_route = afsk_tx_route, .listen = aprs_listen_route, .amp_per_level = 9,
+ };
+ #endif
+ 
+@@ -847,9 +847,8 @@ void dm32_speaker_pcm(bool on)
+ }
+ 
+ #if CONFIG_APRS_AFSK
+-// APRS AFSK (hrc_afsk.c): during an FM transmission the prompt FIFO's audio goes to the modulator (the path that put
+-// beeps on DMR bursts, modem-hrc7000.md 8.4), so the tones go there with the microphone muted. False when the radio
+-// isn't transmitting FM
++// APRS and MDC AFSK use the prompt FIFO during FM TX. Codec mute cannot reach the analog FM mic path, where
++// voice would ride on the tones. Switch the mic to the muted codec path while the tones play.
+ static bool afsk_tx_route(bool on)
+ {
+ 	if (on && (!transmitting || mode != RADIO_MODE_FM)) {
+@@ -857,6 +856,7 @@ static bool afsk_tx_route(bool on)
+ 	}
+ 	afsk_tx = on;
+ 	hrc7000_codec_mute(&modem, on, false);
++	hrc_pin_write(PIN_MIC_PATH, !on);
+ 	ring_play();
+ 	return true;
+ }
+diff --git a/core/aprs/aprs.h b/core/aprs/aprs.h
+index 56e668c..b30b28a 100644
+--- a/core/aprs/aprs.h
++++ b/core/aprs/aprs.h
+@@ -256,6 +256,8 @@ bool aprs_can_receive(void);
+ // The receive path is running (the receiver must stay awake: no battery saving)
+ bool aprs_rx_listening(void);
+ #if CONFIG_APRS_RX
++// The configured APRS receive frequency, or zero when APRS receive is off (radio task only).
++uint32_t aprs_rx_freq(void);
+ // Release the FM audio path before another mode takes the receiver (radio task only).
+ void aprs_rx_stop(void);
+ #endif
+diff --git a/core/aprs/aprs_ax25.c b/core/aprs/aprs_ax25.c
+index a5dfb49..0e4cf71 100644
+--- a/core/aprs/aprs_ax25.c
++++ b/core/aprs/aprs_ax25.c
+@@ -855,6 +855,11 @@ static bool rx_by_stream(void)
+ // try routes the receiver and back
+ #define RX_RETRY_MS	1000u
+ 
++uint32_t aprs_rx_freq(void)
++{
++	return aprs_s.cfg.rx_on ? aprs_cfg_freq(&aprs_s.cfg) : 0u;
++}
++
+ void aprs_rx_stop(void)
+ {
+ 	aprs_s.rx_retry_wait = false;
+@@ -874,8 +879,7 @@ void aprs_ax25_rx_service(const aprs_radio_t *r, uint32_t now_ms)
+ {
+ 	const hal_afsk_t *h = board.afsk;
+ 	bool own = rx_by_board();
+-	bool want = aprs_s.cfg.rx_on && r->fm_rx && r->rx_hz != 0 && r->rx_hz == aprs_cfg_freq(&aprs_s.cfg) &&
+-		    (own || rx_by_stream());
++	bool want = r->fm_rx && r->rx_hz != 0 && r->rx_hz == aprs_rx_freq() && (own || rx_by_stream());
+ 	if (!want) {
+ 		aprs_rx_stop();
+ 		return;
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 811636f..cf86ddc 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -1015,6 +1015,13 @@ static bool tune(radio_sm_t *sm, uint32_t now_ms)
+ #if CONFIG_AM_RX
+ 	sm->view.am = radio_am_channel(&sm->view.ch) ||
+ 		(sm->view.vfo_am && radio_am_vfo_allowed(sm->view.ch.rx_hz));
++#endif
++#if CONFIG_APRS_RX
++	// Release the FM audio copy before retuning so another channel or modem can take it.
++	if (aprs_rx_listening() && (sm->view.ch.mode != RADIO_MODE_FM || sm->view.am || sm->hotspot ||
++				    sm->view.ch.rx_hz != aprs_rx_freq())) {
++		aprs_rx_stop();
++	}
+ #endif
+ 	reset_tone(sm);
+ #if CONFIG_BATTERY_SAVE
+@@ -1025,15 +1032,12 @@ static bool tune(radio_sm_t *sm, uint32_t now_ms)
+ 		RADIO_MODE_DMR : RADIO_MODE_FM;
+ 	// P25, NXDN and YSF run with the board in its digital mode, the DMR stack stopped; a retune starts the engine over
+ 	bool air = air_mode(sm->view.ch.mode);
++#if RADIO_MDC_RX
+ 	if (air) {
+ 		// The FM sample copy shares the digital provider's interrupt. Release it before opening the provider.
+-#if RADIO_MDC_RX
+ 		mdc_rx_stop(sm);
+-#endif
+-#if CONFIG_APRS_RX
+-		aprs_rx_stop();
+-#endif
+ 	}
++#endif
+ 	bool air_same = false;
+ 	if (air) {
+ 		mode = (radio_mode_t)sm->view.ch.mode;
+@@ -6217,7 +6221,7 @@ static void aprs_poll(radio_sm_t *sm, uint32_t now_ms)
+ #if CONFIG_APRS_AFSK
+ 	r.can_rf = aprs_can_start(sm);
+ 	r.fm_rx = sm->aprs_phase == APRS_RF_OFF && sm->view.ch.mode == RADIO_MODE_FM && !sm->hotspot &&
+-		  sm->view.state != RS_TX;
++		  !sm->view.am && !sm->view.bcast && sm->view.state != RS_TX;
+ 	r.rx_hz = sm->view.ch.rx_hz;
+ #endif
+ #if CONFIG_DMR
+diff --git a/docs/spec/aprs.md b/docs/spec/aprs.md
+index 46f3f52..d543233 100644
+--- a/docs/spec/aprs.md
++++ b/docs/spec/aprs.md
+@@ -208,6 +208,9 @@ at full deviation pushed the AT1846S noise reading over the line for a poll or t
+ squelch gated audio cut the packet in pieces: the preamble in one opening, the frame in the next. `aprs_rx_listening()`
+ says whether the path runs.
+ 
++When a retune takes the receiver off the APRS frequency or out of FM, the radio task releases the APRS audio path
++before retuning. This lets a digital modem take the receive audio copy and restarts APRS decoding when FM returns.
++
+ The receive setting and messaging default to on when the radio can receive (`aprs_can_receive()`: the build has
+ `CONFIG_APRS_RX` and one of the two paths exists).
+ 
+diff --git a/docs/spec/hardware-dm32.md b/docs/spec/hardware-dm32.md
+index d893cc4..491f38f 100644
+--- a/docs/spec/hardware-dm32.md
++++ b/docs/spec/hardware-dm32.md
+@@ -486,7 +486,7 @@ ground. Whether F1/F2 are routed anywhere on the DM-32UV board is unknown (3.11)
+ | 0x28 | PTB8 | Keypad backlight | out | high = on |
+ | 0x2B | PTB11 | PTT | in | low = pressed |
+ | 0x2C | PTB12 | GPS power | out | **low = GPS on**, high = off |
+-| 0x2E | PTB14 | Audio path select: mic to analog FM path vs to DMR codec | out | 1 = analog (FM TX), 0 = DMR; set at each TX start |
++| 0x2E | PTB14 | Audio path select: mic to analog FM path vs to DMR codec | out | 1 = analog FM TX, 0 = codec path. FM AFSK uses the muted codec path while tones play |
+ | 0x2F | PTB15 | FD6818 audio switch | out | 1 = the FD6818's audio output to the speaker and away from the C7000's ADC; 0 = the audio into the C7000 (DMR receive needs this) and the speaker on the codec (measured) |
+ | 0x31–0x34 | PTB17–20 | Keypad columns 1–4 | in | low = key closed |
+ | 0x35 | PTB21 | Audio power amplifier enable | out | high = on |
+@@ -1212,10 +1212,10 @@ Values written at init; field meanings from the datasheet:
+ | 0x30 | DR_ADC_AGC | 0x34 | AGC data byte |
+ | modem 0x088 | LINEOUT_CTRL | 0x01 | line out 2 enabled |
+ 
+-APRS AFSK transmit (measured on the SDR bench, 2026-10-16, a UHF test frequency, 25 kHz, lowest power, a canned frame through
+-`hal_afsk_t.tx_start`): a valid FCS at every level tried, 29 flags of TX delay, twist about -1.1 dB, 14-15 degrees phase
+-residual. Level 50 (PCM amplitude 2750) gives 3.1 kHz peak with 2.2 / 2.5 kHz mark / space deviation; level 75 gives
+-4.5 kHz peak; PCM 5850 and up is limited at 5.1 kHz peak. Receive decodes off air. While AFSK receive runs, the
++APRS AFSK transmit routes the microphone through the muted codec (GPIO 0x2E = 0) while the prompt FIFO plays the
++tones. RadioFoundry [#875](https://github.com/RadioFoundry/RadioFoundry/pull/875) measured a valid FCS both with
++a quiet microphone and while speaking, with about 3.2 kHz peak deviation at level 50 (PCM amplitude 450) and
++25 kHz channel width. The previous analog microphone route could corrupt the transmitted frame. While AFSK receive runs, the
+ speaker plays FM through the HR_C7000 instead of straight from the FD6818. A flat transmitter at a strong level shows
+ 320-400 Hz 1-10 dB under the tones: 50-80 % decode with one demodulator path, 12 of 12 with both. Both paths take about
+ 6 % of the CPU at 8 kHz.
+diff --git a/docs/testing/dm32-bringup.md b/docs/testing/dm32-bringup.md
+index ce80726..a1edca9 100644
+--- a/docs/testing/dm32-bringup.md
++++ b/docs/testing/dm32-bringup.md
+@@ -194,7 +194,7 @@ The HR_C7000 copies its FM receive audio to the CPU (`modem-hrc7000.md` 8.5). AP
+ | The debug link's `aprs` view on 144.390 | `aprs.rx_listening=1`, `rx_bits` rising by about 1200 a second on noise, `rx_peak` above 0 | `rx_listening=0`: the receive setting (`rfoundry_debug.py aprs set rx 1`) or the frequency. Bits not rising: SYS_INTERP_MASK bit 14 (0x1100039C) clear, or GPIO 0x2F high |
+ | A packet on the air | `rx_hdlc_frames` and `stations` go up | `rx_fcs_errors` rising with packets present: the half read (FM_ADDR_SW), the level (noise reaches full scale), audio under the tones (below) |
+ | An FM signal on 144.390 with the squelch open | heard on the speaker, through the C7000's FM playback | AUDIO_CONTROL bit 6, the codec line out |
+-| A packet sent at level 50, recorded by the SDR bench (`aprs.md` 13) | decodes with a valid FCS, about 3 kHz peak deviation, twist within 2 dB | no tones: AUDIO_CONTROL bit 7 during the transmission, Timer 4 (vector 36) not firing. Deviation: `amp_per_level` in `radio_dm32.c` |
++| A packet sent at level 50, recorded by the SDR bench (`aprs.md` 13) | decodes with a valid FCS, about 3.2 kHz peak deviation, mark about 4 dB below space | no tones: check AUDIO_CONTROL bit 7 and Timer 4 (vector 36). For voice on the tones, check that GPIO 0x2E is low while AFSK plays. Deviation: `amp_per_level` in `radio_dm32.c` |
+ 
+ ## Open items to settle on the bench
+ 
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+index 00f2389..9f873c4 100644
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -60,6 +60,9 @@ static struct {
+ 	bool afsk_stuck;	// ... or never finishes
+ } hw;
+ 
++#if CONFIG_APRS_RX
++static unsigned retunes_with_aprs_audio;
++#endif
+ static uint32_t now;
+ uint32_t hal_millis(void) { return now; }	// ui_svc_aprs.c
+ static char frames[8][AX25_TNC2_MAX];	// what went out, decoded from the tones
+@@ -71,6 +74,11 @@ static bool r_rx(uint32_t hz, radio_bw_t bw, const subtone_t *t)
+ {
+ 	(void)bw;
+ 	(void)t;
++#if CONFIG_APRS_RX
++	if (hz != APRS_HZ && aprs_rx_listening()) {
++		retunes_with_aprs_audio++;
++	}
++#endif
+ 	hw.rx_hz = hz;
+ 	return true;
+ }
+@@ -1722,6 +1730,36 @@ static void test_rf_failures(void)
+ }
+ 
+ #if CONFIG_APRS_RX
++// The receiver must release the APRS input before the board retunes, and take it back on returning.
++static void test_rx_release_on_retune(void)
++{
++	fake_tap.caps = AUDIO_TAP_FM_RX;
++	memset(&pcm, 0, sizeof(pcm));
++	reset();
++	retunes_with_aprs_audio = 0;
++	zone.count = 2;
++	zone.channels[1] = 2;
++	chan.rx_hz = chan.tx_hz = APRS_HZ;
++	settings_init();
++	radio_sm_init(&sm, now);
++	run(200);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening());
++	req(RREQ_CH_STEP, 1);
++	CHECK(hw.rx_hz == CH2_HZ && !aprs_rx_listening() && retunes_with_aprs_audio == 0);
++	req(RREQ_CH_STEP, -1);
++	run(200);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening());
++#if CONFIG_DUAL_WATCH
++	radio_req_t watch = { RREQ_SCAN, RSCAN_DUAL, 1 };
++	radio_sm_request(&sm, &watch, now);
++	int starts = pcm.starts;
++	run(3000);
++	CHECK(sm.scan.kind == SCAN_DUAL && pcm.starts > starts + 3 && retunes_with_aprs_audio == 0);
++	req(RREQ_SCAN, RSCAN_STOP);
++#endif
++	fake_tap.caps = 0;
++}
++
+ // One 20 ms block of receive audio through the stream, then a radio poll
+ static void feed(const int16_t *s)
+ {
+@@ -2306,6 +2344,7 @@ int main(void)
+ 	test_rf_failures();
+ #if CONFIG_APRS_RX
+ 	test_stations_digi_igate();
++	test_rx_release_on_retune();
+ 	test_rx_stream();
+ 	test_rx_board_only();
+ 	test_station_lookup();

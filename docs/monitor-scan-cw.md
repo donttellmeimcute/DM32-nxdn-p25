@@ -32,7 +32,12 @@ adyacentes en una carga de 50 Ω.
 - [HR_C7000, referencia del módem fijada en la compilación](https://github.com/RadioFoundry/RadioFoundry/blob/e89121e97a314f0ddd0475f848713ba10710d7db/docs/spec/modem-hrc7000.md)
 - [Identificación Morse de SFR](https://radiofoundry.org/docs/spec/sfr)
 
-## Compilación de banco
+## Instalación y compilación
+
+En **Custom Modes** del flasher elige **Monitor Scan**, **CW** o ambos.
+La release incluye esas combinaciones con los modos digitales de Full,
+Multimode y DMR + FM. El flasher ofrece compilar localmente las demás
+combinaciones. Los tres perfiles estándar dejan ambos módulos apagados.
 
 ```sh
 python3 tools/build_current.py --monitor-cw-tests-only

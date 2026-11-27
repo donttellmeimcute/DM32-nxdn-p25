@@ -69,7 +69,7 @@ jobs:
         run: |
           set -eu
           T=build/current/tests/host
-          tests="sigToneTest ambeVoiceTest radioFeaturesTest radioCoreTestNxdn radioListenBandsTest aprsRadioTest aprsRadioMdcTest rda5807mTest voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest hrc7000AirTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
+          tests="sigToneTest ambeVoiceTest radioFeaturesTest radioCoreTestNxdn radioListenBandsTest aprsTest aprsRadioTest aprsRadioMdcTest rda5807mTest voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest hrc7000AirTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
             dmrFecTest dmrRxChainTest
             nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest radioCoreTestYsf
             radioCoreTestP25Nxdn radioCoreTestAirInterop fd6818Test m17Test m17VoiceTest radioCoreTestM17 radioCoreTestDstar
@@ -169,14 +169,15 @@ jobs:
                 --git "$GITHUB_SHA" --out "$GITHUB_WORKSPACE/dist"
             )
           done
-          MODE_ARGS=()
+          MODE_ARGS=(--experimental)
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            MODE_ARGS=(--only modes-p25 --only modes-p25-m17-dstar --only modes-p25-nxdn-m17-dstar --only modes-p25-ysf-m17-dstar)
+            MODE_ARGS=(--only modes-p25 --only modes-p25-m17-dstar --only modes-p25-nxdn-m17-dstar --only modes-p25-ysf-m17-dstar
+              --only modes-monitor-scan --only modes-p25-nxdn-ysf-cw --only modes-p25-nxdn-ysf-m17-dstar-monitor-scan-cw)
           fi
           python3 tools/build_mode_presets.py --tree "$TREE" --out dist --version "$VERSION" \
             --git "$GITHUB_SHA" --cross "$GITHUB_WORKSPACE/toolchain/bin/csky-elf-" --jobs 4 "${MODE_ARGS[@]}"
           ls -l dist
-          cat dist/SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Keep as artifact

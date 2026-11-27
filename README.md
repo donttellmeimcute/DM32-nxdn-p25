@@ -45,10 +45,11 @@ Puedes detenerte en un resultado, escucharlo y guardar la frecuencia
 como canal RX Only.
 
 La herramienta Morse decodifica pulsos de la envolvente RF y permite
-practicar en el altavoz con texto, CQ, el indicativo y 73. Monitor Scan
-y Morse se habilitan por separado en compilaciones personalizadas y
-quedan apagados en los perfiles de distribución. Las pruebas en placa
-siguen pendientes. Consulta [configuración, validación y límites de RF](docs/monitor-scan-cw.md).
+practicar en el altavoz con texto, CQ, el indicativo y 73. En **Custom
+Modes** del flasher puedes habilitar Monitor Scan, Morse o ambos con los
+modos digitales de Full, Multimode o DMR + FM. Los tres perfiles estándar
+arrancan con ambas opciones apagadas. Las pruebas en placa siguen pendientes.
+Consulta [configuración, validación y límites de RF](docs/monitor-scan-cw.md).
 
 ## Estado (24 de noviembre de 2026)
 
@@ -77,7 +78,7 @@ La release instalable más reciente está en [Releases](../../releases); el flas
 | DMR Tier III | Estación móvil, activada por defecto (`CONFIG_DMR_TRUNK`, `CONFIG_DMR_TRUNK_TX`): canal de control, registro, llamadas de grupo y privadas, datos cortos (RadioFoundry). Sin probar en un sistema real |
 | P25 troncal | Fase 1, activado por defecto (`CONFIG_P25_TRUNK`): canal de control, seguimiento de llamadas y **TX troncal** (registro, afiliación, petición de canal de voz con PTT) cuando el canal permite TX, tiene ID de unidad y TG y el sistema no es *solo escucha* (RadioFoundry). Sin probar en un sistema real |
 | Tonos de permiso estilo Motorola | DMR: el chirp de MOTOTRBO (cuatro notas rápidas). P25 y NXDN: el permiso de ASTRO 25 (tres bips de 910 Hz) antes de transmitir. Se apagan en Ajustes › Sonido › Tono de permiso. El primer PTT DMR tras NXDN, FM o P25 ya no sale sin voz: la voz retoma en su primer bloque la ruta del altavoz que el tono de permiso dejaba encendida (el fix 0043 se había perdido al cambiar de base; `3f1c173`, cubierto por `ambeVoiceTest` en host). **Pendiente confirmación en el aire** de ese primer PTT |
-| APRS, GPS, hotspot | Los de RadioFoundry; sin probar en el aire con esta imagen |
+| APRS, GPS, hotspot | KISS TNC usa el cable de programación a 115200 baudios con **Herramientas → APRS → KISS por USB** (en inglés, **KISS on USB**). Para recibir AX.25, sintoniza en FM la frecuencia APRS configurada. El TX AFSK separa el micrófono analógico de los tonos y RX libera el audio antes de salir del canal APRS. Validado en software. Falta la prueba física de esta compilación. |
 
 ## Cambio de base: qué se pierde y qué hacer
 
