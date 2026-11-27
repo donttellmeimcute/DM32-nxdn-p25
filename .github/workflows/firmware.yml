@@ -71,7 +71,8 @@ jobs:
           T=build/current/tests/host
           tests="sigToneTest ambeVoiceTest radioFeaturesTest radioCoreTestNxdn radioListenBandsTest aprsTest aprsRadioTest aprsRadioMdcTest rda5807mTest voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest hrc7000AirTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
             dmrFecTest dmrRxChainTest
-            nxdnTest nxdnEngineTest nxdnEngineTestAes aesTest ysfTest ysfEngineTest radioCoreTestYsf
+            nxdnTest nxdnEngineTest nxdnEngineTestAes radioCoreTestNxdnScrambler ambeVoiceReplayTest radioFeaturesReplayTest
+            aesTest ysfTest ysfEngineTest radioCoreTestYsf
             radioCoreTestP25Nxdn radioCoreTestAirInterop fd6818Test m17Test m17VoiceTest radioCoreTestM17 radioCoreTestDstar
             mmdvmTest codeplugEditTest codeplugEditTestDstar codeplugTagTest settingsTest uiFlowTest uiFlowTestReplay uiFlowTestDstar"
           make -C "$T" -j4 $tests

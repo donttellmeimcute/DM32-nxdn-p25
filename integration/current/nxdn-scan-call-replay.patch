@@ -1,0 +1,1104 @@
+diff --git a/core/dmr/ambe/ambeVoice.c b/core/dmr/ambe/ambeVoice.c
+index f3ffdd9..faea334 100644
+--- a/core/dmr/ambe/ambeVoice.c
++++ b/core/dmr/ambe/ambeVoice.c
+@@ -165,19 +165,46 @@ uint8_t ambeVoiceCapture(const ambe_cap_entry_t **entries, uint8_t *want)
+ #endif
+ 
+ #if CONFIG_DMR_REPLAY
+-// The call task is the only reader and writer of the recording. The audio task receives replay via the usual queue.
++// Replay shares the AMBE stream with the live call task (the air provider for NXDN). Control and playback
++// from the radio task are serialized against the provider. The audio task still consumes the usual queue.
++static void (*replay_lock)(void), (*replay_unlock)(void);
++static char dmr_sink_context;
++#if CONFIG_NXDN
++static char nxdn_sink_context;
++#endif
+ static struct {
+ 	uint8_t *storage;
+ 	const dmr_caller_t *caller;
+ 	uint16_t frames, next;
+-	bool enabled, ready, playing, good;
++	bool enabled, ready, playing, good, keep_stream;
++#if CONFIG_NXDN
++	bool nxdn;
++#endif
+ } replay;
+ 
++void ambeVoiceReplaySetLock(void (*lock)(void), void (*unlock)(void))
++{
++	replay_lock = lock;
++	replay_unlock = unlock;
++}
++
++static bool replay_recording(void)
++{
++	return replay.caller != NULL
++#if CONFIG_NXDN
++	       || replay.nxdn
++#endif
++		;
++}
++
+ static void replay_clear(void)
+ {
+-	if (replay.storage != NULL)
+-		memset(replay.storage, 0, AMBE_REPLAY_BYTES);
++	if (replay.frames != 0)
++		memset(replay.storage, 0, (size_t)replay.frames * 7u);
+ 	replay.caller = NULL;
++#if CONFIG_NXDN
++	replay.nxdn = false;
++#endif
+ 	replay.frames = 0;
+ 	replay.ready = replay.good = false;
+ }
+@@ -186,10 +213,11 @@ void ambeVoiceReplayInit(uint8_t storage[AMBE_REPLAY_BYTES])
+ {
+ 	memset(&replay, 0, sizeof replay);
+ 	replay.storage = storage;
+-	replay_clear();	// the AHB SRAM can survive a warm reset
++	if (storage != NULL)
++		memset(storage, 0, AMBE_REPLAY_BYTES);	// AHB SRAM can survive a warm reset
+ }
+ 
+-void ambeVoiceReplayCancel(void)
++static void replay_cancel(void)
+ {
+ 	if (replay.playing) {
+ 		replay.playing = false;
+@@ -197,35 +225,59 @@ void ambeVoiceReplayCancel(void)
+ 		STORE(rx_end_seq, next);
+ 		STORE(rx_seq, next);	// the audio task discards queued replay frames from the old sequence
+ 		if (streaming && aud != NULL) {
+-			aud->stop();
++			if (!replay.keep_stream) {
++				aud->stop();
++				streaming = false;
++			}
+ 			if (aud->speaker_pcm != NULL)
+ 				aud->speaker_pcm(false);
+-			streaming = false;
+ 		}
+ 		STORE(rx_head, LOAD(rx_tail));
+ 	}
+ }
+ 
++void ambeVoiceReplayCancel(void)
++{
++	if (replay_lock != NULL)
++		replay_lock();
++	replay_cancel();
++	if (replay_unlock != NULL)
++		replay_unlock();
++}
++
+ void ambeVoiceReplayRetune(void)
+ {
+-	ambeVoiceReplayCancel();
+-	if (replay.caller != NULL)
++	if (replay_lock != NULL)
++		replay_lock();
++	replay_cancel();
++	if (replay_recording())
+ 		replay_clear();
++	if (replay_unlock != NULL)
++		replay_unlock();
+ }
+ 
+ void ambeVoiceReplayEnable(bool on)
+ {
++	if (replay_lock != NULL)
++		replay_lock();
+ 	if (!on) {
+-		ambeVoiceReplayCancel();
++		replay_cancel();
+ 		replay_clear();
+ 	}
+ 	replay.enabled = on && replay.storage != NULL;
++	if (replay_unlock != NULL)
++		replay_unlock();
+ }
+ 
+ uint8_t ambeVoiceReplayFlags(void)
+ {
+-	return (replay.enabled ? AMBE_REPLAY_ENABLED : 0u) | (replay.ready ? AMBE_REPLAY_READY : 0u) |
+-	       (replay.playing ? AMBE_REPLAY_PLAYING : 0u);
++	if (replay_lock != NULL)
++		replay_lock();
++	uint8_t flags = (replay.enabled ? AMBE_REPLAY_ENABLED : 0u) | (replay.ready ? AMBE_REPLAY_READY : 0u) |
++			(replay.playing ? AMBE_REPLAY_PLAYING : 0u);
++	if (replay_unlock != NULL)
++		replay_unlock();
++	return flags;
+ }
+ 
+ static bool voc_ok(void);
+@@ -237,9 +289,9 @@ static bool replay_clear_group(const dmr_caller_t *c)
+ 
+ static void replay_record(const uint8_t *bits)
+ {
+-	if (replay.caller == NULL)
++	if (!replay_recording())
+ 		return;
+-	if (!replay_clear_group(replay.caller)) {
++	if (replay.caller != NULL && !replay_clear_group(replay.caller)) {
+ 		replay_clear();	// a PI or privacy announcement can arrive after the header
+ 		return;
+ 	}
+@@ -258,13 +310,32 @@ static void replay_record(const uint8_t *bits)
+ 
+ static void replay_done(void)
+ {
+-	if (!replay_clear_group(replay.caller) || !replay.good) {
++	if ((replay.caller != NULL && !replay_clear_group(replay.caller)) || !replay.good) {
+ 		replay_clear();
+ 		return;
+ 	}
+ 	replay.caller = NULL;
++#if CONFIG_NXDN
++	replay.nxdn = false;
++#endif
+ 	replay.ready = true;
+ }
++
++#if CONFIG_NXDN
++void ambeVoiceReplayNxdnBegin(bool eligible)
++{
++	if (replay.enabled) {
++		replay_clear();
++		replay.nxdn = eligible;
++	}
++}
++
++void ambeVoiceReplayNxdnReject(void)
++{
++	if (replay.nxdn)
++		replay_clear();
++}
++#endif
+ #endif
+ 
+ static void sink_begin(const dmr_caller_t *caller, void *ctx)
+@@ -274,7 +345,7 @@ static void sink_begin(const dmr_caller_t *caller, void *ctx)
+ #if CONFIG_DMR_REPLAY
+ 	if (ctx != NULL) {
+ 		ambeVoiceReplayCancel();
+-		if (replay.enabled) {
++		if (ctx == &dmr_sink_context && replay.enabled) {
+ 			replay_clear();
+ 			if (replay_clear_group(caller))
+ 				replay.caller = caller;
+@@ -334,16 +405,18 @@ static void sink_end(void *ctx)
+ {
+ 	(void)ctx;
+ #if CONFIG_DMR_REPLAY
+-	if (ctx != NULL && replay.caller != NULL)
++	if (ctx != NULL && replay_recording())
+ 		replay_done();
+ #endif
+ 	STORE(rx_end_seq, rx_seq);
+ }
+ 
+ #if CONFIG_DMR_REPLAY
+-bool ambeVoiceReplayStart(void)
++static void replay_service(void);
++
++static bool replay_start(bool keep_stream)
+ {
+-	if (!replay.ready || replay.playing || replay.caller != NULL || !voc_ok() ||
++	if (!replay.ready || replay.playing || replay_recording() || !voc_ok() ||
+ 	    LOAD(rx_tail) != rx_head || rx_seq != rx_end_seq || tx_seq != tx_end_seq)
+ 		return false;
+ 	sink_begin(NULL, NULL);
+@@ -352,12 +425,23 @@ bool ambeVoiceReplayStart(void)
+ 		return false;
+ 	}
+ 	replay.next = 0;
++	replay.keep_stream = keep_stream;
+ 	replay.playing = true;
+-	ambeVoiceReplayService();
++	replay_service();
+ 	return true;
+ }
+ 
+-void ambeVoiceReplayService(void)
++bool ambeVoiceReplayStart(bool keep_stream)
++{
++	if (replay_lock != NULL)
++		replay_lock();
++	bool started = replay_start(keep_stream);
++	if (replay_unlock != NULL)
++		replay_unlock();
++	return started;
++}
++
++static void replay_service(void)
+ {
+ 	if (!replay.playing)
+ 		return;
+@@ -378,6 +462,15 @@ void ambeVoiceReplayService(void)
+ 			replay.playing = false;
+ 	}
+ }
++
++void ambeVoiceReplayService(void)
++{
++	if (replay_lock != NULL)
++		replay_lock();
++	replay_service();
++	if (replay_unlock != NULL)
++		replay_unlock();
++}
+ #endif
+ 
+ // --- source (call task) ---
+@@ -841,11 +934,16 @@ static const dmr_voice_sink_t sink = {
+ 	.begin = sink_begin, .frame = sink_frame, .lost = sink_lost, .end = sink_end, .ctx = NULL,
+ };
+ #if CONFIG_DMR_REPLAY
+-static char dmr_sink_context;
+ static const dmr_voice_sink_t dmr_sink = {
+ 	.begin = sink_begin, .frame = sink_frame, .lost = sink_lost, .end = sink_end, .ctx = &dmr_sink_context,
+ };
+ const dmr_voice_sink_t *ambeVoiceDmrSink(void) { return &dmr_sink; }
++#if CONFIG_NXDN
++static const dmr_voice_sink_t nxdn_sink = {
++	.begin = sink_begin, .frame = sink_frame, .lost = sink_lost, .end = sink_end, .ctx = &nxdn_sink_context,
++};
++const dmr_voice_sink_t *ambeVoiceNxdnSink(void) { return &nxdn_sink; }
++#endif
+ #endif
+ static const dmr_voice_source_t source = {
+ 	.begin = source_begin, .next = source_next, .end = source_end,
+diff --git a/core/dmr/ambe/ambeVoice.h b/core/dmr/ambe/ambeVoice.h
+index c084a53..a7724c5 100644
+--- a/core/dmr/ambe/ambeVoice.h
++++ b/core/dmr/ambe/ambeVoice.h
+@@ -78,11 +78,19 @@ const dmr_voice_sink_t *ambeVoiceSink(void);
+ #define AMBE_REPLAY_ENABLED	0x01u
+ #define AMBE_REPLAY_READY	0x02u
+ #define AMBE_REPLAY_PLAYING	0x04u
++void ambeVoiceReplaySetLock(void (*lock)(void), void (*unlock)(void));
+ void ambeVoiceReplayInit(uint8_t storage[AMBE_REPLAY_BYTES]);
+ void ambeVoiceReplayEnable(bool on);
+ uint8_t ambeVoiceReplayFlags(void);
+ const dmr_voice_sink_t *ambeVoiceDmrSink(void);
+-bool ambeVoiceReplayStart(void);
++#if CONFIG_NXDN
++const dmr_voice_sink_t *ambeVoiceNxdnSink(void);
++// The NXDN provider starts a recording only from an eligible header and rejects it if later fields rule it out.
++void ambeVoiceReplayNxdnBegin(bool eligible);
++void ambeVoiceReplayNxdnReject(void);
++#endif
++// NXDN already holds the audio stream open for calls from its provider task.
++bool ambeVoiceReplayStart(bool keep_stream);
+ void ambeVoiceReplayCancel(void);
+ void ambeVoiceReplayRetune(void);
+ void ambeVoiceReplayService(void);
+diff --git a/core/nxdn/nxdn_engine.c b/core/nxdn/nxdn_engine.c
+index c294221..ae4b099 100644
+--- a/core/nxdn/nxdn_engine.c
++++ b/core/nxdn/nxdn_engine.c
+@@ -80,14 +80,15 @@ static void rx_fields(nxdn_engine_t *e, const nxdn_call_t *c, bool start)
+ 		e->played = true;
+ 		if (e->hooks.rx_start)
+ 			e->hooks.rx_start(c, e->ctx);
+-	} else if (play) {
++	} else if (e->played) {
+ 		if (e->hooks.rx_update)
+ 			e->hooks.rx_update(c, e->ctx);
+-	} else if (e->played) {
+-		// A field that came in late says the call is not for us after all (or it turned encrypted)
+-		e->played = false;
+-		if (e->hooks.rx_end)
+-			e->hooks.rx_end(e->ctx);
++		if (!play) {
++			// A field that came in late says the call is not for us after all (or it turned encrypted)
++			e->played = false;
++			if (e->hooks.rx_end)
++				e->hooks.rx_end(e->ctx);
++		}
+ 	}
+ }
+ 
+diff --git a/core/radio/radio_nxdn.c b/core/radio/radio_nxdn.c
+index 12f2106..0427d1e 100644
+--- a/core/radio/radio_nxdn.c
++++ b/core/radio/radio_nxdn.c
+@@ -313,18 +313,40 @@ static void params_channel(const channel_t *ch, uint16_t number, nxdn_engine_cfg
+ // ── Voice: the DMR side's voice path (ambeVoice.h), its sink on receive and its source on transmit. The hooks run in
+ // the provider's task, which is the only one feeding that path while NXDN runs (the DMR stack is stopped); the
+ // audio stream is started and stopped by the radio task (begin, end) ──
++#if CONFIG_DMR_REPLAY
++#define nxdn_voice_sink ambeVoiceNxdnSink
++
++static bool v_replay_eligible(const nxdn_call_t *c)
++{
++	return c->have_vcall && !c->late && !c->iv && c->vcall.cipher == NXDN_CIPHER_NONE &&
++	       c->vcall.call_type == NXDN_CALL_GROUP && c->vcall.src != NXDN_ID_NULL;
++}
++
++static void v_update(const nxdn_call_t *c, void *ctx)
++{
++	(void)ctx;
++	if (!v_replay_eligible(c))
++		ambeVoiceReplayNxdnReject();
++}
++#else
++#define nxdn_voice_sink ambeVoiceSink
++#endif
++
+ static void v_start(const nxdn_call_t *c, void *ctx)
+ {
+-	const dmr_voice_sink_t *s = ambeVoiceSink();
++	const dmr_voice_sink_t *s = nxdn_voice_sink();
+ 
+ 	(void)c;
+ 	(void)ctx;
+ 	s->begin(NULL, s->ctx);
++#if CONFIG_DMR_REPLAY
++	ambeVoiceReplayNxdnBegin(v_replay_eligible(c));
++#endif
+ }
+ 
+ static void v_voice(const uint8_t ehr[NXDN_EHR_BYTES], void *ctx)
+ {
+-	const dmr_voice_sink_t *s = ambeVoiceSink();
++	const dmr_voice_sink_t *s = nxdn_voice_sink();
+ 
+ 	(void)ctx;
+ 	s->frame(ehr, s->ctx);
+@@ -332,7 +354,7 @@ static void v_voice(const uint8_t ehr[NXDN_EHR_BYTES], void *ctx)
+ 
+ static void v_end(void *ctx)
+ {
+-	const dmr_voice_sink_t *s = ambeVoiceSink();
++	const dmr_voice_sink_t *s = nxdn_voice_sink();
+ 
+ 	(void)ctx;
+ 	s->end(s->ctx);
+@@ -372,6 +394,9 @@ static uint16_t v_key(uint8_t id, void *ctx)
+ 
+ static const nxdn_engine_hooks_t voice_hooks = {
+ 	.rx_start = v_start, .rx_voice = v_voice, .rx_end = v_end, .tx_voice = v_tx,
++#if CONFIG_DMR_REPLAY
++	.rx_update = v_update,
++#endif
+ #if CONFIG_NXDN_SCRAMBLER
+ 	.scramble_key = v_key,
+ #endif
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index cf86ddc..7853c67 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -5020,6 +5020,12 @@ static bool scan_step(radio_sm_t *sm, uint32_t now_ms)
+ 			scan_stop(sm, false, now_ms);
+ 			return false;
+ 		}
++#if CONFIG_NXDN
++		if (sm->view.ch.mode == RADIO_MODE_NXDN && radio_listen_band(hz)) {
++			scan_stop(sm, false, now_ms);
++			return false;
++		}
++#endif
+ 		vfo_set_hz(sm, hz);
+ 		tune(sm, now_ms);
+ 	} else {
+@@ -5098,6 +5104,15 @@ static void scan_start(radio_sm_t *sm, uint8_t kind, uint32_t lo_hz, uint32_t hi
+ 			lo_hz += (offset + step - lo_hz % step) % step;
+ 			hi_hz -= (hi_hz % step + step - offset) % step;
+ 		}
++#endif
++		// The lower end of the DM-32UV VHF band overlaps the AM airband.
++#if CONFIG_AM_RX && CONFIG_NXDN
++		if (sm->view.ch.mode == RADIO_MODE_NXDN && radio_am_tx_refused(lo_hz)) {
++			uint32_t step = sm->view.vfo_step_hz;
++			if (step == 0 || hi_hz < RADIO_AM_HI_HZ)
++				return;
++			lo_hz += (RADIO_AM_HI_HZ - lo_hz + step - 1u) / step * step;
++		}
+ #endif
+ 		// Both ends in one band, and room for two stops
+ 		bool same_band = false;
+@@ -9155,8 +9170,13 @@ static bool replay_idle(const radio_sm_t *sm, uint32_t now_ms)
+ 	if (sm->aprs_phase != APRS_RF_OFF)
+ 		return false;
+ #endif
+-	return sm->dmr_running && !sm->ptt && !sm->hotspot && !sm->standby && sm->view.state == RS_IDLE &&
+-	       sm->view.dmr.state == RDMR_IDLE && sm->view.scan == 0 &&
++	if (sm->ptt || sm->hotspot || sm->standby || sm->view.state != RS_IDLE || sm->view.scan != 0)
++		return false;
++#if CONFIG_NXDN
++	if (sm->view.ch.mode == RADIO_MODE_NXDN)
++		return radio_nxdn_running() && !(sm->view.nxdn.flags & RADIO_NXDN_RX);
++#endif
++	return sm->dmr_running && sm->view.dmr.state == RDMR_IDLE &&
+ 	       (!dmr_call_last_activity(&heard_ms) || now_ms - heard_ms >= 150u);
+ }
+ 
+@@ -9192,7 +9212,7 @@ static void replay_request(radio_sm_t *sm, int32_t cmd, uint32_t now_ms)
+ 			radio_status_t st;
+ 			board.radio->status(&st);
+ 			if (!replay_carrier(sm, &st))
+-				ambeVoiceReplayStart();
++				ambeVoiceReplayStart(sm->view.ch.mode == RADIO_MODE_NXDN);
+ 		}
+ 	}
+ 	replay_publish(sm);
+diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
+index b5427be..a21db32 100644
+--- a/core/radio/radio_task.c
++++ b/core/radio/radio_task.c
+@@ -24,6 +24,9 @@
+ #if CONFIG_DMR_DATA_CORE
+ #include "dmr/dmrDataService.h"
+ #endif
++#if CONFIG_DMR_REPLAY
++#include "dmr/ambe/ambeVoice.h"
++#endif
+ #if CONFIG_DMR_EMERGENCY
+ #include "dmr/dmr_emergency.h"
+ #endif
+@@ -309,8 +312,8 @@ static void data_lock(void) { vTaskSuspendAll(); }
+ static void data_unlock(void) { (void)xTaskResumeAll(); }
+ #endif
+ 
+-#if CONFIG_POSITION
+-// The position service's and the APRS engine's any-task calls (position.h, aprs.h): short copies, the same way
++#if CONFIG_POSITION || CONFIG_DMR_REPLAY
++// Short copies shared across tasks. Replay also serializes its audio queue producer with the NXDN provider.
+ static void copy_lock(void) { vTaskSuspendAll(); }
+ static void copy_unlock(void) { (void)xTaskResumeAll(); }
+ #endif
+@@ -323,6 +326,9 @@ void radio_core_start(void)
+ #if CONFIG_POSITION
+ 	position_set_lock(copy_lock, copy_unlock);
+ #endif
++#if CONFIG_DMR_REPLAY
++	ambeVoiceReplaySetLock(copy_lock, copy_unlock);
++#endif
+ #if CONFIG_DMR_DATA_CORE
+ 	dmrDataServiceSetLock(data_lock, data_unlock);
+ #endif
+diff --git a/core/ui/lang/es.po b/core/ui/lang/es.po
+index 502b85c..7ca185c 100644
+--- a/core/ui/lang/es.po
++++ b/core/ui/lang/es.po
+@@ -662,18 +662,18 @@ msgstr "Destino: solo canales DMR"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_OFF"
+-msgid "Talk & listen: Record DMR"
+-msgstr "Hablar y escuchar: Grabar DMR"
++msgid "Enable Record calls first"
++msgstr "Activa Grabar llamadas"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_EMPTY"
+-msgid "No DMR recording"
+-msgstr "Sin grabación DMR"
++msgid "No recording"
++msgstr "Sin grabación"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_BUSY"
+-msgid "Wait for idle DMR"
+-msgstr "Espera canal DMR libre"
++msgid "Wait for idle digital channel"
++msgstr "Espera un canal digital libre"
+ 
+ #: core/ui/ui_app.c core/ui/ui_menus.c
+ msgctxt "SET_LABEL_TG_NAME_FIRST"
+@@ -4057,8 +4057,8 @@ msgstr "Nombre / número TG"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "KEYFN_VALUE_DMR_REPLAY"
+-msgid "Replay DMR"
+-msgstr "Reproducir DMR"
++msgid "Replay call"
++msgstr "Reproducir llamada"
+ 
+ #: core/ui/ui_menus.c core/ui/ui_screens.c
+ msgctxt "TITLE_EMERGENCY"
+@@ -4340,8 +4340,8 @@ msgstr "ID CW SFR"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DMR_RECORDING"
+-msgid "Record clear DMR"
+-msgstr "Grabar DMR en claro"
++msgid "Record calls"
++msgstr "Grabar llamadas"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_PRIVACY_KEY_TYPE"
+diff --git a/core/ui/lang/fr.po b/core/ui/lang/fr.po
+index 9ff97ac..7d6cd34 100644
+--- a/core/ui/lang/fr.po
++++ b/core/ui/lang/fr.po
+@@ -654,18 +654,18 @@ msgstr "Cible : DMR seul"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_OFF"
+-msgid "Talk & listen: Record DMR"
+-msgstr "Parler et écouter : enregistrer DMR"
++msgid "Enable Record calls first"
++msgstr "Activez Enregistrer les appels"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_EMPTY"
+-msgid "No DMR recording"
+-msgstr "Aucun enregistrement DMR"
++msgid "No recording"
++msgstr "Aucun enregistrement"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_BUSY"
+-msgid "Wait for idle DMR"
+-msgstr "Attendez un canal DMR libre"
++msgid "Wait for idle digital channel"
++msgstr "Attendez un canal numérique libre"
+ 
+ #: core/ui/ui_app.c core/ui/ui_menus.c
+ msgctxt "SET_LABEL_TG_NAME_FIRST"
+@@ -4049,8 +4049,8 @@ msgstr "Nom / numéro TG"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "KEYFN_VALUE_DMR_REPLAY"
+-msgid "Replay DMR"
+-msgstr "Écouter DMR"
++msgid "Replay call"
++msgstr "Rejouer un appel"
+ 
+ #: core/ui/ui_menus.c core/ui/ui_screens.c
+ msgctxt "TITLE_EMERGENCY"
+@@ -4332,8 +4332,8 @@ msgstr "ID CW SFR"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DMR_RECORDING"
+-msgid "Record clear DMR"
+-msgstr "Enregistrer DMR clair"
++msgid "Record calls"
++msgstr "Enregistrer les appels"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_PRIVACY_KEY_TYPE"
+diff --git a/core/ui/lang/it.po b/core/ui/lang/it.po
+index 965896f..5218cd7 100644
+--- a/core/ui/lang/it.po
++++ b/core/ui/lang/it.po
+@@ -654,18 +654,18 @@ msgstr "Destinaz.: solo canali DMR"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_OFF"
+-msgid "Talk & listen: Record DMR"
+-msgstr "Parla e ascolta: registra DMR"
++msgid "Enable Record calls first"
++msgstr "Attiva Registra chiamate"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_EMPTY"
+-msgid "No DMR recording"
+-msgstr "Nessuna registrazione DMR"
++msgid "No recording"
++msgstr "Nessuna registrazione"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_BUSY"
+-msgid "Wait for idle DMR"
+-msgstr "Attendi un canale DMR libero"
++msgid "Wait for idle digital channel"
++msgstr "Attendi un canale digitale libero"
+ 
+ #: core/ui/ui_app.c core/ui/ui_menus.c
+ msgctxt "SET_LABEL_TG_NAME_FIRST"
+@@ -4049,8 +4049,8 @@ msgstr "Nome / numero TG"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "KEYFN_VALUE_DMR_REPLAY"
+-msgid "Replay DMR"
+-msgstr "Riascolta DMR"
++msgid "Replay call"
++msgstr "Riproduci chiamata"
+ 
+ #: core/ui/ui_menus.c core/ui/ui_screens.c
+ msgctxt "TITLE_EMERGENCY"
+@@ -4332,8 +4332,8 @@ msgstr "ID CW SFR"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DMR_RECORDING"
+-msgid "Record clear DMR"
+-msgstr "Registra DMR in chiaro"
++msgid "Record calls"
++msgstr "Registra chiamate"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_PRIVACY_KEY_TYPE"
+diff --git a/core/ui/lang/zh.po b/core/ui/lang/zh.po
+index 1f453f3..7b15b29 100644
+--- a/core/ui/lang/zh.po
++++ b/core/ui/lang/zh.po
+@@ -656,18 +656,18 @@ msgstr "通话目标：仅 DMR 信道"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_OFF"
+-msgid "Talk & listen: Record DMR"
+-msgstr "通话与收听：记录DMR"
++msgid "Enable Record calls first"
++msgstr "请先启用通话录音"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_EMPTY"
+-msgid "No DMR recording"
+-msgstr "无DMR录音"
++msgid "No recording"
++msgstr "没有录音"
+ 
+ #: core/ui/ui_app.c
+ msgctxt "DMR_REPLAY_BUSY"
+-msgid "Wait for idle DMR"
+-msgstr "请等待DMR空闲"
++msgid "Wait for idle digital channel"
++msgstr "等待数字信道空闲"
+ 
+ #: core/ui/ui_app.c core/ui/ui_menus.c
+ msgctxt "SET_LABEL_TG_NAME_FIRST"
+@@ -4051,8 +4051,8 @@ msgstr "TG 名称/号码"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "KEYFN_VALUE_DMR_REPLAY"
+-msgid "Replay DMR"
+-msgstr "回放DMR"
++msgid "Replay call"
++msgstr "播放通话"
+ 
+ #: core/ui/ui_menus.c core/ui/ui_screens.c
+ msgctxt "TITLE_EMERGENCY"
+@@ -4334,8 +4334,8 @@ msgstr "单频中继 CW ID"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_DMR_RECORDING"
+-msgid "Record clear DMR"
+-msgstr "记录未加密DMR"
++msgid "Record calls"
++msgstr "通话录音"
+ 
+ #: core/ui/ui_menus.c
+ msgctxt "SET_LABEL_PRIVACY_KEY_TYPE"
+diff --git a/core/ui/ui_app.c b/core/ui/ui_app.c
+index 96ffe7c..e73c167 100644
+--- a/core/ui/ui_app.c
++++ b/core/ui/ui_app.c
+@@ -2559,16 +2559,21 @@ void ui_app_key(const input_event_t *ev)
+ 			return;
+ #endif
+ #if CONFIG_DMR_REPLAY
+-		case ACT_DMR_REPLAY:
++		case ACT_DMR_REPLAY: {
++			bool digital = view->dmr.active;
++#if CONFIG_NXDN
++			digital |= (view->nxdn.flags & RADIO_NXDN_ON) != 0;
++#endif
+ 			if (!view->dmr.replay_enabled)
+-				ui_toast(TR(DMR_REPLAY_OFF, "Talk & listen: Record DMR"));
++				ui_toast(TR(DMR_REPLAY_OFF, "Enable Record calls first"));
+ 			else if (!view->dmr.replay_ready)
+-				ui_toast(TR(DMR_REPLAY_EMPTY, "No DMR recording"));
+-			else if (!view->dmr.active || view->state != RS_IDLE || view->scan != 0)
+-				ui_toast(TR(DMR_REPLAY_BUSY, "Wait for idle DMR"));
++				ui_toast(TR(DMR_REPLAY_EMPTY, "No recording"));
++			else if (!digital || view->state != RS_IDLE || view->scan != 0)
++				ui_toast(TR(DMR_REPLAY_BUSY, "Wait for idle digital channel"));
+ 			else
+ 				radio_req_dmr_replay(RADIO_DMR_REPLAY_PLAY);
+ 			return;
++		}
+ #endif
+ 		case ACT_CALL_BACK:
+ 			call_back_key();
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index 2fa6b45..b28429e 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -8140,7 +8140,7 @@ static const tr_id_t n_keyfn_press[] = { TRN(VALUE_DEFAULT, "Default"), TRN(KEYF
+ 					     TRX(KEYFN_VALUE_A_B, "A/B"), TRN(WORD_DUAL_WATCH, "Dual watch"),
+ #endif
+ #if CONFIG_DMR_REPLAY
+-					     TRN(KEYFN_VALUE_DMR_REPLAY, "Replay DMR"),
++					     TRN(KEYFN_VALUE_DMR_REPLAY, "Replay call"),
+ #endif
+ };
+ static const int16_t v_keyfn_hold[] = { KEYFN_DEFAULT, KEYFN_NONE, KEYFN_TALK_TARGET, KEYFN_POWER, KEYFN_ZONE_UP,
+@@ -8182,7 +8182,7 @@ static const tr_id_t n_keyfn_hold[] = { TRN(VALUE_DEFAULT, "Default"), TRN(KEYFN
+ 					    TRX(KEYFN_VALUE_A_B, "A/B"), TRN(WORD_DUAL_WATCH, "Dual watch"),
+ #endif
+ #if CONFIG_DMR_REPLAY
+-					    TRN(KEYFN_VALUE_DMR_REPLAY, "Replay DMR"),
++					    TRN(KEYFN_VALUE_DMR_REPLAY, "Replay call"),
+ #endif
+ };
+ #endif
+@@ -8386,7 +8386,7 @@ static const set_item_t s_talk[] = {
+ 		UI_SET_SFR_CWID, v_sfrcwid, n_sfrcwid),
+ #endif
+ #if CONFIG_DMR_REPLAY
+-	TOGGLE(TRN(SET_LABEL_DMR_RECORDING, "Record clear DMR"), "record replay voice this session", UI_SET_DMR_REPLAY),
++	TOGGLE(TRN(SET_LABEL_DMR_RECORDING, "Record calls"), "record replay voice this session", UI_SET_DMR_REPLAY),
+ #endif
+ };
+ static const set_item_t s_privacy[] = {
+diff --git a/docs/user/09-dmr.md b/docs/user/09-dmr.md
+index 7e26200..adc1d9c 100644
+--- a/docs/user/09-dmr.md
++++ b/docs/user/09-dmr.md
+@@ -129,13 +129,13 @@ window ("Reply ended").
+ 
+ ## Replay the last clear group call
+ 
+-Where DMR replay is available, turn on **Settings > Talk & listen > Record clear DMR** for this session. In
+-**Settings > Keys**, assign **Replay DMR** to a programmable key. Press it while on an idle DMR channel to listen
+-through the speaker. Press it again to stop. A live signal or transmission takes priority over replay.
++Where call replay is available, turn on **Settings > Talk & listen > Record calls** for this session. In
++**Settings > Keys**, assign **Replay call** to a programmable key. Press it on an idle DMR or NXDN channel to
++listen through the speaker. Press it again to stop. A live signal or transmission takes priority over replay.
+ 
+-The recorder keeps up to the first 30 seconds of the latest clear DMR group call whose opening header was heard.
+-Private and encrypted calls are excluded. The recording is held in RAM and erased when recording is turned off or
+-the radio powers down. Recording starts off at every power-up. A working DMR voice codec is required.
++The recorder keeps up to the first 30 seconds of the latest clear DMR or NXDN group call whose opening header was
++heard. Private, scrambled and encrypted calls are excluded. The recording is held in RAM and erased when recording
++is turned off or the radio powers down. Recording starts off at every power-up. A working AMBE voice codec is required.
+ 
+ ## Calling back later
+ 
+diff --git a/docs/user/12-scan.md b/docs/user/12-scan.md
+index b4571cb..4a850fa 100644
+--- a/docs/user/12-scan.md
++++ b/docs/user/12-scan.md
+@@ -17,7 +17,8 @@ is in ("Scanning the band"). The status line shows SCAN, and the channel name ch
+ For a narrower VFO scan, tune the lower frequency and press **OK** on **Tools > Scan low**. Tune the upper frequency
+ and press **OK** on **Tools > Scan high**. The radio remembers both. When the limits are in the active band and at least
+ one VFO step apart, scanning stays within them. Set the step under **Settings > Talk & listen > VFO step**. Hold **OK**
+-on either limit to clear it and scan the full band again.
++on either limit to clear it and scan the full band again. On the DM-32UV, a VHF NXDN VFO scan skips the overlap
++with the AM airband below 137 MHz, keeping the selected NXDN rate throughout the sweep.
+ 
+ A scan needs at least one other channel to go to. It doesn't run in hotspot mode or while you transmit.
+ 
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 9c80a79..6d4203e 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -425,7 +425,7 @@ radioCoreTestNxdn: $(RCNXDN) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dm
+ RCNXSC  := $(sort $(RCNXDN) $(SCRAMBLE))
+ radioCoreTestNxdnScrambler: $(RCNXSC) $(wildcard $(CORE)/radio/*.h $(CORE)/nxdn/*.h)
+ 	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
+-		-DCONFIG_NXDN=1 -DCONFIG_AIR_RAW=1 -DCONFIG_NXDN_SCRAMBLER=1 -o $@ $(RCNXSC) -lm
++		-DCONFIG_NXDN=1 -DCONFIG_AIR_RAW=1 -DCONFIG_NXDN_SCRAMBLER=1 -DCONFIG_AM_RX=1 -DCONFIG_DMR_REPLAY=1 -o $@ $(RCNXSC) -lm
+ 
+ # The same with YSF (CONFIG_YSF): the far end is a YSF engine on the fake board.air; the voice goes
+ # through the DMR side's vocoder path. No vocoder lends memory (as on the STM32 platform)
+diff --git a/tests/host/ambeVoiceTest.c b/tests/host/ambeVoiceTest.c
+index 33d7e14..f441260 100644
+--- a/tests/host/ambeVoiceTest.c
++++ b/tests/host/ambeVoiceTest.c
+@@ -671,11 +671,11 @@ static void testReplay(void)
+ 	CHECK(!ambeVoiceReplayFlags() && store[0] == 0 && store[AMBE_REPLAY_BYTES] == 0xa5,
+ 	      "boot erases only its private area and is off");
+ 	replay_test_call(&c, 3);
+-	CHECK(!ambeVoiceReplayStart() && store[0] == 0, "no recording before opt-in");
++	CHECK(!ambeVoiceReplayStart(false) && store[0] == 0, "no recording before opt-in");
+ 	ambeVoiceReplayEnable(true);
+ 	replay_test_call(&c, AMBE_REPLAY_FRAMES + 6);
+ 	CHECK(ambeVoiceReplayFlags() == (AMBE_REPLAY_ENABLED | AMBE_REPLAY_READY), "a clear group call is ready");
+-	CHECK(ambeVoiceReplayStart(), "replay starts");
++	CHECK(ambeVoiceReplayStart(false), "replay starts");
+ 	for (unsigned i = 0; i < AMBE_REPLAY_FRAMES; i++) {
+ 		block();
+ 		makeFrame((int)i, bits, frame);
+@@ -685,23 +685,23 @@ static void testReplay(void)
+ 	block();
+ 	CHECK(!(ambeVoiceReplayFlags() & AMBE_REPLAY_PLAYING) && !speaker_on && spkSilent() && store[AMBE_REPLAY_BYTES] == 0xa5,
+ 	      "playback and storage stop at exactly 30 seconds");
+-	CHECK(ambeVoiceReplayStart(), "a second replay starts");
++	CHECK(ambeVoiceReplayStart(false), "a second replay starts");
+ 	block();
+ 	CHECK(speaker_on, "second replay reaches the speaker");
+ 	ambeVoiceReplayCancel();
+ 	CHECK(!speaker_on && cb == NULL && !(ambeVoiceReplayFlags() & AMBE_REPLAY_PLAYING), "preemption cuts the route and flushes audio");
+-	CHECK(ambeVoiceReplayStart(), "can restart a preempted recording");
++	CHECK(ambeVoiceReplayStart(false), "can restart a preempted recording");
+ 	c.encrypted = true;
+ 	replay_test_call(&c, 6);
+-	CHECK(!ambeVoiceReplayStart() && store[0] == 0, "an encrypted call is never retained even if offered to the sink");
++	CHECK(!ambeVoiceReplayStart(false) && store[0] == 0, "an encrypted call is never retained even if offered to the sink");
+ 	c.encrypted = false;
+ 	c.group = false;
+ 	replay_test_call(&c, 6);
+-	CHECK(!ambeVoiceReplayStart(), "a private call is never retained");
++	CHECK(!ambeVoiceReplayStart(false), "a private call is never retained");
+ 	c.group = true;
+ 	c.late_entry = true;
+ 	replay_test_call(&c, 6);
+-	CHECK(!ambeVoiceReplayStart(), "late entry without its initial privacy signaling is excluded");
++	CHECK(!ambeVoiceReplayStart(false), "late entry without its initial privacy signaling is excluded");
+ 	c.late_entry = false;
+ 	const dmr_voice_sink_t *sink = ambeVoiceDmrSink();
+ 	sink->begin(&c, sink->ctx);
+@@ -710,12 +710,12 @@ static void testReplay(void)
+ 	c.pi_header = true;
+ 	sink->frame(frame, sink->ctx);
+ 	sink->end(sink->ctx);
+-	CHECK(!ambeVoiceReplayStart() && store[0] == 0, "a late privacy header purges a provisional buffer");
++	CHECK(!ambeVoiceReplayStart(false) && store[0] == 0, "a late privacy header purges a provisional buffer");
+ 	c.pi_header = false;
+ 	replay_test_call(&c, 6);
+-	CHECK(ambeVoiceReplayStart(), "a subsequent clear call is available");
++	CHECK(ambeVoiceReplayStart(false), "a subsequent clear call is available");
+ 	ambeVoiceReplayEnable(false);
+-	CHECK(!ambeVoiceReplayFlags() && store[0] == 0 && !speaker_on && !ambeVoiceReplayStart(), "opt-out clears the clip");
++	CHECK(!ambeVoiceReplayFlags() && store[0] == 0 && !speaker_on && !ambeVoiceReplayStart(false), "opt-out clears the clip");
+ }
+ #endif
+ 
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index cf58e18..432d545 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -565,11 +565,15 @@ static void air_step(void);	// with the far radio's engine, below
+ static bool far_on_air(void) { return false; }
+ #endif
+ 
++#if CONFIG_DMR_REPLAY
++static uint8_t replay_storage[AMBE_REPLAY_BYTES];
++#endif
++
+ const board_t board = {
+ 	.name = "fake",
+ 	.hwopts = fake_hwopts,
+ 	.hwopt_count = 1,
+-	.caps = CAP_GPS,
++	.caps = CAP_GPS | (CONFIG_AM_RX ? CAP_AM_RX : 0),
+ 	.gps = &fake_gps,
+ 	.bands = bands,
+ 	.band_count = 4,
+@@ -590,6 +594,9 @@ const board_t board = {
+ 	.dmr = &sim_modem,
+ 	.audio = &fake_audio,
+ 	.vocoder = &fake_vocoder,
++#if CONFIG_DMR_REPLAY
++	.dmr_replay = replay_storage,
++#endif
+ #if CONFIG_APRS_RX && CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF
+ 	.afsk = &fake_afsk,
+ #endif
+@@ -4149,6 +4156,13 @@ bool radio_get_dual(radio_dual_ref_t ref[2], uint8_t *sel, uint8_t *at)
+ 	return sm.scan.kind == SCAN_DUAL;
+ }
+ void radio_req_roam(uint8_t cmd) { req(RREQ_ROAM, cmd); }
++#if CONFIG_DMR_REPLAY
++bool radio_req_dmr_replay(radio_dmr_replay_cmd_t cmd)
++{
++	req(RREQ_DMR_REPLAY, cmd);
++	return true;
++}
++#endif
+ void radio_req_beep(uint8_t b) { req(RREQ_BEEP, b); }
+ void radio_req_beep_after(uint8_t b, uint32_t delay_ms)
+ {
+@@ -9161,6 +9175,46 @@ bool nxdn_conv_save(uint16_t number, const channel_t *ch, const nxdn_conv_t *con
+ }
+ 
+ #if CONFIG_SCAN
++#if CONFIG_AM_RX
++static bool nxdn_scan_am_rx(uint32_t hz, radio_bw_t bw)
++{
++	return r_rx(hz, bw, &(subtone_t){ TONE_NONE, 0 });
++}
++
++static void test_nxdn_vfo_scan_am(void)
++{
++	fake_radio.rx_am = nxdn_scan_am_rx;
++	for (uint8_t variant = VFO_VARIANT_FIRST; variant <= VFO_VARIANT_SECOND; variant++) {
++		setup_codeplug_nxdn();
++		start();
++		req(RREQ_VFO, 1);
++		req(RREQ_VFO_SET, 173987500);
++		req(RREQ_VFO_STEP_SIZE, 12500);
++		radio_req_vfo_mode(RADIO_MODE_NXDN, variant);
++		req(RREQ_SCAN, RSCAN_VFO);
++		CHECK(sm.scan.lo_hz == 137000000 && sm.scan.hi_hz == 174000000);
++		for (uint32_t elapsed = 0; elapsed < 1200; elapsed += RADIO_POLL_MS) {
++			run(RADIO_POLL_MS);
++			CHECK(sm.view.scan == SCAN_VFO && sm.view.ch.mode == RADIO_MODE_NXDN && !sm.view.am);
++			CHECK((sm.view.ch.vfo_digital & VFO_DIG_NXDN_MASK) == variant && radio_nxdn_running());
++			CHECK(hw.rx_hz >= 137000000);
++		}
++		CHECK(hw.rx_hz < 140000000);  // wrapped without tuning any AM frequencies
++		req(RREQ_SCAN, RSCAN_STOP);
++		CHECK(sm.view.ch.mode == RADIO_MODE_NXDN);
++
++		// A user range straddling the boundary keeps the original frequency raster.
++		radio_sm_request(&sm, &(radio_req_t){ RREQ_SCAN_VFO, 136991000, 137040000 }, now);
++		CHECK(sm.scan.lo_hz == 137003500 && sm.scan.hi_hz == 137040000);
++		CHECK(sm.view.scan == SCAN_VFO && sm.view.ch.mode == RADIO_MODE_NXDN);
++		req(RREQ_SCAN, RSCAN_STOP);
++		radio_sm_request(&sm, &(radio_req_t){ RREQ_SCAN_VFO, 136975000, 136995000 }, now);
++		CHECK(sm.view.scan == 0 && sm.view.ch.mode == RADIO_MODE_NXDN);
++	}
++	fake_radio.rx_am = NULL;
++}
++#endif
++
+ // A zone scan over a stored NXDN channel (docs/spec/nxdn.md 6.4): it stops there, holds on a call that plays (once its
+ // VCALL says so) and moves on from one that doesn't; a channel at a rate the board can't receive is left out
+ static void test_nxdn_scan(void)
+@@ -9494,7 +9548,10 @@ static void test_nxdn_aes(void)
+ 	CHECK(sm.view.channel_number == 3 && radio_nxdn_running());
+ 	CHECK(v->tx_aes_ready);
+ 
+-	// A call encrypted with key id 9: played
++	// A call encrypted with key id 9: played, but not recorded.
++#if CONFIG_DMR_REPLAY
++	req(RREQ_DMR_REPLAY, RADIO_DMR_REPLAY_ON);
++#endif
+ 	nfar_key = key;
+ 	nfar_kid = 9;
+ 	nfar_begin(true, 7, 2001, false, 20);
+@@ -9505,6 +9562,10 @@ static void test_nxdn_aes(void)
+ 	CHECK(v->src == 2001 && v->dst == 20 && hw.led[LED_GREEN]);
+ 	nxdn_engine_tx_stop(&nfar);
+ 	run(500);
++#if CONFIG_DMR_REPLAY
++	CHECK(sm.view.dmr.replay_enabled && !sm.view.dmr.replay_ready);
++	req(RREQ_DMR_REPLAY, RADIO_DMR_REPLAY_OFF);
++#endif
+ 
+ 	// Another key id: shown as encrypted, never played
+ 	nfar_kid = 10;
+@@ -9915,6 +9976,9 @@ static void test_nxdn_scrambler(void)
+ 	kv_t3_clear();
+ 	kv_t3_set(CODEPLUG_KEY_TRAFFIC, key4, sizeof key4);
+ 	kv_t3_set(CODEPLUG_KEY_TRAFFIC + 1, key7, sizeof key7);
++#if CONFIG_DMR_REPLAY
++	req(RREQ_DMR_REPLAY, RADIO_DMR_REPLAY_ON);
++#endif
+ 	for (int rate = 0; rate <= 1; rate++) {
+ 		stored_nxdn[3].conv.rate9600 = rate != 0;
+ 		req(RREQ_ZONE_POS, 0);
+@@ -9930,6 +9994,9 @@ static void test_nxdn_scrambler(void)
+ 		CHECK((sm.view.nxdn.flags & (RADIO_NXDN_ENC | RADIO_NXDN_PLAYED)) == (RADIO_NXDN_ENC | RADIO_NXDN_PLAYED));
+ 		nxdn_engine_tx_stop(&nfar);
+ 		run(550);
++#if CONFIG_DMR_REPLAY
++		CHECK(sm.view.dmr.replay_enabled && !sm.view.dmr.replay_ready);
++#endif
+ 		nfar_scramble_id = 8;
+ 		nfar_begin(rate != 0, 1, 2001, false, 20);
+ 		CHECK(nxdn_engine_tx_prepare(&nfar) && nxdn_engine_tx_go(&nfar));
+@@ -9963,6 +10030,46 @@ static void test_nxdn_scrambler(void)
+ 	memset(stored_nxdn, 0, sizeof stored_nxdn);
+ }
+ 
++#if CONFIG_DMR_REPLAY
++static void test_nxdn_replay(void)
++{
++	setup_codeplug_nxdn();
++	start();
++	nxdn_defaults();
++	aud.feed = true;
++	req(RREQ_VFO, 1);
++	req(RREQ_VFO_SET, 446100000);
++	req(RREQ_DMR_REPLAY, RADIO_DMR_REPLAY_ON);
++	CHECK(sm.view.dmr.replay_enabled && !sm.view.dmr.replay_ready);
++	for (uint8_t variant = VFO_VARIANT_FIRST; variant <= VFO_VARIANT_SECOND; variant++) {
++		bool wide = variant == VFO_VARIANT_SECOND;
++		radio_req_vfo_mode(RADIO_MODE_NXDN, variant);
++		nfar_begin(wide, 1, 2001, false, 20);
++		nfar_next = 0;
++		nfar_call(1000);
++		run(350);
++		CHECK(sm.view.state == RS_IDLE && sm.view.dmr.replay_ready);
++		dec_next = 0;
++		dec_in_order = 0;
++		v_decode_hook = dec_hook;
++		req(RREQ_DMR_REPLAY, RADIO_DMR_REPLAY_PLAY);
++		CHECK(sm.view.dmr.replay_playing);
++		run(240);
++		CHECK(aud.pcm && dec_in_order >= 8 && !hw.keyed);
++		v_decode_hook = NULL;
++
++		// A private call interrupts replay and must never become the stored recording.
++		nfar_begin(wide, 1, 2002, true, 1);
++		nfar_call(800);
++		run(350);
++		CHECK(!sm.view.dmr.replay_playing && !sm.view.dmr.replay_ready && aud.started);
++	}
++	req(RREQ_DMR_REPLAY, RADIO_DMR_REPLAY_OFF);
++	CHECK(!sm.view.dmr.replay_enabled && !sm.view.dmr.replay_ready);
++	nfar_stop();
++}
++#endif
++
+ static void test_nxdn(void)
+ {
+ 	test_nxdn_rx();
+@@ -9976,8 +10083,14 @@ static void test_nxdn(void)
+ 	test_nxdn_mode();
+ 	test_nxdn_stored();
+ 	test_nxdn_quick_stored();
++#if CONFIG_DMR_REPLAY
++	test_nxdn_replay();
++#endif
+ #if CONFIG_SCAN
+ 	test_nxdn_scan();
++#if CONFIG_AM_RX
++	test_nxdn_vfo_scan_am();
++#endif
+ #if CONFIG_DUAL_WATCH
+ 	test_nxdn_dual();
+ 	test_nxdn_dual_vfo_monitor();
+diff --git a/tests/host/sim/ui_sim.c b/tests/host/sim/ui_sim.c
+index 2a9b269..a376e50 100644
+--- a/tests/host/sim/ui_sim.c
++++ b/tests/host/sim/ui_sim.c
+@@ -2292,6 +2292,12 @@ bool ui_svc_mode(uint8_t mode)
+ 	retune();
+ 	view.ch.mode = mode;
+ 	view.dmr.active = mode == RADIO_MODE_DMR;
++#if CONFIG_NXDN
++	if (mode == RADIO_MODE_NXDN)
++		view.nxdn.flags |= RADIO_NXDN_ON;
++	else
++		view.nxdn.flags &= (uint8_t)~RADIO_NXDN_ON;
++#endif
+ 	if (view.vfo) {
+ 		vfo_mode = mode;
+ 		default_target();
+diff --git a/tests/host/uiFlowTest.c b/tests/host/uiFlowTest.c
+index 5ae787b..0e8e197 100644
+--- a/tests/host/uiFlowTest.c
++++ b/tests/host/uiFlowTest.c
+@@ -2181,7 +2181,7 @@ static void replay_key_checks(void)
+ {
+ 	char err[240];
+ 	sim_reset(&sim_geoms[3], SIM_MAP_K);
+-	if (!sim_run("replaykey expect:toast=Talk_&_listen:_Record_DMR expect:shows=Record", err, sizeof err)) {
++	if (!sim_run("replaykey expect:toast=Enable_Record_calls_first expect:shows=Record", err, sizeof err)) {
+ 		printf("FAIL DMR recording off message: %s\n", err);
+ 		fails++;
+ 	}
+@@ -2191,6 +2191,13 @@ static void replay_key_checks(void)
+ 		printf("FAIL DMR Replay programmable action: %s\n", err);
+ 		fails++;
+ 	}
++#if CONFIG_NXDN
++	if (!sim_run("vfokey dlmode:nxdn replaykey", err, sizeof err) || !sim_view()->dmr.replay_playing ||
++	    !sim_run("replaykey", err, sizeof err) || sim_view()->dmr.replay_playing) {
++		printf("FAIL NXDN Replay programmable action: %s\n", err);
++		fails++;
++	}
++#endif
+ }
+ #endif
+ 

@@ -236,6 +236,7 @@ def prepare(tree, dstar=False):
 	              'monitor-scan-air-validation.patch'):
 		run('git', 'apply', '--binary', PATCH_DIR / patch, cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'dm32-kiss-tnc-afsk.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'nxdn-scan-call-replay.patch', cwd=tree)
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
 
 
