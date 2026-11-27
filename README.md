@@ -30,6 +30,15 @@ los cambios de esta rama en [`integration/current/base.patch`](integration/curre
 | YSF | System Fusion V/D-1, DN y VW |
 | D-STAR | DV simplex en el VFO y en memorias. Guardado verificado en software, con pruebas de RF pendientes |
 
+## Programación con CHIRP
+
+La comunidad comparte un controlador beta para [PocketCHIRP](https://pocketchirp.com)
+y [CHIRP de escritorio](https://chirpmyradio.com). Descarga
+[`pc_dm32uv_multimode.py`](https://github.com/donttellmeimcute/DM32-nxdn-p25/issues/116#issuecomment-7207860534)
+y busca el modelo **PC-DM-32UV Multimode**. La versión del controlador se
+preparó con el firmware `8ec4a85d`. Conserva una copia del codeplug antes de
+escribir en la radio.
+
 ## Gráfica RSSI
 
 Abre **Menú → Herramientas → Gráfica RSSI** para ver la intensidad en dBm de la frecuencia sintonizada,
@@ -42,7 +51,9 @@ al girar una antena direccional. Los huecos indican que faltó una lectura del r
 Monitor Scan recorre una cuadrícula VHF/UHF, usa el RSSI para decidir
 cuándo probar los decodificadores y mantiene la radio en solo recepción.
 Puedes detenerte en un resultado, escucharlo y guardar la frecuencia
-como canal RX Only.
+como canal RX Only. Desde el VFO, abre el menú rápido y pulsa **#** para
+abrir **Señales → Escaneo cercano**. Selecciona **Digital** para buscar DMR,
+NXDN, YSF y los demás modos digitales habilitados en la compilación.
 
 La herramienta Morse decodifica pulsos de la envolvente RF y permite
 practicar en el altavoz con texto, CQ, el indicativo y 73. En **Custom

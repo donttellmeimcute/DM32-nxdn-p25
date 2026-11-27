@@ -1,0 +1,135 @@
+diff --git a/boards/dm32/radio_dm32.c b/boards/dm32/radio_dm32.c
+index 3055313..afbddeb 100644
+--- a/boards/dm32/radio_dm32.c
++++ b/boards/dm32/radio_dm32.c
+@@ -743,7 +743,8 @@ static void status(radio_status_t *st)
+ 	last_rssi_raw = fd6818_rssi_raw(r67);
+ 	last_noise_raw = r65 & 0xFFu;
+ 	st->rssi_dbm = fd6818_rssi_dbm(r67);
+-	st->noise = fd6818_noise(r65);	// the chip's floor lifted above the core's squelch levels (fd6818.h)
++	st->noise = mode == RADIO_MODE_FM && have_rx && !asleep && !transmitting && !fd6818_am_on(&fd) ?
++		fd6818_dm32_fm_noise(r65, rx_hz) : fd6818_noise(r65);
+ #if CONFIG_AM_RX
+ 	(void)fd6818_am_status(&fd, r65, r67, &st->rssi_dbm, &st->noise);	// AM: its own level and squelch value
+ #endif
+@@ -961,7 +962,7 @@ const hal_radio_t dm32_radio = {
+ 	.status = status,
+ 	.audio = audio,
+ 	.volume = NULL,
+-	.fm_squelch_l1_margin = 2,	// weak FM can open below raw noise 41; the empty-channel floor starts at 43
++	.fm_squelch_l1_margin = 2,	// loosen level 1 within the close hysteresis
+ #if CONFIG_REF_TRIM
+ 	.ref_trim = ref_trim,
+ #endif
+diff --git a/docs/spec/hardware-dm32.md b/docs/spec/hardware-dm32.md
+index 491f38f..b411db9 100644
+--- a/docs/spec/hardware-dm32.md
++++ b/docs/spec/hardware-dm32.md
+@@ -776,9 +776,11 @@ Checked on the radio by hand (2026-10-30): 10 ppm moved the carrier 4400 Hz, as
+ | Tone generator 1 | 0x71 | tone in Hz × 10 (1750 Hz burst) |
+ | CSS status | 0x0C | b10 CTCSS detected; b14 DCS normal, b15 DCS inverted. Polled; nothing to clear. The datasheet puts the same results in 0x60 |
+ 
+-FM squelch level 1 opens below raw noise 41, up from 39. The close line stays at raw noise 42, one unit below
+-the lowest empty-channel reading in the FD6818 reference measurements. Verify the weak-carrier opening and return
+-to idle on both RF sections. See [radio-features.md](radio-features.md) 3.5 for the shared squelch rules.
++For normal VHF and UHF FM, the DM-32UV maps raw noise references 52 and 43 respectively to 68 on the core
++squelch scale. The reference stays above the level-1 close line. Readings decrease by two scale units for every raw
++unit of quieting, so weak FM can open even at the default level. Extended frequencies use the shared FD6818 mapping.
++The raw readings remain available to diagnostics. Verify the opening and return to idle on both RF sections. See
++[radio-features.md](radio-features.md) 3.5 for the shared squelch and tone rules.
+ 
+ Receive sequences, in the radio's own order. CTCSS: 0x07 = the tone word, 0x07 = 0x21CE, 0x52, then 0x51. DCS: 0x07 =
+ 0x0AD7 first, the two 0x08 halves, then 0x51. Off: 0x07 = 0x0470, 0x07 = 0x21CE, 0x51 = 0.
+diff --git a/drivers/rf/fd6818/fd6818.h b/drivers/rf/fd6818/fd6818.h
+index af3ec22..dcd5f89 100644
+--- a/drivers/rf/fd6818/fd6818.h
++++ b/drivers/rf/fd6818/fd6818.h
+@@ -166,6 +166,21 @@ static inline uint8_t fd6818_noise_plus(uint16_t r65, uint8_t offset)
+ }
+ static inline uint8_t fd6818_noise(uint16_t r65) { return fd6818_noise_plus(r65, FD6818_NOISE_OFFSET); }
+ 
++// Normalize the two normal FM bands to the core's squelch levels. The no-signal reference maps to 68, above
++// the level-1 close line. A quieter reading gains two core units for each raw unit below that reference.
++static inline uint8_t fd6818_dm32_fm_noise(uint16_t r65, uint32_t hz)
++{
++	int floor;
++	if (hz >= 136000000u && hz <= 174000000u)
++		floor = 52;	// below the lowest reported VHF idle noise
++	else if (hz >= 400000000u && hz <= 480000000u)
++		floor = 43;	// conservative UHF idle reference
++	else
++		return fd6818_noise(r65);
++	int noise = 68 + 2 * ((int)(r65 & 0xFFu) - floor);
++	return (uint8_t)(noise < 0 ? 0 : noise > UINT8_MAX ? UINT8_MAX : noise);
++}
++
+ // --- Register access (one frame each, inside the critical section) ---
+ 
+ void fd6818_attach(fd6818_t *dev, rfbus_t *bus);	// the default variant
+diff --git a/tests/host/fd6818Test.c b/tests/host/fd6818Test.c
+index 771179f..a1cedd4 100644
+--- a/tests/host/fd6818Test.c
++++ b/tests/host/fd6818Test.c
+@@ -196,6 +196,12 @@ static void test_helpers(void)
+ 	// the measured floor (43) stays shut at the loosest squelch level (opens below 64), a strong carrier (8) opens the
+ 	// tightest (below 40): core/radio/radio_sm.h RADIO_SQL_*
+ 	CHECK(fd6818_noise(43) >= 64 && fd6818_noise(8) < 40);
++	CHECK(fd6818_dm32_fm_noise(0xAB2A, 146520000u) == 48);	// raw 42 now opens level 5 on VHF
++	CHECK(fd6818_dm32_fm_noise(34, 446000000u) == 50);	// a weaker UHF signal still opens level 5
++	CHECK(fd6818_dm32_fm_noise(52, 146520000u) > 67);
++	CHECK(fd6818_dm32_fm_noise(43, 446000000u) > 67);		// both idle readings keep level 1 closed
++	CHECK(fd6818_dm32_fm_noise(8, 146520000u) == 0 && fd6818_dm32_fm_noise(255, 446000000u) == 255);
++	CHECK(fd6818_dm32_fm_noise(43, 70000000u) == fd6818_noise(43));
+ }
+ 
+ static void test_frames(void)
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 9c090ba..4de9601 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -51,6 +51,7 @@
+ #include "fuzz.h"
+ #include "position/position.h"
+ #include "radio/beep.h"
++#include "rf/fd6818/fd6818.h"
+ 
+ static int failures;
+ static int checks;
+@@ -1336,6 +1337,29 @@ static void test_fm_squelch_level_one_margin(void)
+ 	fake_radio.fm_squelch_l1_margin = 0;
+ }
+ 
++static void test_dm32_fm_squelch(void)
++{
++	static const struct { uint32_t hz; uint8_t signal, idle; } cases[] = {
++		{ 146520000u, 42, 52 }, { 446000000u, 34, 43 },
++	};
++	for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
++		setup_codeplug();
++		chans[1].rx_hz = chans[1].tx_hz = cases[i].hz;
++		start();
++		rx_signal(fd6818_dm32_fm_noise(cases[i].idle, cases[i].hz), true);
++		poll_for(RADIO_POLL_MS);
++		CHECK(sm.view.state == RS_IDLE && !hw.audio);
++		CHECK(fd6818_noise(cases[i].signal) >= radio_sm_squelch_open_below(sm.view.squelch));
++		rx_signal(fd6818_dm32_fm_noise(cases[i].signal, cases[i].hz), true);
++		poll_for(RADIO_POLL_MS);
++		CHECK(sm.view.squelch == RADIO_SQUELCH_DEFAULT && sm.view.state == RS_RX && hw.audio);
++		rx_signal(fd6818_dm32_fm_noise(cases[i].idle, cases[i].hz), true);
++		poll_for(RADIO_SQL_CLOSE_POLLS * RADIO_POLL_MS);
++		CHECK(sm.view.state == RS_IDLE && !hw.audio);
++	}
++	setup_codeplug();
++}
++
+ static void test_tx(void)
+ {
+ 	setup_codeplug();
+@@ -12970,6 +12994,7 @@ int main(int argc, char **argv)
+ 	test_vfo_step_auto();
+ 	test_squelch();
+ 	test_fm_squelch_level_one_margin();
++	test_dm32_fm_squelch();
+ 	test_channel_squelch();
+ 	test_parked_kind();
+ 	test_tx();

@@ -70,7 +70,7 @@ jobs:
           set -eu
           T=build/current/tests/host
           tests="sigToneTest ambeVoiceTest radioFeaturesTest radioCoreTestNxdn radioListenBandsTest aprsTest aprsRadioTest aprsRadioMdcTest rda5807mTest voiceCipherTest dmrAesTest dmrPrivacyTest dmrCallTest dmrCallTestAes hrc7000DmrTest hrc7000AirTest p25Test p25EngineTest p25EngineTestAes p25VoiceTest
-            dmrFecTest dmrRxChainTest
+            dmrFecTest dmrRxChainTest dmrDataTest dmrDataServiceTest dmrDataServiceTestNoTms
             radioCoreTest t3CodeplugTest t3PduTest t3MsTest t3AccessTest t3ViewTest
             nxdnTest nxdnEngineTest nxdnEngineTestAes radioCoreTestNxdnScrambler ambeVoiceReplayTest radioFeaturesReplayTest
             aesTest ysfTest ysfEngineTest radioCoreTestYsf

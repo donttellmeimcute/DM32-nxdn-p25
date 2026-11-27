@@ -1,0 +1,337 @@
+diff --git a/core/m17/m17_voice.c b/core/m17/m17_voice.c
+index 850d172..7c81083 100644
+--- a/core/m17/m17_voice.c
++++ b/core/m17/m17_voice.c
+@@ -130,27 +130,34 @@ static bool tx_voice(uint8_t data[M17_STREAM_BYTES], void *ctx)
+ 
+ static const m17_engine_hooks_t hooks = { rx_start, rx_voice, rx_end, tx_voice };
+ 
+-// ── The codec's time: each encode and decode is timed (the clock m17VoiceBegin is given). One that takes longer than
+-// M17_VOICE_BUDGET_US means this core can't run Codec 2 in real time: from then on the codec
+-// is never called again (until a restart: the core won't get faster), so the audio task, which runs above the radio and
+-// UI tasks, is not busy without end ──
++// Charge late blocks against one PCM period of slack and let faster blocks repay it. Limit a persistently slow
++// codec so the higher-priority audio task cannot starve the radio and UI.
+ static uint32_t (*now_fn)(void);
+-static volatile bool slow;
++static uint32_t codec_lag_us;
++static bool rx_slow, tx_slow;
+ 
+ static uint32_t clock_us(void)
+ {
+ 	return now_fn != NULL ? now_fn() : 0;
+ }
+ 
+-static void took(uint32_t *last, uint32_t *max, uint32_t t0)
++static bool on_time(uint32_t *last, uint32_t *max, uint32_t t0)
+ {
+ 	uint32_t us = clock_us() - t0;
+ 
+ 	*last = us;
+ 	if (us > *max)
+ 		*max = us;
+-	if (us > M17_VOICE_BUDGET_US)
+-		STORE(slow, true);
++	if (us <= M17_VOICE_BUDGET_US) {
++		uint32_t spare = M17_VOICE_BUDGET_US - us;
++		codec_lag_us = spare < codec_lag_us ? codec_lag_us - spare : 0;
++		return true;
++	}
++	uint32_t late = us - M17_VOICE_BUDGET_US;
++	if (late >= M17_VOICE_MAX_LAG_US - codec_lag_us)
++		return false;
++	codec_lag_us += late;
++	return true;
+ }
+ 
+ // ── Audio callback ──
+@@ -177,6 +184,12 @@ static void rx_block(struct CODEC2 *c, int16_t *spk)
+ 		cb_live = true;
+ 		cb_playing = cb_speaker = false;
+ 		cb_lead = 0;
++		codec_lag_us = 0;
++		STORE(rx_slow, false);
++	}
++	if (LOAD(rx_slow)) {
++		silence(spk);
++		return;
+ 	}
+ 	uint8_t t = rx_tail, h = LOAD(rx_head);
+ 	while (t != h && rxq_seq[t & (M17_VOICE_QUEUE - 1)] != cb_seq)
+@@ -218,8 +231,13 @@ static void rx_block(struct CODEC2 *c, int16_t *spk)
+ 	}
+ 	uint32_t t0 = clock_us();
+ 	codec2_decode(c, spk, rxq[t & (M17_VOICE_QUEUE - 1)]);
+-	took(&stats.dec_us, &stats.dec_us_max, t0);
+ 	STORE(rx_tail, (uint8_t)(t + 1));
++	if (!on_time(&stats.dec_us, &stats.dec_us_max, t0)) {
++		STORE(rx_slow, true);
++		speaker(false);
++		silence(spk);
++		return;
++	}
+ 	stats.rx_frames++;
+ }
+ 
+@@ -235,8 +253,11 @@ static void tx_block(struct CODEC2 *c, uint8_t g, const int16_t *mic)
+ 	}
+ 	uint32_t t0 = clock_us();
+ 	codec2_encode(c, cb_pair + cb_half * M17_C2_BYTES, scaled);
+-	took(&stats.enc_us, &stats.enc_us_max, t0);
+ 	stats.tx_encoded++;
++	if (!on_time(&stats.enc_us, &stats.enc_us_max, t0)) {
++		STORE(tx_slow, true);
++		return;
++	}
+ 	cb_half ^= 1;
+ 	if (cb_half)
+ 		return;		// the first half of a stream frame
+@@ -287,11 +308,16 @@ static void codec_block(void *arg)
+ 		if (g != cb_tx_gen) {
+ 			cb_tx_gen = g;
+ 			cb_half = 0;
++			codec_lag_us = 0;
++			STORE(rx_slow, false);
+ 			speaker(false);
+ 		}
+-		tx_block(c, g, b->mic);
++		if (!LOAD(tx_slow))
++			tx_block(c, g, b->mic);
+ 		silence(b->spk);
+ 	} else {
++		if (cb_tx_gen != g)
++			codec_lag_us = 0;
+ 		cb_tx_gen = g;
+ 		rx_block(c, b->spk);
+ 	}
+@@ -302,7 +328,7 @@ void m17VoiceAudioBlock(const int16_t *mic, int16_t *spk, void *ctx)
+ 	block_t b = { mic, spk };
+ 
+ 	(void)ctx;
+-	if (!LOAD(active) || LOAD(slow))
++	if (!LOAD(active))
+ 		silence(spk);
+ 	else if (run_on != NULL)
+ 		run_on(codec_block, &b, stack_top);
+@@ -346,6 +372,9 @@ void m17VoiceBegin(void *mem, size_t len, m17_voice_runner_t run, void *top, uin
+ 	cb_seq = 0;
+ 	cb_half = 0;
+ 	cb_live = cb_playing = cb_speaker = cb_mixing = false;
++	codec_lag_us = 0;
++	STORE(rx_slow, false);
++	STORE(tx_slow, false);
+ 	STORE(active, true);
+ }
+ 
+@@ -364,6 +393,7 @@ void m17VoicePause(void)
+ 	}
+ 	streaming = false;
+ 	cb_speaker = false;
++	STORE(tx_slow, false);
+ }
+ 
+ void m17VoiceTx(bool on)
+@@ -406,7 +436,12 @@ const m17_engine_hooks_t *m17VoiceHooks(void)
+ 
+ bool m17VoiceSlow(void)
+ {
+-	return LOAD(slow);
++	return LOAD(rx_slow) || m17VoiceTxSlow();
++}
++
++bool m17VoiceTxSlow(void)
++{
++	return LOAD(tx_slow);
+ }
+ 
+ void m17VoiceGetStats(m17_voice_stats_t *out)
+diff --git a/core/m17/m17_voice.h b/core/m17/m17_voice.h
+index 6e5f69b..6dfad52 100644
+--- a/core/m17/m17_voice.h
++++ b/core/m17/m17_voice.h
+@@ -34,9 +34,9 @@
+ #ifndef M17_VOICE_ARENA
+ #define M17_VOICE_ARENA		31744	// bytes for Codec 2's state and FFT tables (m17VoiceTest: 30752 on a 64-bit host)
+ #endif
+-// The longest a 20 ms block's encode or decode may take. Longer, the core can't keep up: the codec is switched off (the
+-// audio task runs above the radio and UI tasks, so a codec that never catches up would starve them)
+-#define M17_VOICE_BUDGET_US	15000u
++// The PCM cadence is 20 ms. Leave 2 ms per block for scheduling and modem work.
++#define M17_VOICE_BUDGET_US	18000u
++#define M17_VOICE_MAX_LAG_US	20000u
+ #ifndef M17_VOICE_STACK
+ #define M17_VOICE_STACK		24576	// bytes of stack for Codec 2's frames (about 20 KB measured on a host)
+ #endif
+@@ -66,9 +66,9 @@ typedef void (*m17_voice_runner_t)(void (*fn)(void *arg), void *arg, void *top);
+ // 2 is made in the arena by the audio callback's first block (its
+ // set-up needs the codec's stack); one that does not fit leaves the voice silent (m17_voice_stats_t.alloc_fails)
+ void m17VoiceBegin(void *mem, size_t len, m17_voice_runner_t run, void *top, uint32_t (*now_us)(void));
+-// An encode or a decode took longer than M17_VOICE_BUDGET_US: the codec is off until a restart (voice silent, no
+-// stream frames for the engine). Any task
++// The current receive or transmit stream fell behind the PCM cadence. Any task.
+ bool m17VoiceSlow(void);
++bool m17VoiceTxSlow(void);	// a receive overload must never deny PTT
+ void m17VoicePoll(void);	// every tick while M17 runs: starts the audio stream once a call is heard
+ void m17VoicePause(void);	// stop PCM before the RF provider switches clocks
+ void m17VoiceTx(bool on);
+diff --git a/core/radio/radio_m17.c b/core/radio/radio_m17.c
+index 2bd59c8..35e8ade 100644
+--- a/core/radio/radio_m17.c
++++ b/core/radio/radio_m17.c
+@@ -268,10 +268,10 @@ static void m17_tx_abort(void)
+ 	}
+ }
+ 
+-// Codec 2 too slow for this core: PTT refused, a transmission cut (radio_sm.c shows why)
++// Cut a transmission that cannot keep up. Clearing TX stops PCM and allows the next PTT to retry.
+ static uint8_t m17_tx_fault(void)
+ {
+-	return m17VoiceSlow() ? (uint8_t)TXDENY_CPU : (uint8_t)TXDENY_NONE;
++	return m17VoiceTxSlow() ? (uint8_t)TXDENY_CPU : (uint8_t)TXDENY_NONE;
+ }
+ 
+ static uint8_t m17_tx_state(void)
+diff --git a/docs/spec/m17.md b/docs/spec/m17.md
+index 86a95a7..189990c 100644
+--- a/docs/spec/m17.md
++++ b/docs/spec/m17.md
+@@ -113,7 +113,7 @@ frame; playback starts with four frames queued. With no encoder frame ready the
+ | Memory | none of its own where the vocoder lends its code window (`hal_vocoder_t.lend_window`, `HAL_VOCODER_WINDOW`: the HR_C7000 platform, 83,456 B, idle while no DMR voice runs). While M17 runs the window holds the engine (about 1.8 KB), Codec 2's state and FFT tables (31,392 B on a 64-bit host, in a 31,744 B arena, `M17_VOICE_ARENA`) and the codec's stack. The vocoder's calls give silence meanwhile; leaving M17 copies its code back from the slot. Without a lending vocoder (the host tests) a static block holds the engine and the arena |
+ | Stack | Codec 2 runs on its own 24 KB (`M17_VOICE_STACK`) at the top of the window, through `hal_vocoder_t.call_on_stack` (`platform/hrc7000/call_on_stack.S`), not on the audio task's: 17,832 B used on a 64-bit host (m17VoiceTest runs it on such a stack). The audio task's stack and the FreeRTOS heap are unchanged |
+ | CPU | `CODEC2_FIXED_3200` replaces the floating-point 3200 encoder with an integer TX analysis path (Q20 LPC/LSP, integer pitch, energy and LSPD quantization). It emits standard 64-bit Codec 2 3200 frames and has no floating-point/libm dependency in its host object; it is not bit-exact with upstream, especially in pitch and voicing. The reference floating-point decoder remains for RX and interoperability. The original encoder/decoder cost counted on CK803S code was 19.2/20.1 million instructions per 20 ms (114/120 ms at 168 MHz even at one instruction per cycle), and codec creation was 22.9 million; those counts do not measure the new fixed TX path. Host `m17VoiceTest` measured at most 12 us inside fixed encode and 34 us inside reference decode on the test machine; these are not CK803S timings |
+-| Too slow | Each encode and decode is timed on the provider's microsecond clock. One over 15 ms (`M17_VOICE_BUDGET_US`) switches the codec off until a restart (`m17VoiceSlow`): no more codec calls, so the audio task, which runs above the radio and UI tasks, no longer keeps them out (before this check a slow codec held it busy without end: the radio froze on PTT). A transmission is cut and unkeyed, PTT refused (`TXDENY_CPU`, "CPU too slow for voice", with "M17 enc X dec Y ms"), received calls stay silent; the call's fields still show. The home screen's chips line shows the times in place of the CAN, the TX screen after the CAN. The fixed TX path does not disable or relax this protection |
++| Too slow | Codec 2 blocks budget 18 ms against the 20 ms PCM cadence. Faster blocks repay accumulated lag. At 20 ms of lag, RX mutes the current call and TX cuts and unkeys with `TXDENY_CPU` ("CPU too slow for voice"). The next call can retry. The chips and TX screens show the maximum encode and decode times. |
+ 
+ ## 7. Tests
+ 
+diff --git a/tests/host/m17VoiceTest.c b/tests/host/m17VoiceTest.c
+index 3f25835..47dba32 100644
+--- a/tests/host/m17VoiceTest.c
++++ b/tests/host/m17VoiceTest.c
+@@ -83,7 +83,7 @@ static size_t alt_used(void)
+ 	return sizeof(alt_stack) - i;
+ }
+ 
+-// Clocks for the codec's timing: the host's, and one 20 ms on at each read (a core too slow for Codec 2)
++// Use the host clock for the codec performance test and a synthetic clock for deadline tests.
+ static uint32_t host_us(void)
+ {
+ 	struct timespec ts;
+@@ -91,8 +91,8 @@ static uint32_t host_us(void)
+ 	clock_gettime(CLOCK_MONOTONIC, &ts);
+ 	return (uint32_t)(ts.tv_sec * 1000000u + ts.tv_nsec / 1000);
+ }
+-static uint32_t slow_t;
+-static uint32_t slow_us(void) { return slow_t += 20000; }
++static uint32_t test_t, test_step;
++static uint32_t test_us(void) { return test_t += test_step; }
+ 
+ int main(void)
+ {
+@@ -208,26 +208,54 @@ int main(void)
+ 		printf("m17 voice: host time per 20 ms block: encode %.1f us, decode %.1f us\n", enc,
+ 		       (double)(clock() - t0) / CLOCKS_PER_SEC * 1e6 / 500);
+ 	}
+-	// The codec's time: measured on every block, within the budget here; then on a core where an encode takes
+-	// 20 ms the codec switches itself off after the first one, for good: no more encodes, no frames for the engine
+ 	m17VoiceGetStats(&st);
+ 	printf("m17 voice: host create %u us, encode max %u us, decode max %u us\n", st.create_us, st.enc_us_max,
+ 	       st.dec_us_max);
+ 	CHECK(st.enc_us_max > 0 && st.dec_us_max > 0 && st.enc_us_max < M17_VOICE_BUDGET_US && !m17VoiceSlow());
+ 	m17VoiceEnd();
+-	m17VoiceBegin(arena_mem, sizeof(arena_mem), run_on_alt, alt_stack + sizeof(alt_stack), slow_us);
++
++	m17VoiceBegin(arena_mem, sizeof(arena_mem), run_on_alt, alt_stack + sizeof(alt_stack), test_us);
+ 	m17VoiceTx(true);
+-	uint32_t before = st.tx_encoded;
+-	for (unsigned b = 0; b < 10; b++) {
++	// An occasional 24 ms encode is absorbed by the next 10 ms encode, with a full outgoing voice frame.
++	for (unsigned b = 0; b < 12; b++) {
+ 		uint8_t d[M17_STREAM_BYTES];
+ 
++		test_step = b % 2 == 0 ? 24000 : 10000;
+ 		voice(b, mic);
+ 		m17VoiceAudioBlock(mic, spk, NULL);
+-		CHECK(!h->tx_voice(d, NULL));
++		CHECK(!m17VoiceSlow() && h->tx_voice(d, NULL) == (b % 2 == 1));
+ 	}
+ 	m17VoiceGetStats(&st);
+-	CHECK(m17VoiceSlow() && st.tx_encoded == before + 1 && st.enc_us_max >= 20000);
++	uint32_t before = st.tx_encoded;
++	test_step = 24000;
++	for (unsigned b = 0; b < 10; b++)
++		m17VoiceAudioBlock(mic, spk, NULL);
++	m17VoiceGetStats(&st);
++	CHECK(m17VoiceTxSlow() && st.tx_encoded == before + 4 && st.enc_us_max >= 24000);
+ 	m17VoiceTx(false);
++	m17VoicePause();
++
++	// An RX overload silences only that call. A subsequent receive call can decode speech again.
++	uint32_t decoded = st.rx_frames;
++	h->rx_start(&call, NULL);
++	for (unsigned b = 0; b < 16; b++) {
++		if (b % 2 == 0)
++			h->rx_voice(frames[(b / 2) % nf], NULL);
++		m17VoiceAudioBlock(mic, spk, NULL);
++	}
++	m17VoiceGetStats(&st);
++	CHECK(m17VoiceSlow() && !m17VoiceTxSlow() && st.rx_frames == decoded + 3);
++	CHECK(rms(spk, AUDIO_BLOCK_SAMPLES) == 0);
++	h->rx_end(NULL);
++	test_step = 10000;
++	h->rx_start(&call, NULL);
++	for (unsigned b = 0; b < 16; b++) {
++		if (b % 2 == 0)
++			h->rx_voice(frames[(b / 2) % nf], NULL);
++		m17VoiceAudioBlock(mic, spk, NULL);
++	}
++	m17VoiceGetStats(&st);
++	CHECK(!m17VoiceSlow() && st.rx_frames > decoded + 3 && rms(spk, AUDIO_BLOCK_SAMPLES) > 0);
+ 	printf("m17 voice: codec ran %u times on its own stack, %zu of %u bytes used\n", runs, alt_used(),
+ 	       (unsigned)M17_VOICE_STACK);
+ 	CHECK(runs > 600 && alt_used() < sizeof(alt_stack) - 2048);
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 4e916a4..8a1fe0f 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12424,29 +12424,27 @@ static void test_m17(void)
+ 	m17_engine_tx_clear(&m17_far_eng);
+ 	m17_engine_end(&m17_far_eng);
+ 
+-	// A core too slow for Codec 2 (board.air's clock 20 ms on at each read, so every encode takes 20 ms): the first
+-	// encode over the budget switches the codec off, the transmission is cut and unkeyed, PTT is refused with why
+-	// and the time measured, and nothing else stops (docs/spec/m17.md 6)
+-	CHECK(!m17VoiceSlow() && (sm.view.m17.flags & RADIO_M17_SLOW) == 0);	// (this clock stands still while it encodes)
++	// Sustained late encodes cut TX. The guard leaves the radio ready to try again after PTT release.
++	CHECK(!m17VoiceSlow() && (sm.view.m17.flags & RADIO_M17_SLOW) == 0);
+ 	uint32_t encoded = (m17VoiceGetStats(&vs), vs.tx_encoded);
+-	air_clock_step = 20000;
++	air_clock_step = 24000;
+ 	req(RREQ_PTT, 1);
+ 	run(600);
+ 	air_clock_step = 0;
+ 	m17VoiceGetStats(&vs);
+-	CHECK(m17VoiceSlow() && vs.enc_us_max >= 20000 && vs.tx_encoded <= encoded + 2);
++	CHECK(vs.enc_us_max >= 24000 && vs.tx_encoded == encoded + 4);
+ 	CHECK(!hw.keyed && sm.view.state == RS_TX_DENIED && sm.view.tx_deny == TXDENY_CPU);
+-	CHECK((sm.view.m17.flags & RADIO_M17_SLOW) != 0 && sm.view.m17.enc_t10 >= 200);
++	CHECK(sm.view.m17.enc_t10 >= 240);
+ 	req(RREQ_PTT, 0);
+ 	run(200);
+ 	CHECK(sm.view.state != RS_TX_DENIED && !hw.keyed);
+-	req(RREQ_PTT, 1);	// refused at once now: never keyed
+-	run(100);
+-	CHECK(!hw.keyed && sm.view.state == RS_TX_DENIED && sm.view.tx_deny == TXDENY_CPU);
+-	req(RREQ_PTT, 0);
+-	run(200);
++	req(RREQ_PTT, 1);
++	run(600);
+ 	m17VoiceGetStats(&vs);
+-	CHECK(vs.tx_encoded <= encoded + 2);	// the codec stays off
++	CHECK(hw.keyed && sm.view.state == RS_TX && vs.tx_encoded > encoded + 4 && !m17VoiceSlow());
++	req(RREQ_PTT, 0);
++	run(600);
++	CHECK(!hw.keyed && sm.view.state != RS_TX);
+ 	aud.feed = aud.feed_signal = false;
+ 	cp_radio_name = "";
+ }

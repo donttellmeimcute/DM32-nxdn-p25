@@ -1,0 +1,178 @@
+diff --git a/core/dmr/dmrData.c b/core/dmr/dmrData.c
+index 6af3266..94c3a73 100644
+--- a/core/dmr/dmrData.c
++++ b/core/dmr/dmrData.c
+@@ -645,27 +645,32 @@ int dmrDataBuildUDP(bool group, uint32_t dst, uint32_t src, uint16_t srcPort, ui
+ 
+ #if CONFIG_DMR_TMS
+ // Motorola TMS simple text message: length, header (0xA0, or 0xE0 to request an ACK), no address,
+-// sequence number, encoding, then the text as UTF-16LE
++// sequence number, encoding, then CR LF and the text as UTF-16LE
+ static int tmsText(const char *text, uint8_t seq, bool ackRequested, uint8_t *tms)
+ {
+ 	int textLen = strlen(text);
+ 
+-	if (textLen > 140)
++	if (textLen > DMR_TMS_TEXT_MAX)
+ 	{
+-		textLen = 140;
++		textLen = DMR_TMS_TEXT_MAX;
+ 	}
+ 
+-	int length = 6 + (2 * textLen);
++	int length = DMR_TMS_TEXT_OFFSET + (2 * textLen);
+ 	putU16(&tms[0], length - 2);
+ 	tms[2] = ackRequested ? 0xE0 : 0xA0;
+ 	tms[3] = 0x00;
+ 	tms[4] = 0x80 | (seq & 0x1F);
+ 	tms[5] = 0x04;
++	// MOTOTRBO sends this prefix. Some receivers discard the first two UTF-16 code units.
++	tms[6] = '\r';
++	tms[7] = 0x00;
++	tms[8] = '\n';
++	tms[9] = 0x00;
+ 
+ 	for (int i = 0; i < textLen; i++)
+ 	{
+-		tms[6 + (2 * i)] = (uint8_t)text[i];
+-		tms[7 + (2 * i)] = 0x00;
++		tms[DMR_TMS_TEXT_OFFSET + (2 * i)] = (uint8_t)text[i];
++		tms[DMR_TMS_TEXT_OFFSET + (2 * i) + 1] = 0x00;
+ 	}
+ 	return length;
+ }
+@@ -683,7 +688,7 @@ static int tmsUdp(uint8_t *l4, int length)
+ int dmrDataBuildTMS(bool group, uint32_t dst, uint32_t src, const char *text, uint8_t seq, bool ackRequested,
+ 						uint8_t blockType, int preambles, dmrBurst_t *out, int maxBursts)
+ {
+-	DMR_DATA_BUFFER static uint8_t tms[6 + (2 * 140)];
++	DMR_DATA_BUFFER static uint8_t tms[DMR_TMS_TEXT_PDU_MAX];
+ 	int length = tmsText(text, seq, ackRequested, tms);
+ 
+ 	return dmrDataBuildUDP(group, dst, src, DMR_UDP_PORT_TMS, DMR_UDP_PORT_TMS, tms, length, blockType, preambles, out, maxBursts);
+diff --git a/core/dmr/dmrData.h b/core/dmr/dmrData.h
+index c368b3f..5040440 100644
+--- a/core/dmr/dmrData.h
++++ b/core/dmr/dmrData.h
+@@ -243,13 +243,16 @@ int dmrDataBuildConfirmed(uint8_t sap, uint32_t dst, uint32_t src, const uint8_t
+ // The number of blocks a confirmed packet of length octets takes (0: more than DMR_CONFIRMED_MAX_BLOCKS)
+ int dmrDataConfirmedBlocks(int length, uint8_t blockType);
+ #if CONFIG_DMR_TMS	// Motorola TMS format support (docs/spec/dmr-data.md 5.1)
++#define DMR_TMS_TEXT_MAX				140
++#define DMR_TMS_TEXT_OFFSET				10	// 6 header octets and 4 for CR LF
++#define DMR_TMS_TEXT_PDU_MAX				(DMR_TMS_TEXT_OFFSET + (2 * DMR_TMS_TEXT_MAX))
+ int dmrDataBuildTMS(bool group, uint32_t dst, uint32_t src, const char *text, uint8_t seq, bool ackRequested,
+ 						uint8_t blockType, int preambles, dmrBurst_t *out, int maxBursts);
+ // seq: the 7 bit sequence number of the message being acknowledged
+ int dmrDataBuildTMSAck(uint32_t dst, uint32_t src, uint8_t seq, int preambles, dmrBurst_t *out, int maxBursts);
+ // The same text and ACK as UDP datagrams (header from and to DMR_UDP_PORT_TMS, checksum left 0 for the IPv4 layer,
+ // then the TMS octets) into l4: their length. The data service sends individual ones as confirmed data with them
+-#define DMR_TMS_UDP_MAX					(8 + 6 + (2 * 140))
++#define DMR_TMS_UDP_MAX					(8 + DMR_TMS_TEXT_PDU_MAX)
+ #define DMR_TMS_ACK_UDP_MAX				(8 + 6)
+ int dmrDataTMSUDP(const char *text, uint8_t seq, bool ackRequested, uint8_t l4[DMR_TMS_UDP_MAX]);
+ int dmrDataTMSAckUDP(uint8_t seq, uint8_t l4[DMR_TMS_ACK_UDP_MAX]);
+diff --git a/docs/spec/dmr-data.md b/docs/spec/dmr-data.md
+index 9161828..7d38664 100644
+--- a/docs/spec/dmr-data.md
++++ b/docs/spec/dmr-data.md
+@@ -137,9 +137,10 @@ All three are read whatever the setting.
+ 
+ - Format: IPv4 / UDP port 4007 to 4007, user data SAP 4. Ours is confirmed data where 5.1.1 needs it (below),
+   otherwise unconfirmed. TMS header 0xE0 (ACK requested) or 0xA0,
+-  sequence number in 5 bits (with bit 7 set), encoding 4, the text as UTF-16LE (Latin-1 characters only on the
+-  radio side). Header bits as seen on air: 0x80 a sequence octet follows, 0x40 ACK requested, 0x20 set in every
+-  TMS packet, the low 5 bits the type (0 text, 0x1F ACK).
++  sequence number in 5 bits (with bit 7 set), encoding 4, then CR LF and the text as UTF-16LE (Latin-1 characters
++  only on the radio side). Receivers that skip the two leading code units keep the full message. The receive side
++  also accepts TMS text without the prefix. Header bits as seen on air: 0x80 a sequence octet follows, 0x40 ACK
++  requested, 0x20 set in every TMS packet, the low 5 bits the type (0 text, 0x1F ACK).
+ - The TMS ACK: header 0xBF, no address, the sequence number (00 03 BF 00 0A for s/n 10; past 31 a second octet with
+   bits 5-6, 00 04 BF 00 9E 60 for s/n 126), as a MOTOTRBO radio and BrandMeister send it. An ACK with header 0x9F
+   (0x20 clear, seen from other MOTOTRBO gear) is still taken. Radio IDs map to 12.x.x.x, groups to 225.x.x.x (the CAI addresses; a packet from the host may carry
+@@ -194,8 +195,8 @@ left it, not what BrandMeister got. A single unanswered packet may be a lost one
+ our sends with 2 preambles all unanswered and the identical pair above; the TMS ACK findings below on two samples each.
+ 
+ BrandMeister takes ETSI IP text on 5016 from a radio, confirmed and unconfirmed, and answers in TMS (cases 4 and 5
+-below). Not known yet: whether it takes unconfirmed rate 1/2 TMS. A MOTOTRBO radio's text starts with CR LF
+-(`0d 00 0a 00`); ours doesn't, and BrandMeister took ours without it on 5016.
++below). Not known yet: whether it takes unconfirmed rate 1/2 TMS. A MOTOTRBO radio's TMS text starts with CR LF
++(`0d 00 0a 00`). BrandMeister also took ETSI IP text without a prefix on 5016.
+ 
+ That check is run by hand, once, to settle the formats, and its results are recorded here. It is never part of
+ `tests/hil` or any automated or repeated test: no test reaches the real BrandMeister network. Host tests use the
+@@ -522,7 +523,7 @@ and checks these.
+ | Packet | UDP payload | SAP 4 bursts | SAP 3 bursts | Saved | Confirmed SAP 4 / SAP 3 |
+ |---|---|---|---|---|---|
+ | ARS registration (7 digit ID; 4005) | 14 | 7 (420 ms) | 6 (360 ms) | 1 burst | 8 / 6 |
+-| TMS, 16 characters (4007, IDs 98: 5 octet header) | 38 | 9 (540 ms) | 7 (420 ms) | 2 | 10 / 8 |
++| TMS, 16 characters (4007, IDs 98: 5 octet header) | 42 | 10 (600 ms) | 8 (480 ms) | 2 | 11 / 9 |
+ | TMS ACK | 5 | 7 | 5 | 2 | 7 / 5 |
+ | LRRP immediate answer with a position (4001) | 26 | 8 | 7 | 1 | 9 / 7 |
+ | SNMP GET (UDP 161 from an ephemeral port: 9 octet header) | 60 | 11 (660 ms) | 10 (600 ms) | 1 | 13 / 11 |
+diff --git a/tests/host/dmrDataTest.c b/tests/host/dmrDataTest.c
+index 335e441..510afe0 100644
+--- a/tests/host/dmrDataTest.c
++++ b/tests/host/dmrDataTest.c
+@@ -104,7 +104,9 @@ static void testTMSRoundTrip(bool group, int preambles)
+ 	dmrDataUDP_t udp;
+ 	CHECK(dmrDataGetUDP(&dmrDataRxPacket, &udp));
+ 	CHECK(udp.appPort == DMR_UDP_PORT_TMS);
+-	CHECK(udp.length == (int)(6 + (2 * strlen(text))));
++	CHECK(udp.length == (int)(10 + (2 * strlen(text))));
++	const uint8_t prefixAndText[] = { 0x0D, 0x00, 0x0A, 0x00, 'H', 0x00, 'e', 0x00 };
++	CHECK(udp.length >= 14 && memcmp(&udp.payload[6], prefixAndText, sizeof(prefixAndText)) == 0);
+ 
+ 	dmrDataTMS_t tms;
+ 	CHECK(dmrDataDecodeTMS(udp.payload, udp.length, &tms));
+@@ -252,6 +254,33 @@ static void testRawPacket(void)
+ 	dumpBursts("raw-short-data", bursts, n);
+ }
+ 
++static void testTMSTextUDP(void)
++{
++	uint8_t datagram[DMR_TMS_UDP_MAX + 2];
++	uint8_t *l4 = &datagram[1];
++	// UDP header, TMS header, CR LF, then both characters. Confirmed sends use this datagram builder.
++	const uint8_t expected[] = {
++		0x0F, 0xA7, 0x0F, 0xA7, 0x00, 0x16, 0x00, 0x00,
++		0x00, 0x0C, 0xE0, 0x00, 0x85, 0x04, 0x0D, 0x00, 0x0A, 0x00, 'A', 0x00, 'B', 0x00,
++	};
++	int length = dmrDataTMSUDP("AB", 5, true, l4);
++	CHECK(length == sizeof(expected) && memcmp(l4, expected, sizeof(expected)) == 0);
++
++	// Preserve the 140-character limit and leave the bytes adjacent to the caller's buffer untouched.
++	char text[142];
++	memset(text, 'X', sizeof(text) - 1);
++	text[139] = 'Z';
++	text[141] = '\0';
++	memset(datagram, 0xA5, sizeof(datagram));
++	length = dmrDataTMSUDP(text, 5, true, l4);
++	CHECK(length == DMR_TMS_UDP_MAX && length == 298);
++	CHECK(l4[4] == 0x01 && l4[5] == 0x2A && l4[8] == 0x01 && l4[9] == 0x20);
++	CHECK(datagram[0] == 0xA5 && datagram[sizeof(datagram) - 1] == 0xA5);
++	dmrDataTMS_t tms;
++	CHECK(dmrDataDecodeTMS(&l4[8], length - 8, &tms));
++	CHECK(strlen(tms.text) == 140 && memcmp(tms.text, text, 140) == 0);
++}
++
+ static void testTMSAck(void)
+ {
+ 	dmrBurst_t bursts[DMR_DATA_MAX_BURSTS];
+@@ -815,7 +844,7 @@ static void testAirtime(void)
+ 	int arsLen = dmrDataBuildARSRegistration(9991234, ars);
+ 	struct { const char *what; int payload; int header3; } t[] = {
+ 		{ "ARS registration (7 digit ID)", arsLen, 9 },
+-		{ "TMS, 16 characters", 6 + 32, 5 },		// ID 98 both ways
++		{ "TMS, 16 characters", 10 + 32, 5 },		// ID 98 both ways
+ 		{ "TMS ACK", 5, 5 },
+ 		{ "LRRP immediate answer with a position", 26, 9 },
+ 		{ "SNMP GET, 60 octets", 60, 9 },
+@@ -1127,6 +1156,7 @@ int main(void)
+ 	testTMSRates();
+ 	testIPPackets();
+ 	testRawPacket();
++	testTMSTextUDP();
+ 	testTMSAck();
+ 	testReferenceVectors();
+ 	testARS();

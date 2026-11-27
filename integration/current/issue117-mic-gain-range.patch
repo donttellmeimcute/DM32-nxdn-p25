@@ -1,0 +1,57 @@
+diff --git a/core/dmr/ambe/ambeVoice.c b/core/dmr/ambe/ambeVoice.c
+index faea334..758f44b 100644
+--- a/core/dmr/ambe/ambeVoice.c
++++ b/core/dmr/ambe/ambeVoice.c
+@@ -909,7 +909,7 @@ void ambeVoiceAudioBlock(const int16_t *mic, int16_t *spk, void *ctx)
+ 
+ // --- set-up ---
+ 
+-// 2 dB per step around step 5 (unity): -10 dB .. +10 dB, Q8
++// Manual software microphone gain. Step 5 passes the original samples.
+ void ambeVoiceSetMicGain(uint8_t step)
+ {
+ 	STORE(mic_gain_q8, mic_gain_step_q8(step));
+diff --git a/core/radio/mic_gain_pcm.h b/core/radio/mic_gain_pcm.h
+index 38a3e6c..2f9262c 100644
+--- a/core/radio/mic_gain_pcm.h
++++ b/core/radio/mic_gain_pcm.h
+@@ -4,10 +4,10 @@
+ 
+ #include "radio/mic_gain.h"
+ 
+-// The manual microphone gain steps in Q8, 2 dB per step and unity at step 5.
++// Software AMBE gain in Q8. The top two steps add 12 and 16 dB for quiet microphones.
+ static inline uint16_t mic_gain_step_q8(uint8_t step)
+ {
+-	static const uint16_t q8[MIC_GAIN_STEPS + 1] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 643, 810 };
++	static const uint16_t q8[MIC_GAIN_STEPS + 1] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 1019, 1615 };
+ 	return q8[step > MIC_GAIN_STEPS ? MIC_GAIN_STEPS : step];
+ }
+ 
+diff --git a/docs/spec/radio-features.md b/docs/spec/radio-features.md
+index a38fa12..9e6ec2a 100644
+--- a/docs/spec/radio-features.md
++++ b/docs/spec/radio-features.md
+@@ -324,7 +324,8 @@ Squelch level 0 (always open) and the APRS hold (`RADIO_SQL_CLOSE_POLLS_APRS`) k
+ 
+ ### 3.6 Mic gain
+ 
+-Settings > Talk & listen > Mic gain: a step 0-10, 2 dB a step, 5 = the board's own levels (`core/radio/mic_gain.c`).
++Settings > Talk & listen > Mic gain has steps 0–10. Step 5 uses the board's own levels (`core/radio/mic_gain.c`).
++The steps are 2 dB apart for hardware gain. Software DMR and D-STAR use +12 dB at step 9 and +16 dB at step 10.
+ The UI stores it (`settings_t.mic_gain`) and applies it at start-up and on each change with `radio_set_mic_gain()`;
+ the debug link's SETTING op 29 sets it in RAM only.
+ 
+diff --git a/tests/host/ambeVoiceTest.c b/tests/host/ambeVoiceTest.c
+index f441260..40f94e1 100644
+--- a/tests/host/ambeVoiceTest.c
++++ b/tests/host/ambeVoiceTest.c
+@@ -748,7 +748,7 @@ static void testTxMicGain(void)
+ 	mic[1] = 1000;
+ 	ambeVoiceSetMicGain(10);
+ 	block();
+-	CHECK(cap_pcm[0][0] == -3164 && cap_pcm[0][1] == 3164, "quiet PCM gets the requested gain");
++	CHECK(cap_pcm[0][0] == -6308 && cap_pcm[0][1] == 6308, "quiet PCM gets the requested gain");
+ 
+ 	mic[0] = -20000;
+ 	mic[1] = 20000;

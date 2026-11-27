@@ -1,0 +1,33 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 8a1fe0f..9c090ba 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12554,11 +12554,12 @@ static void test_dstar_memory(void)
+ 	const int16_t gain_test_quiet[] = { -1000, 1000 };
+ 	const int16_t gain_test_loud[] = { -20000, 20000 };
+ 	const int16_t gain_test_full[] = { INT16_MIN, INT16_MAX };
+-	CHECK(mic_gain_limit_q8(gain_test_quiet, 2, 810) == 810);
++	uint16_t max_gain = mic_gain_step_q8(MIC_GAIN_STEPS);
++	CHECK(max_gain == 1615 && mic_gain_limit_q8(gain_test_quiet, 2, max_gain) == max_gain);
+ 	CHECK(mic_gain_limit_q8(gain_test_loud, 2, 256) == 256);
+-	uint16_t gain_test_limited = mic_gain_limit_q8(gain_test_loud, 2, 810);
+-	CHECK(gain_test_limited > 256 && gain_test_limited < 810 && (uint32_t)gain_test_limited * 20000u <= 32767u * 256u);
+-	CHECK(mic_gain_limit_q8(gain_test_full, 2, 810) == 256);
++	uint16_t gain_test_limited = mic_gain_limit_q8(gain_test_loud, 2, max_gain);
++	CHECK(gain_test_limited > 256 && gain_test_limited < max_gain && (uint32_t)gain_test_limited * 20000u <= 32767u * 256u);
++	CHECK(mic_gain_limit_q8(gain_test_full, 2, max_gain) == 256);
+ 
+ 	// Manual gain must reach the far-end PCM when the board has no microphone gain hook.
+ 	uint8_t saved_gain = radio_mic_gain();
+@@ -12586,9 +12587,9 @@ static void test_dstar_memory(void)
+ 	ui_svc_apply(UI_SET_MIC_AGC, 0);
+ 	CHECK(ui_svc_setting_set(UI_SET_MIC_GAIN, saved_ui_gain));
+ 	radio_set_mic_gain(saved_gain);
+-	// Each five-step increase is 10 dB. Allow for quantization in the decoded energy.
++	// The 5-to-10 change boosts decoded energy, subject to the input peak limiter and AMBE quantization.
+ 	CHECK(energy[0] > 0 && energy[1] > 6 * energy[0] && energy[1] < 16 * energy[0]);
+-	CHECK(energy[2] > 6 * energy[1] && energy[2] < 16 * energy[1]);
++	CHECK(energy[2] > 12 * energy[1] && energy[2] < 50 * energy[1]);
+ 	CHECK(energy[3] * 100 > energy[2] * 90 && energy[3] * 100 < energy[2] * 110);
+ 	// The external station transmits a DV reply and the handheld plays it.
+ 	dstar_header_t reply = dstar_far.header;
