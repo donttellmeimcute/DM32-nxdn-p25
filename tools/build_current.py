@@ -14,6 +14,8 @@ import os
 import shutil
 from pathlib import Path
 import subprocess
+import tempfile
+import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = 'e89121e97a314f0ddd0475f848713ba10710d7db'
@@ -225,6 +227,17 @@ def prepare(tree, dstar=False):
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
 
 
+def check_monitor_cw():
+	"""Run portable RX scan and Morse tests using a native compiler, not C-SKY."""
+	root = ROOT / 'experimental/monitor-cw'
+	with tempfile.TemporaryDirectory(prefix='dm32-monitor-cw-') as tmp:
+		binary = Path(tmp) / 'monitor-cw-test'
+		run(*shlex.split(os.environ.get('HOSTCC', 'cc')), '-std=c11',
+		    '-Wall', '-Wextra', '-Werror', '-pedantic', '-Os',
+		    root / 'test.c', '-o', binary)
+		run(binary)
+
+
 def main():
 	ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 	ap.add_argument('--tree', type=Path, default=ROOT / 'build/current',
@@ -240,7 +253,12 @@ def main():
 	ap.add_argument('--no-mdc1200', action='store_true', help='build with CONFIG_MDC1200=n (MDC-1200 ID on FM channels)')
 	ap.add_argument('--bench-tx-1p25m', action='store_true',
 	                help='write the 220–230 MHz bench build with a separate name and output directory')
+	ap.add_argument('--monitor-cw-tests-only', action='store_true',
+	                help='run native Monitor Scan/CW regression tests without fetching or building firmware')
 	args = ap.parse_args()
+	check_monitor_cw()
+	if args.monitor_cw_tests_only:
+		return
 	tree = args.tree.resolve()
 	disabled = set(args.without)
 	if not args.dstar or args.variant != 'full' or 'p25' in disabled:
