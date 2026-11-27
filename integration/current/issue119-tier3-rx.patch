@@ -1,0 +1,774 @@
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 7853c67..e33ffd4 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -8167,7 +8167,21 @@ static void bench_tick(radio_sm_t *sm, uint32_t now_ms)
+ 
+ // --- Settings: what the radio was set to, back at power-on (core/settings), and saved when it changes ---
+ 
+-// The preferences the radio core uses: base squelch, master power, VFO step. The own DMR ID is the codeplug's
++// A Tier III system may use the radio's DMR ID when its own is unset. Load it before selecting the channel.
++static void load_own_id(radio_sm_t *sm)
++{
++#if CONFIG_DMR
++	sm->own_id = codeplug_dmr_id();
++	if (sm->own_id == 0) {
++		sm->own_id = RADIO_DMR_ID_DEFAULT;
++	}
++	sm->view.dmr.own_id = sm->own_id;
++#else
++	(void)sm;
++#endif
++}
++
++// The preferences the radio core uses: base squelch, master power, VFO step
+ static void apply_prefs(radio_sm_t *sm, const settings_t *st)
+ {
+ 	master_power = st->master_power;
+@@ -8184,11 +8198,6 @@ static void apply_prefs(radio_sm_t *sm, const settings_t *st)
+ 	sm->vfo_step_set = st->vfo_step_hz >= 1000u && st->vfo_step_hz <= 1000000u ? st->vfo_step_hz : 0;
+ 	step_update(sm);
+ #if CONFIG_DMR
+-	sm->own_id = codeplug_dmr_id();	// set on the radio in Settings > My radio, which writes the codeplug
+-	if (sm->own_id == 0) {
+-		sm->own_id = RADIO_DMR_ID_DEFAULT;
+-	}
+-	sm->view.dmr.own_id = sm->own_id;
+ 	// The radio name (talker alias text): the settings' override, else the codeplug's; hang times from the codeplug
+ 	codeplug_dmr_settings_t gs;
+ 	codeplug_dmr_settings(&gs);
+@@ -8775,6 +8784,7 @@ static void reload(radio_sm_t *sm, uint32_t now_ms)
+ 	}
+ 	sm->view.zone_index = zi;
+ #endif
++	load_own_id(sm);
+ 	select_position(sm, zi, number, pos);
+ #if CONFIG_ZONE_WRITE && CONFIG_SCAN
+ 	if (sm->scan.kind == SCAN_ZONE && zone_sum(sm) != sum) {
+@@ -8966,6 +8976,7 @@ void radio_sm_init(radio_sm_t *sm, uint32_t now_ms)
+ 	kv_load(sm, now_ms);
+ 
+ 	// The saved zone and channel; else zone 0 and its first channel; if zone 0 has none, the first zone that has one
++	load_own_id(sm);
+ 	select_position(sm, st.zone_index, st.channel, st.zone_pos);
+ 	apply_prefs(sm, &st);
+ #if CONFIG_DMR
+diff --git a/core/dmr/trunk/t3_ms.c b/core/dmr/trunk/t3_ms.c
+index 4cba2e1..2205d5b 100644
+--- a/core/dmr/trunk/t3_ms.c
++++ b/core/dmr/trunk/t3_ms.c
+@@ -193,8 +193,11 @@ static void hunt_next(t3_ms_t *ms, uint32_t now)
+ 		t3_chan_t c;
+ 		uint8_t i = ms->hunt_idx;
+ 		ms->hunt_idx = (uint8_t)((ms->hunt_idx + 1u) % n);
+-		if (ms->hunt_idx == 0) {
+-			ms->hunt_strict = false;	// a whole pass found nothing better: take any TSCC again
++		if (ms->hunt_idx == 0 && ms->hunt_strict) {
++			// A whole pass found nothing better: take any TSCC again, and hold on it. Set only here: a later pass
++			// that hears nothing (a fade at the edge of coverage) keeps the hold due
++			ms->weak_failed = true;
++			ms->hunt_strict = false;
+ 		}
+ 		if (hunt_candidate(ms, i, &c)) {
+ 			tune(ms, now, &c, 0, false);
+@@ -246,6 +249,8 @@ static void enter_hunt(t3_ms_t *ms, uint32_t now, bool retry)
+ 	ms->csc_valid = false;
+ 	ms->retry_tscc = retry && ms->tscc.rx_hz != 0;
+ 	ms->hunt_strict = false;
++	ms->weak_failed = false;
++	ms->weak_hold_until = 0;	// the hold was on the TSCC left (lost, or let go once the hold was over); the backoff stays
+ 	ms->vote.on = false;
+ 	ms->st.hunts++;
+ 	hunt_next(ms, now);
+@@ -1601,6 +1606,8 @@ static bool authorized(t3_ms_t *ms, uint16_t code)
+ 	return t3_authorize(&ms->auth, code) == T3_AUTH_OK;
+ }
+ 
++static bool weak(const t3_ms_t *ms, int16_t dbm);
++
+ static void confirm(t3_ms_t *ms, uint32_t now, uint8_t slot, uint8_t cc, const t3_aloha_t *a)
+ {
+ 	if (ms->state == T3_HUNT && ms->hunt_strict && ms->cfg->leave_dbm != 0 && ms->level_dbm != 0 &&
+@@ -1610,6 +1617,20 @@ static void confirm(t3_ms_t *ms, uint32_t now, uint8_t slot, uint8_t cc, const t
+ 		return;
+ 	}
+ 	if (ms->state == T3_HUNT) {
++		if (ms->hunt_strict || (ms->level_dbm != 0 && !weak(ms, ms->level_dbm))) {
++			// A TSCC at or above the threshold: the next weak spell may be left at once. The backoff stays: a level
++			// that only touched the threshold (one sample, at the edge of coverage) soon fails again, and only a
++			// level clearly above it (the tick) starts the hold over
++			ms->weak_hold_until = 0;
++		} else if (ms->weak_failed) {
++			// Back on a TSCC no stronger than the one left: leaving again finds nothing either, and every
++			// hunt misses what the TSCC sends meanwhile (grants included). Hold, longer after each such pass
++			ms->weak_hold_ms = ms->weak_hold_ms == 0 ? T3_WEAK_HOLD_MS :
++					   ms->weak_hold_ms >= T3_WEAK_HOLD_MAX_MS / 2u ? T3_WEAK_HOLD_MAX_MS :
++					   ms->weak_hold_ms * 2u;
++			ms->weak_hold_until = (now + ms->weak_hold_ms) | 1u;
++		}
++		ms->weak_failed = false;
+ 		ms->state = T3_CAMPED;
+ 		ms->tscc = ms->tuned;
+ 		ms->tscc.cc = cc;
+@@ -1670,6 +1691,7 @@ static void on_move(t3_ms_t *ms, uint32_t now, const t3_move_t *m, const t3_cdef
+ 	ms->massreg = false;
+ 	ms->tscc_slots = 0;
+ 	ms->csc_valid = false;
++	ms->weak_hold_until = 0;	// the hold was on the TSCC left
+ 	ms->moves++;
+ 	ms->last_valid_ms = now;
+ 	tune(ms, now, &ms->tscc, 0, false);
+@@ -1767,6 +1789,7 @@ static void vote_end(t3_ms_t *ms, uint32_t now, bool moving)
+ 		ms->tscc = to;
+ 		ms->tuned.cc = to.cc;
+ 		ms->confirmed = false;
++		ms->weak_hold_until = 0;	// the hold was on the TSCC left
+ 		ms->massreg = false;
+ 		ms->tscc_slots = 0;
+ 		ms->csc_valid = false;
+@@ -1826,7 +1849,14 @@ void t3_ms_level(t3_ms_t *ms, uint32_t now, int16_t dbm)
+ 	    ms->asleep || !since(now, ms->woke_ms, T3_SETTLE_MS)) {
+ 		return;
+ 	}
+-	ms->level_dbm = ms->level_dbm == 0 ? dbm : (int16_t)((3 * (int32_t)ms->level_dbm + dbm) / 4);
++	// Rounded to the nearest dB: truncated toward 0, a falling level would stop up to 3 dB short (above the
++	// threshold it should cross)
++	int32_t sum = 3 * (int32_t)ms->level_dbm + dbm;
++	int16_t avg = ms->level_dbm == 0 ? dbm : (int16_t)((sum >= 0 ? sum + 2 : sum - 2) / 4);
++	if (avg == ms->level_dbm && dbm != avg) {
++		avg = (int16_t)(avg + (dbm < avg ? -1 : 1));	// rounded alone, a steady level stops 1 dB short
++	}
++	ms->level_dbm = avg;
+ }
+ 
+ // A complete PDU heard on the TSCC we are hunting or camped on. cdef: the appended block of an MBC, or NULL
+@@ -2491,8 +2521,12 @@ bool t3_ms_poll(t3_ms_t *ms, uint32_t now, t3_act_t *act)
+ 			enter_hunt(ms, now, true);
+ 			break;
+ 		}
++		if (ms->weak_hold_until != 0 && !before(now, ms->weak_hold_until)) {
++			ms->weak_hold_until = 0;	// over: left set, it would read as ahead again 2^31 ms on
++		}
++		bool held = ms->weak_hold_until != 0;
+ 		if (!(ms->cfg->opts & T3_OPT_NO_ROAM) && weak(ms, ms->level_dbm) && ms->ax.state == T3_AX_IDLE &&
+-		    hunt_count(ms) > 1) {
++		    hunt_count(ms) > 1 && !held) {
+ 			// Below the threshold (6.3.3.1 a) for T3_WEAK_MS, with somewhere else to look: hunt, and take only a
+ 			// stronger TSCC for one pass
+ 			if (ms->weak_since == 0) {
+@@ -2507,6 +2541,12 @@ bool t3_ms_poll(t3_ms_t *ms, uint32_t now, t3_act_t *act)
+ 		} else {
+ 			ms->weak_since = 0;
+ 		}
++		if (ms->level_dbm != 0 && ms->cfg->leave_dbm != 0 &&
++		    ms->level_dbm >= ms->cfg->leave_dbm + T3_VOTE_MARGIN_DB) {
++			// Clearly above the threshold: a later weak spell (the radio moved) is left after T3_WEAK_MS again
++			ms->weak_hold_ms = 0;
++			ms->weak_hold_until = 0;
++		}
+ 		if (!may_send(ms)) {
+ 			break;
+ 		}
+diff --git a/core/dmr/trunk/t3_ms.h b/core/dmr/trunk/t3_ms.h
+index 5590c79..14d1610 100644
+--- a/core/dmr/trunk/t3_ms.h
++++ b/core/dmr/trunk/t3_ms.h
+@@ -92,6 +92,8 @@
+ #define T3_VOTE_MS		360	// sampling an adjacent TSCC after a Vote Now (VOTE_BLK: 2-10 frames)
+ #define T3_VOTE_MARGIN_DB	6	// an adjacent TSCC this much stronger is better (no radiated preference)
+ #define T3_WEAK_MS		5000	// camped with the level below leave_dbm this long: hunt (6.3.3.1 a)
++#define T3_WEAK_HOLD_MS		30000	// a weak-TSCC hunt that found nothing better: no other for this long, doubled each time
++#define T3_WEAK_HOLD_MAX_MS	300000	// ... up to this
+ #define T3_VOTE_AGAIN_MS	30000	// an adjacent TSCC sampled isn't sampled again this soon, unless ours is weak
+ 
+ typedef struct {
+@@ -473,6 +475,9 @@ typedef struct {
+ 	int16_t level_dbm;		// the tuned channel's averaged signal level (t3_ms_level), 0 = none yet
+ 	uint32_t weak_since;		// camped and below leave_dbm since (0: not)
+ 	bool hunt_strict;		// hunting after a weak TSCC: confirm only one above leave_dbm, for one pass
++	bool weak_failed;		// that pass ended with nothing better: the TSCC taken next starts a hold
++	uint32_t weak_hold_until;	// no leaving a weak TSCC before this (0: none)
++	uint32_t weak_hold_ms;		// the hold last set: doubles after each pass that found nothing (0: none)
+ 	struct {
+ 		bool on;		// sampling adj[idx] until `until`
+ 		uint8_t idx;
+diff --git a/site/static/js/codeplug/csv.js b/site/static/js/codeplug/csv.js
+index e3f22ab..5e6ce28 100644
+--- a/site/static/js/codeplug/csv.js
++++ b/site/static/js/codeplug/csv.js
+@@ -175,3 +175,3 @@ const TYPES = Object.fromEntries(CALL_TYPES.map((k) => [k, k[0].toUpperCase() +
+ // "NXDN" alone means the 9600 bit/s mode, as the editor's new NXDN channel does.
+-const NXDN_KIND = 4, YSF_KIND = 6;
++const T3_KIND = 1, NXDN_KIND = 4, YSF_KIND = 6;
+ const isNxdn = (kind) => kind === NXDN_KIND || kind === SCRAMBLER_KIND;
+@@ -181,2 +181,3 @@ const asChannelMode = (s) => {
+ 	const v = s.trim().toLowerCase().replace(/[_-]/g, " ").replace(/\s+/g, " ");
++	if (v === "dmr tier iii" || v === "dmr tier 3" || v === "t3") return { kind: T3_KIND };
+ 	if (["ysf", "c4fm", "fusion", "system fusion", "yaesu system fusion"].includes(v)) return { kind: YSF_KIND };
+@@ -191,2 +192,3 @@ const asChannelMode = (s) => {
+ const channelModeText = (r) => {
++	if (r.kind === T3_KIND) return "DMR Tier III";
+ 	if (r.kind === YSF_KIND) return "YSF";
+@@ -199,2 +201,7 @@ const setChannelMode = (r, s, m) => {
+ 	const v = asChannelMode(s);
++	if (v.kind === T3_KIND) {
++		// This table has no systems. Only update a channel that already has its Tier III system.
++		if (r.kind !== T3_KIND || !r.system) throw new Bad("csv_t3_system");
++		return;
++	}
+ 	if (v.kind) {
+@@ -206,3 +213,3 @@ const usesTagTx = (r) => isNxdn(r.kind) || r.kind === YSF_KIND || r.kind === dst
+ // Scrambler CSVs leave the base RX only even in editors that don't recognize the mode.
+-const rxOnlyText = (r) => yesNo(r.kind === SCRAMBLER_KIND || (usesTagTx(r) ? !r.tagTx : r.rxOnly));
++const rxOnlyText = (r) => yesNo(r.kind === SCRAMBLER_KIND || (r.kind === T3_KIND || usesTagTx(r) ? !r.tagTx : r.rxOnly));
+ const setRxOnly = (r, s) => {
+@@ -210,3 +217,4 @@ const setRxOnly = (r, s) => {
+ 	const v = asBool(s);
+-	if (usesTagTx(r)) r.tagTx = !v;
++	if (r.kind === T3_KIND && !s.trim()) return;
++	if (r.kind === T3_KIND || usesTagTx(r)) r.tagTx = !v;
+ 	else r.rxOnly = v;
+@@ -461,3 +469,10 @@ export const TABLES = {
+ 			c("SFR A", "sfrA", asInt(0, 255, 0)),
+-			c("SFR B", "sfrB", asInt(0, 255, 0)),
++			{ header: "SFR B", key: "sfrB", aliases: [], get: (r) => r.sfrB,
++				set: (r, s) => {
++					r.sfrB = asInt(0, 255, 0)(s);
++					r.acceptBadCrc = (r.sfrB & 0x30) === 0x20;
++				} },
++			{ header: "Accept Invalid CRC", key: "acceptBadCrc", aliases: [],
++				get: (r) => yesNo(r.acceptBadCrc),
++				set: (r, s) => { if (s.trim()) r.acceptBadCrc = asBool(s); } },
+ 			c("ID Type", "aniType", asWordOf(ANI_TYPE_WORDS), (r) => (hasAni(r) ? "MDC-1200" : ""), ["Signaling", "PTT ID Type"]),
+@@ -557,3 +572,3 @@ export function importTable(m, text, table = detect(text)) {
+ 	if (table === "channels") {
+-		const priority = { mode: 0, ysfRxDgid: 1, scramblerTx: 3 };
++		const priority = { mode: 0, ysfRxDgid: 1, scramblerTx: 3, acceptBadCrc: 3 };
+ 		found.sort((a, b) => (priority[a.col.key] ?? 2) - (priority[b.col.key] ?? 2));
+@@ -589,2 +604,8 @@ export function importTable(m, text, table = detect(text)) {
+ 				if (!(e instanceof Bad)) throw e;
++				if (e.code === "csv_t3_system") {
++					problems.push({ row: i + 1, column: col.header, code: e.code, params: e.params, skipped: true });
++					if (!fresh) out.push(rec);
++					skip = true;
++					break;
++				}
+ 				// A new channel with an invalid explicit mode must not be saved as default FM.
+diff --git a/site/static/js/codeplug/mode_t3.js b/site/static/js/codeplug/mode_t3.js
+index 85aa326..c3fc81c 100644
+--- a/site/static/js/codeplug/mode_t3.js
++++ b/site/static/js/codeplug/mode_t3.js
+@@ -16,7 +16,7 @@ export const siteMax = (model) => 2 ** (12 - NET_BITS[model & 3]) - 1;
+ 
+ // The options word (1): the bits the editor knows, by field. Others are kept as stored
+ export const OPTS = {
+-	allCalls: 0x0002, emergencyAny: 0x0004, privateCalls: 0x0020, registerTalkgroups: 0x0040, acceptAls: 0x0080,
++	allCalls: 0x0002, emergencyAny: 0x0004, followAll: 0x0008, learnSystem: 0x0010, privateCalls: 0x0020, registerTalkgroups: 0x0040, acceptAls: 0x0080,
+ 	acceptKill: 0x0100, noRoaming: 0x0200, acceptStun: 0x0400, ipGateway: 0x1000,
+ };
+ const OPT_MASK = Object.values(OPTS).reduce((a, b) => a | b, 0);
+@@ -81,9 +81,9 @@ export const validKey = (k) => /^[0-9A-Fa-f]{32}$/.test(String(k ?? "").replace(
+ 
+ const range = (lo, hi) => ({ type: "int", min: lo, max: hi });
+ // Each option's section in the system form, and its help (editor.t3.opt.<key>_help) where it has one
+-const OPT_SECTION = { allCalls: "calls", emergencyAny: "calls", privateCalls: "calls", registerTalkgroups: "radio", ipGateway: "radio",
++const OPT_SECTION = { learnSystem: "identity", allCalls: "calls", emergencyAny: "calls", followAll: "calls", privateCalls: "calls", registerTalkgroups: "radio", ipGateway: "radio",
+ 	acceptAls: "commands", acceptKill: "commands", acceptStun: "commands", noRoaming: "roaming" };
+-const OPT_HELP = new Set(["allCalls", "registerTalkgroups", "ipGateway", "acceptAls", "acceptKill", "acceptStun", "noRoaming"]);
++const OPT_HELP = new Set(["allCalls", "followAll", "learnSystem", "registerTalkgroups", "ipGateway", "acceptAls", "acceptKill", "acceptStun", "noRoaming"]);
+ const optionFields = (section) => Object.keys(OPTS).filter((k) => OPT_SECTION[k] === section).map((k) =>
+ 	({ key: k, label: `editor.t3.opt.${k}`, type: "bool", section, help: OPT_HELP.has(k) ? `editor.t3.opt.${k}_help` : undefined }));
+ 
+@@ -173,7 +173,8 @@ export const t3System = {
+ export const t3Kind = {
+ 	id: 1,
+ 	systemType: 1,
+-	contacts: true,		// the talk target is the record's contact, the groups followed its RX group list
++	contacts: true,
++	recordFields: ["contact", "rxList", "acceptBadCrc"],
+ 	ownFreqs: false,	// the record holds the system's first control channel
+ 	defaultTx: true,	// a site grants every transmission
+ 	fallback: true,
+diff --git a/site/static/js/codeplug/model.js b/site/static/js/codeplug/model.js
+index 7bf7225..23bb38f 100644
+--- a/site/static/js/codeplug/model.js
++++ b/site/static/js/codeplug/model.js
+@@ -140,7 +140,7 @@ function same(a, b, keys) {
+ const CHANNEL_KEYS = [
+ 	"name", "rxHz", "txHz", "mode", "power", "tot", "rxTone", "txTone", "bw", "rxOnly", "allSkip", "zoneSkip", "vox",
+ 	"squelch", "colorCode", "timeslot", "contact", "rxList", "aprs", "dmrId", "dmrPrivacy", "dmrPrivacyKey", "noBeep", "noEco", "dmo", "roam",
+-	"aliasTs1", "aliasTs2", "useLocation", "lat", "lon", "sfr", "sfrA", "sfrB", "toneBurst",
++	"aliasTs1", "aliasTs2", "useLocation", "lat", "lon", "sfr", "sfrA", "sfrB", "toneBurst", "acceptBadCrc",
+ 	"aniType", "aniSend", "aniDecode", "aniId",
+ ];
+ 
+@@ -264,7 +264,7 @@ export function newChannel(fields = {}) {
+ 		txTone: "", bw: 12.5, rxOnly: false, allSkip: false, zoneSkip: false, vox: false, squelch: 0, colorCode: 1,
+ 		timeslot: 1, contact: null, rxList: null, aprs: null, dmrId: 0, noBeep: false, noEco: false, dmo: false,
+ 		roam: false, aliasTs1: 0, aliasTs2: 0, useLocation: false, lat: 0, lon: 0, sfr: false, sfrA: 0, sfrB: 0,
+-		toneBurst: false, aniType: 0, aniSend: 0, aniDecode: false, aniId: 0, kind: 0, ...fields,
++		toneBurst: false, acceptBadCrc: false, aniType: 0, aniSend: 0, aniDecode: false, aniId: 0, kind: 0, ...fields,
+ 	};
+ }
+ 
+diff --git a/site/static/js/codeplug/records.js b/site/static/js/codeplug/records.js
+index 8040892..716dc68 100644
+--- a/site/static/js/codeplug/records.js
++++ b/site/static/js/codeplug/records.js
+@@ -119,6 +119,7 @@ export function decodeChannel(r, memory = false) {
+ 		sfr: (l1 & 0x02) !== 0,
+ 		sfrA: r[0x25],
+ 		sfrB: r[0x2A] & ~0x40,
++		acceptBadCrc: (r[0x2A] & 0x30) === 0x20,
+ 		toneBurst: r[0x2A] !== 0xFF && (r[0x2A] & 0x40) !== 0,	// FM: SFR byte B bit 6, read without the SFR flag (7.3.3); 0xFF = not set
+ 	};
+ }
+@@ -179,7 +180,8 @@ export function encodeChannel(c, r, memory = false) {
+ 	}
+ 	r[0x25] = c.sfrA & 0xFF;
+ 	r[0x2A] = (c.sfrB & 0xBF) | (c.toneBurst ? 0x40 : 0);
+-	if (r[0x2A] === 0xFF) r[0x2A] = 0xCF;	// 0xFF reads as not set: the unused bits 5-4 cleared (as the firmware)
++	if (c.acceptBadCrc) r[0x2A] = (r[0x2A] & ~0x30) | 0x20;
++	else if (r[0x2A] === 0xFF || (c.acceptBadCrc === false && (r[0x2A] & 0x30) === 0x20)) r[0x2A] &= ~0x30;
+ 	return r;
+ }
+ 
+diff --git a/site/static/js/editor/views.js b/site/static/js/editor/views.js
+index 2017412..e9d3510 100644
+--- a/site/static/js/editor/views.js
++++ b/site/static/js/editor/views.js
+@@ -447,12 +447,13 @@ export function channelForm(m, t, { features = null } = {}) {
+ 			[2, t("editor.ani.send_end")], [3, t("editor.ani.send_both")]]), show: aniOn },
+ 		{ ...txt("aniId", "editor.col.ani_id", mdcId(t), mdcIdText), show: aniOn },
+ 		{ ...chk("aniDecode", "editor.col.ani_decode"), show: aniOn },
+-		dmr({ group: t("editor.form.digital") }),
++		{ group: t("editor.form.digital"), show: (r) => r.mode === "dmr" && (!r.kind || r.kind === 1) },
+ 		dmr(sel("colorCode", "editor.col.cc", () => [...Array(16).keys()].map((n) => [n, String(n)]))),
+ 		dmr(sel("timeslot", "editor.col.ts", () => [[1, "1"], [2, "2"]])),
+ 		dmr(sel("contact", "editor.col.contact", () => refOptions(m.contacts, t))),
+ 		dmr(sel("rxList", "editor.col.rx_list", () => refOptions(m.rxLists, t))),
+ 		dmr(txt("dmrId", "editor.col.channel_id", dmrId(t), (v) => (v ? String(v) : ""))),
++		{ ...chk("acceptBadCrc", "editor.col.t3_crc_recheck"), show: (r) => r.kind === 1 },
+ 		dmr(chk("dmo", "editor.col.dmo")),
+ 		sel("dmrPrivacy", "editor.col.dmr_privacy", () => [
+ 			[DMR_PRIV.default, t("editor.tot.default")], [DMR_PRIV.off, t("editor.none")],
+diff --git a/site/i18n/en.json b/site/i18n/en.json
+index 3d13d86..d11cfbc 100644
+--- a/site/i18n/en.json
++++ b/site/i18n/en.json
+@@ -1613,6 +1613,12 @@
+  "editor.col.squelch": "Squelch",
+  "editor.col.vox": "VOX Allowed",
+  "editor.col.tone_burst": "1750 Hz Tone Burst",
++ "editor.col.t3_crc_recheck": "Recheck Tier III RX CRC",
++ "editor.t3.opt.followAll": "Follow every talkgroup",
++ "editor.t3.opt.followAll_help": "Follow grants for any talkgroup the site carries.",
++ "editor.t3.opt.learnSystem": "Learn system code",
++ "editor.t3.opt.learnSystem_help": "Use the network model and NET heard on the control channel in receive-only mode.",
++ "editor.csv.err.csv_t3_system": "Use an Open Firmware codeplug image to import the Tier III system first.",
+  "editor.col.ani_type": "ID type",
+  "editor.col.ani_send": "Send ID",
+  "editor.col.ani_id": "MDC-1200 ID",
+diff --git a/site/i18n/es.json b/site/i18n/es.json
+index 5440250..edc6101 100644
+--- a/site/i18n/es.json
++++ b/site/i18n/es.json
+@@ -1613,6 +1613,12 @@
+  "editor.col.squelch": "Squelch",
+  "editor.col.vox": "VOX permitido",
+  "editor.col.tone_burst": "Ráfaga de tono 1750 Hz",
++ "editor.col.t3_crc_recheck": "Revalidar CRC de RX Tier III",
++ "editor.t3.opt.followAll": "Seguir todos los grupos",
++ "editor.t3.opt.followAll_help": "Sigue las concesiones de cualquier grupo que transporte el sitio.",
++ "editor.t3.opt.learnSystem": "Aprender el código del sistema",
++ "editor.t3.opt.learnSystem_help": "En solo recepción, usa el modelo de red y el NET recibidos en el canal de control.",
++ "editor.csv.err.csv_t3_system": "Importa primero el sistema Tier III desde una imagen de codeplug Open Firmware.",
+  "editor.col.ani_type": "Tipo de ID",
+  "editor.col.ani_send": "Enviar ID",
+  "editor.col.ani_id": "ID MDC-1200",
+diff --git a/site/i18n/it.json b/site/i18n/it.json
+index 464bb81..f913bde 100644
+--- a/site/i18n/it.json
++++ b/site/i18n/it.json
+@@ -1613,6 +1613,12 @@
+  "editor.col.squelch": "Squelch",
+  "editor.col.vox": "VOX consentito",
+  "editor.col.tone_burst": "Tono di apertura 1750 Hz",
++ "editor.col.t3_crc_recheck": "Ricontrolla il CRC RX Tier III",
++ "editor.t3.opt.followAll": "Segui tutti i gruppi",
++ "editor.t3.opt.followAll_help": "Segue le assegnazioni per qualsiasi gruppo trasmesso dal sito.",
++ "editor.t3.opt.learnSystem": "Apprendi il codice di sistema",
++ "editor.t3.opt.learnSystem_help": "In sola ricezione usa il modello di rete e il NET ricevuti sul canale di controllo.",
++ "editor.csv.err.csv_t3_system": "Importa prima il sistema Tier III da un'immagine codeplug Open Firmware.",
+  "editor.col.ani_type": "Tipo di ID",
+  "editor.col.ani_send": "Invia ID",
+  "editor.col.ani_id": "ID MDC-1200",
+diff --git a/site/i18n/zh.json b/site/i18n/zh.json
+index e008fe4..abb47e6 100644
+--- a/site/i18n/zh.json
++++ b/site/i18n/zh.json
+@@ -1613,6 +1613,12 @@
+  "editor.col.squelch": "静噪",
+  "editor.col.vox": "允许 VOX",
+  "editor.col.tone_burst": "1750 Hz 突发音",
++ "editor.col.t3_crc_recheck": "重新校验 Tier III 接收 CRC",
++ "editor.t3.opt.followAll": "跟踪所有通话组",
++ "editor.t3.opt.followAll_help": "跟踪本站点承载的任意通话组的信道分配。",
++ "editor.t3.opt.learnSystem": "学习系统码",
++ "editor.t3.opt.learnSystem_help": "仅接收时，使用控制信道接收到的网络模型和 NET。",
++ "editor.csv.err.csv_t3_system": "请先从 Open Firmware 写频镜像导入 Tier III 系统。",
+  "editor.col.ani_type": "ID 类型",
+  "editor.col.ani_send": "发送 ID",
+  "editor.col.ani_id": "MDC-1200 ID",
+diff --git a/docs/dev/codeplug-editor.md b/docs/dev/codeplug-editor.md
+index 72a2426..e8c56dc 100644
+--- a/docs/dev/codeplug-editor.md
++++ b/docs/dev/codeplug-editor.md
+@@ -39,6 +39,10 @@ use it too. Both are plain ES modules that also run in Node. The user's view is
+ | `editor/extensions.js`, `parts.js` | Optional parts register their Save items, table actions, text file openers and DMR ID Database views. `parts.js` lists them, so a part is added without touching `app.js` |
+ | `editor/csvpart.js`, `qdmrpart.js`, `contactspart.js` | The CSV, qdmr YAML and RadioID parts |
+ 
++A channel CSV can edit an existing Tier III channel and preserves its system link. To transfer the system and its
++control-channel and band-plan entries, use an Open Firmware codeplug image. A Tier III CSV row without a matching
++channel and system is reported as skipped.
++
+ Add `#sim` to the page's address to read and write a simulated radio (`fakecps.js`), `#sim-compact` for one that
+ reads format C ID databases, `#sim-modes` for one whose features report every channel mode in the registry. Append `&release=vYY.M` for a radio that runs that release, or `&git_time=N` for a build
+ of a commit from that time, which brings up the update notice when `releases.json` lists a newer one.
+diff --git a/docs/spec/dmr-trunking.md b/docs/spec/dmr-trunking.md
+index eda169c..9dba98b 100644
+--- a/docs/spec/dmr-trunking.md
++++ b/docs/spec/dmr-trunking.md
+@@ -727,7 +727,9 @@ A site sampled isn't sampled again for 30 s unless ours is weak. `T3_OPT_NO_ROAM
+ 
+ **Leaving a weak TSCC.** Camped, idle, below the threshold for 5 s, and with another candidate: the radio hunts from
+ the adjacent sites, and for one pass confirms only a TSCC at or above the threshold (the hunting threshold of
+-6.3.2.3). After a pass it takes any. With nowhere else to look it stays.
++6.3.2.3). After a pass with no better candidate, it takes a weak TSCC again and holds it for 30 s. That hold
++doubles on repeated unsuccessful hunts, up to 5 min. Loss of the TSCC or a site move ends the hold. A level at
++least 6 dB above the threshold also resets the backoff. With nowhere else to look it stays.
+ 
+ ## 8. Timers and constants
+ 
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 432d545..4e916a4 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -11044,6 +11044,32 @@ static void test_t3_emergency_other_system(void)
+ 	t3_cp_done();
+ }
+ 
++// The selected system uses the radio's DMR ID. A restart or codeplug reload must see that ID before selecting it.
++static void test_t3_radio_id(void)
++{
++	const uint32_t saved_id = own_dmr_id;
++	t3_cp_zone(T3_OPT_PRIVATE, 0, 0, NULL);
++	req(RREQ_ZONE, 2);
++	t3_site_run(600);
++	CHECK(sm.view.channel_number == 7 && radio_t3v.on && radio_t3v.state == T3_CAMPED);
++	run(50);
++	boot();
++	t3_site_run(600);
++	CHECK(sm.view.channel_number == 7 && !radio_t3v.unavail && radio_t3v.on && radio_t3v.state == T3_CAMPED);
++
++	t3_cp_done();
++	own_dmr_id = 0;
++	t3_cp_zone(T3_OPT_PRIVATE, 0, 0, NULL);
++	req(RREQ_ZONE, 2);
++	t3_site_run(600);
++	CHECK(sm.view.channel_number == 7 && radio_t3v.unavail && !radio_t3v.on);
++	own_dmr_id = saved_id;
++	req(RREQ_RELOAD, 0);
++	t3_site_run(600);
++	CHECK(sm.view.channel_number == 7 && !radio_t3v.unavail && radio_t3v.on && radio_t3v.state == T3_CAMPED);
++	t3_cp_done();
++}
++
+ // No ID to register with (the system's record has none, nor the radio): the channel shows as unavailable, the engine
+ // never starts and nothing is sent
+ static void test_t3_no_id(void)
+@@ -11165,6 +11191,56 @@ static void t3_grant_tg(uint32_t tg)
+ 	run(300);
+ }
+ 
++// With CRC rechecking enabled on a receive-only system, a valid MBC must still arrive in order with a valid
++// continuation on the control slot. The grant then tunes its own carrier and slot and plays the synthetic call.
++static void test_t3_mbc_rx(void)
++{
++	t3_cp_zone(T3_OPT_PRIVATE | T3_OPT_LISTEN_ONLY, 0, 0, NULL);
++	chans[7].accept_bad_crc = true;
++	req(RREQ_ZONE, 2);
++	t3_site_run(600);
++	CHECK(radio_t3v.state == T3_CAMPED && sim.cfg.recheck_headers);
++	const unsigned air = sim.air_count;
++	const uint32_t voice_hz = 451037500u;
++	t3_csbk_t g = { .op = T3_OP_TV_GRANT };
++	g.u.grant.lpcn = T3_LPCN_ABSOLUTE;
++	g.u.grant.slot = 2;
++	g.u.grant.dst = 201;
++	g.u.grant.src = 1000001u;
++	t3_cdef_t plan = { 3, 0, 23, 456037500u, voice_hz };
++	uint8_t cont[T3_CSBK_BYTES];
++	t3_cdef_build(&plan, g.op, cont);
++	dmr_burst_t head = { .kind = DMR_BURST_MBC_HEADER, .sync = DMR_SYNC_BS, .ts = 1, .cc = 2,
++			     .crc_ok = false, .in_step = true, .len = T3_CSBK_BYTES };
++	CHECK(t3_csbk_build(&g, T3_CRC_MASK_MBC_HDR, head.payload));
++	head.payload[3] ^= 0x08;
++
++	sim_rx(&head);
++	run(60);
++	t3_data_rx(DMR_BURST_MBC_CONT, cont, 2);
++	run(60);
++	CHECK(radio_t3v.state == T3_CAMPED && radio_t3v.followed == 0);
++	// Restart the header on TS1. A corrupt continuation fails even with header rechecking enabled.
++	sim_rx(&head);
++	run(60);
++	cont[4] ^= 1;
++	t3_data_rx(DMR_BURST_MBC_CONT, cont, 1);
++	run(60);
++	CHECK(radio_t3v.state == T3_CAMPED && radio_t3v.followed == 0 && radio_t3v.crc_bad >= 1);
++	cont[4] ^= 1;
++	sim_rx(&head);
++	run(60);
++	t3_data_rx(DMR_BURST_MBC_CONT, cont, 1);
++	run(100);
++	CHECK(radio_t3v.state == T3_FOLLOW && radio_t3v.followed == 1 && hw.rx_hz == voice_hz &&
++	      sm.view.ch.timeslot == 2 && sim.cc_filter == 3);
++	hear_call(true, 201, 1000001u, 3, 1, false);
++	CHECK(sm.view.dmr.state == RDMR_RX && sm.view.dmr.call.dst == 201);
++	t3_site_run(3000);
++	CHECK(radio_t3v.state == T3_CAMPED && hw.rx_hz == T3_RX_HZ && sim.air_count == air);
++	t3_cp_done();
++}
++
+ // Digital monitor on a trunked channel follows every talkgroup's grant (dmr-trunking.md 6), as the system's own
+ // "follow every talkgroup" does; off again, only the channel's talkgroups. The call plays on its own slot and color
+ // code: monitor's any color code and both slots stay conventional DMR's
+@@ -12948,8 +13024,10 @@ int main(int argc, char **argv)
+ 	test_t3_power_save();
+ 	test_t3_channels();
+ 	test_t3_never_keys();
++	test_t3_radio_id();
+ 	test_t3_no_id();
+ 	test_t3_fallback();
++	test_t3_mbc_rx();
+ 	test_t3_follow_all();
+ 	test_t3_learn_syscode();
+ #endif
+diff --git a/tests/host/t3MsTest.c b/tests/host/t3MsTest.c
+index 5a977f6..00224ea 100644
+--- a/tests/host/t3MsTest.c
++++ b/tests/host/t3MsTest.c
+@@ -733,6 +733,134 @@ static void test_weak(void)
+ 	CHECK(ms.state == T3_CAMPED && ms.st.weak_leaves == 0, "nowhere else to look: stays");
+ }
+ 
++// Two programmed TSCCs of ours, both heard below a -105 dBm threshold
++static void weak_hold_setup(t3_ms_t *ms)
++{
++	setup();
++	cfg.leave_dbm = -105;
++	cfg.opts |= T3_OPT_LISTEN_ONLY;	// as on a site of another service: no access to wait on
++	cfg.nctrl = 2;
++	cfg.ctrl[0] = (t3_chan_t){ .lcn = 154, .cc = T3_CC_ANY, .rx_hz = RX(154), .tx_hz = RX(154) + 5000000u };
++	cfg.ctrl[1] = (t3_chan_t){ .lcn = 155, .cc = T3_CC_ANY, .rx_hz = RX(155), .tx_hz = RX(155) + 5000000u };
++	t3_ms_start(ms, &cfg, T);
++	poll_all(ms);
++}
++
++// Every TSCC weak: a pass that finds nothing better holds the radio on the one it comes back to, longer each time,
++// instead of leaving every T3_WEAK_MS and missing the grants sent meanwhile
++static void test_weak_hold(void)
++{
++	t3_ms_t ms;
++	weak_hold_setup(&ms);
++	uint32_t camped_ms = 0;
++	for (uint32_t t = 0; t < 60000; t += 60) {
++		camp_at(&ms, 60, ours, -107);
++		camped_ms += ms.state == T3_CAMPED ? 60u : 0u;
++	}
++	CHECK(ms.st.weak_leaves == 2 && ms.weak_hold_ms == 2u * T3_WEAK_HOLD_MS,
++	      "two passes found nothing in a minute, the hold doubled: %u leaves, hold %u ms",
++	      (unsigned)ms.st.weak_leaves, (unsigned)ms.weak_hold_ms);
++	CHECK(camped_ms >= 50000u, "camped most of the minute: %u ms", (unsigned)camped_ms);
++	for (uint32_t t = 0; t < 30u * 60000u; t += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	CHECK(ms.weak_hold_ms == T3_WEAK_HOLD_MAX_MS && ms.st.weak_leaves <= 12u,
++	      "the hold stops at its most: %u ms, %u leaves in 30 min", (unsigned)ms.weak_hold_ms,
++	      (unsigned)ms.st.weak_leaves);
++	// Clearly above the threshold ends the hold: the next weak spell is left after T3_WEAK_MS again
++	camp_at(&ms, 600, ours, -90);
++	CHECK(ms.state == T3_CAMPED && ms.weak_hold_ms == 0 && ms.weak_hold_until == 0, "strong: the hold cleared");
++	uint32_t before = ms.st.weak_leaves;
++	uint32_t waited = 0;
++	for (; waited < 4u * T3_WEAK_MS && ms.st.weak_leaves == before; waited += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	CHECK(ms.st.weak_leaves == before + 1 && waited > T3_WEAK_MS,
++	      "weak again: left after T3_WEAK_MS (the level average falling first): %u ms", (unsigned)waited);
++	// Just at the threshold doesn't clear it
++	weak_hold_setup(&ms);
++	for (uint32_t t = 0; t < 20000; t += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	CHECK(ms.weak_hold_ms == T3_WEAK_HOLD_MS, "held after one pass: %u", (unsigned)ms.weak_hold_ms);
++	camp_at(&ms, 600, ours, -104);
++	CHECK(ms.weak_hold_ms == T3_WEAK_HOLD_MS, "a level just above the threshold keeps the hold");
++	// A pass that confirms a TSCC just at the threshold ends the hold but keeps the backoff: weak again, the next pass
++	// that finds nothing holds twice as long
++	uint32_t spent = 0;
++	for (; spent < 10u * 60000u && ms.state != T3_HUNT; spent += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	CHECK(ms.state == T3_HUNT && ms.hunt_strict, "left after the hold: %u ms", (unsigned)spent);
++	camp_at(&ms, 600, ours, -104);
++	CHECK(ms.state == T3_CAMPED && ms.weak_hold_until == 0 && ms.weak_hold_ms == T3_WEAK_HOLD_MS,
++	      "confirmed at the threshold: no hold, the backoff kept (%u ms)", (unsigned)ms.weak_hold_ms);
++	for (spent = 0; spent < 60000u && ms.weak_hold_until == 0; spent += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	CHECK(ms.weak_hold_ms == 2u * T3_WEAK_HOLD_MS && spent >= T3_WEAK_MS,
++	      "weak again, nothing better: the hold doubled (%u ms) after %u ms", (unsigned)ms.weak_hold_ms, (unsigned)spent);
++	// A pass after the one that found nothing better hears no TSCC at all (a fade): the hold is still due
++	weak_hold_setup(&ms);
++	for (spent = 0; spent < 60000u && !ms.hunt_strict; spent += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	for (spent = 0; spent < 60000u && ms.hunt_strict; spent += 60) {
++		camp_at(&ms, 60, 0, -107);
++	}
++	camp_at(&ms, 3u * T3_DWELL_MS, 0, -107);	// past the end of the next pass too
++	CHECK(ms.state == T3_HUNT && !ms.hunt_strict && ms.weak_hold_ms == 0, "silent pass: hunting");
++	camp_at(&ms, 600, ours, -107);
++	CHECK(ms.state == T3_CAMPED && ms.weak_hold_ms == T3_WEAK_HOLD_MS && ms.weak_hold_until != 0,
++	      "back on a weak TSCC after a silent pass: held (%u ms)", (unsigned)ms.weak_hold_ms);
++	// The hold over, the deadline is dropped: left set, it would read as ahead again 2^31 ms on
++	camp_at(&ms, T3_WEAK_HOLD_MS + 600, ours, -104);
++	CHECK(ms.state == T3_CAMPED && ms.weak_hold_until == 0 && ms.weak_hold_ms == T3_WEAK_HOLD_MS,
++	      "hold over: deadline cleared, the backoff kept");
++	// The held TSCC lost (T_Nosig): the search ends the hold, the backoff stays
++	weak_hold_setup(&ms);
++	for (spent = 0; spent < 60000u && ms.weak_hold_until == 0; spent += 60) {
++		camp_at(&ms, 60, ours, -107);
++	}
++	CHECK(ms.state == T3_CAMPED && ms.weak_hold_until != 0, "held before the loss");
++	camp_at(&ms, T3_NOSIG_MS + 600, 0, -107);
++	CHECK(ms.state == T3_HUNT && ms.weak_hold_until == 0 && ms.weak_hold_ms == T3_WEAK_HOLD_MS,
++	      "TSCC lost: the hold ended, the backoff kept (%u ms)", (unsigned)ms.weak_hold_ms);
++}
++
++// The level average reaches a steady level to the dB: 1 dB below the threshold counts as weak
++static void test_level_average(void)
++{
++	t3_ms_t ms;
++	weak_hold_setup(&ms);
++	camp_at(&ms, 600, ours, -100);
++	camp_at(&ms, 3000, ours, -106);
++	CHECK(ms.level_dbm == -106, "falling to a steady -106: %d", ms.level_dbm);
++	camp_at(&ms, 3000, ours, -100);
++	CHECK(ms.level_dbm == -100, "rising to a steady -100: %d", ms.level_dbm);
++}
++
++// Two programmed control channels can both remain weak. After one search, stay long enough to catch a grant.
++static void test_weak_reacquisition_grant(void)
++{
++	setup();
++	cfg.leave_dbm = -105;
++	cfg.opts |= T3_OPT_LISTEN_ONLY;
++	cfg.nctrl = 2;
++	cfg.ctrl[0] = (t3_chan_t){ .lcn = 154, .cc = T3_CC_ANY, .rx_hz = RX(154), .tx_hz = RX(154) + 5000000u };
++	cfg.ctrl[1] = (t3_chan_t){ .lcn = 155, .cc = T3_CC_ANY, .rx_hz = RX(155), .tx_hz = RX(155) + 5000000u };
++
++	t3_ms_t ms;
++	t3_ms_start(&ms, &cfg, T);
++	poll_all(&ms);
++	camp_at(&ms, 24000, ours, -107);
++	CHECK(ms.state == T3_CAMPED && ms.st.weak_leaves == 1,
++	      "one search for a stronger TSCC, got %u", (unsigned)ms.st.weak_leaves);
++	t3_csbk_t g = grant(T3_OP_TV_GRANT, 154, 2, TG_A, 1u);
++	send(&ms, 1, CC, &g);
++	CHECK(ms.state == T3_FOLLOW && ms.st.followed == 1 && last.slot == 2, "grant received after the weak search");
++}
++
+ static void test_stop(void)
+ {
+ 	setup();
+@@ -758,6 +886,9 @@ int main(void)
+ 	test_adjacent();
+ 	test_vote();
+ 	test_weak();
++	test_weak_reacquisition_grant();
++	test_weak_hold();
++	test_level_average();
+ 	test_stop();
+ 	printf("t3MsTest: %d checks, %d failures\n", checks, failures);
+ 	return failures != 0;
+diff --git a/site/tests/modes.test.mjs b/site/tests/modes.test.mjs
+index 62fc7c6..d1e44da 100644
+--- a/site/tests/modes.test.mjs
++++ b/site/tests/modes.test.mjs
+@@ -168,6 +168,63 @@ function sample() {
+ 	return { m, plain, conv, t3, p25t, s1, s3 };
+ }
+ 
++test("Tier III native codeplug preserves control, RX group, policies and system linkage", () => {
++	const { m, t3, s1 } = sample();
++	const list = { number: null, name: "Site groups", contacts: [t3.contact] };
++	m.rxLists.push(list);
++	t3.rxList = list;
++	t3.acceptBadCrc = true;
++	t3.tagTx = false;
++	s1.tx = false;
++	s1.fields.followAll = true;
++	s1.fields.learnSystem = true;
++
++	const d = round(m);
++	const c = d.channels.find((ch) => ch.name === t3.name);
++	assert.equal(c.kind, 1);
++	assert.equal(c.system, d.systems.find((s) => s.type === 1));
++	assert.equal(c.system.entries[0].control, true);
++	assert.equal(c.system.entries[0].chan, 12);
++	assert.equal(c.system.fields.followAll, true);
++	assert.equal(c.system.fields.learnSystem, true);
++	assert.equal(c.rxList.name, "Site groups");
++	assert.equal(c.contact.id, 100);
++	assert.equal(c.acceptBadCrc, true);
++	assert.equal(c.tagTx, false);
++
++	c.acceptBadCrc = false;
++	c.system.fields.followAll = false;
++	assert.equal(round(d).channels.find((ch) => ch.name === t3.name).acceptBadCrc, false);
++	assert.equal(round(d).systems.find((s) => s.type === 1).fields.followAll, false);
++});
++
++test("Tier III CSV edits preserve an existing system and reject a missing linkage", async () => {
++	const { exportTable, importTable } = await import("../static/js/codeplug/csv.js");
++	const { m, t3, s1 } = sample();
++	m.channels = [t3];
++	t3.acceptBadCrc = true;
++	t3.tagTx = false;
++	const csv = exportTable(m, "channels");
++	const update = importTable(m, csv, "channels");
++	assert.deepEqual(update.problems, []);
++	assert.equal(t3.kind, 1);
++	assert.match(csv, /DMR Tier III/);
++	assert.match(csv, /Accept Invalid CRC/);
++	assert.equal(t3.system, s1);
++	assert.equal(t3.tagTx, false);
++	assert.equal(t3.acceptBadCrc, true);
++
++	const fresh = empty();
++	const result = importTable(fresh, csv, "channels");
++	assert.equal(result.problems[0].code, "csv_t3_system");
++	assert.equal(result.problems[0].skipped, true);
++	assert.equal(fresh.channels.length, 0);
++
++	const legacy = "Name,Mode,RX,SFR B\nLegacy,DMR,451.000,175\n";
++	assert.deepEqual(importTable(fresh, legacy, "channels").problems, []);
++	assert.equal(round(fresh).channels[0].acceptBadCrc, true);
++});
++
+ test("model: channels of every kind, systems, entries, the key and the unit ID round-trip", () => {
+ 	const { m } = sample();
+ 	const img = encode(m);
