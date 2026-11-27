@@ -1,0 +1,516 @@
+diff --git a/core/aprs/aprs.h b/core/aprs/aprs.h
+index b30b28a..e0cf6df 100644
+--- a/core/aprs/aprs.h
++++ b/core/aprs/aprs.h
+@@ -258,6 +258,13 @@ bool aprs_rx_listening(void);
+ #if CONFIG_APRS_RX
+ // The configured APRS receive frequency, or zero when APRS receive is off (radio task only).
+ uint32_t aprs_rx_freq(void);
++#if CONFIG_DUAL_WATCH
++typedef enum {
++	APRS_RX_PACKET_NONE, APRS_RX_PACKET_ACTIVE, APRS_RX_PACKET_EXPIRED,
++} aprs_rx_packet_t;
++// Recent Bell 202 HDLC packet activity, with a bounded dual-watch hold (radio task only).
++aprs_rx_packet_t aprs_rx_packet(uint32_t now_ms);
++#endif
+ // Release the FM audio path before another mode takes the receiver (radio task only).
+ void aprs_rx_stop(void);
+ #endif
+diff --git a/core/aprs/aprs_ax25.c b/core/aprs/aprs_ax25.c
+index 0e4cf71..1e27f5c 100644
+--- a/core/aprs/aprs_ax25.c
++++ b/core/aprs/aprs_ax25.c
+@@ -826,6 +826,18 @@ static void demod_frame(const uint8_t *frame, size_t n, void *ctx)
+ 	aprs_rx_frame(frame, n, aprs_s.now);
+ }
+ 
++#if CONFIG_DUAL_WATCH
++#define RX_PACKET_GAP_MS	75u	// bridge a board audio half and the radio poll, and cover closing flags
++#define RX_PACKET_MAX_MS	3000u	// a maximum stuffed AX.25 frame takes under 2.65 s at 1200 baud
++
++aprs_rx_packet_t aprs_rx_packet(uint32_t now_ms)
++{
++	if (!aprs_s.rx_running || !aprs_s.rx_packet_seen || now_ms - aprs_s.rx_packet_last_ms >= RX_PACKET_GAP_MS)
++		return APRS_RX_PACKET_NONE;
++	return now_ms - aprs_s.rx_packet_ms < RX_PACKET_MAX_MS ? APRS_RX_PACKET_ACTIVE : APRS_RX_PACKET_EXPIRED;
++}
++#endif
++
+ void aprs_rx_audio(const int16_t *s, size_t n, uint32_t now_ms)
+ {
+ 	aprs_s.now = now_ms;
+@@ -836,6 +848,18 @@ void aprs_rx_audio(const int16_t *s, size_t n, uint32_t now_ms)
+ 		}
+ 	}
+ 	afsk_demod(&aprs_s.demod, s, n);
++#if CONFIG_DUAL_WATCH
++	for (int i = 0; i < AFSK_PATHS; i++) {
++		if (aprs_s.demod.path[i].hdlc.flags >= 2u) {
++			if (!aprs_s.rx_packet_seen || now_ms - aprs_s.rx_packet_last_ms >= RX_PACKET_GAP_MS) {
++				aprs_s.rx_packet_ms = now_ms;
++				aprs_s.rx_packet_seen = true;
++			}
++			aprs_s.rx_packet_last_ms = now_ms;
++			break;
++		}
++	}
++#endif
+ }
+ 
+ // The receive audio: the board's own AFSK receive path, else FM receive audio on the shared PCM stream (boards whose
+@@ -863,6 +887,9 @@ uint32_t aprs_rx_freq(void)
+ void aprs_rx_stop(void)
+ {
+ 	aprs_s.rx_retry_wait = false;
++#if CONFIG_DUAL_WATCH
++	aprs_s.rx_packet_seen = false;
++#endif
+ 	if (!aprs_s.rx_running)
+ 		return;
+ 	if (rx_by_board()) {
+@@ -905,6 +932,10 @@ void aprs_ax25_rx_service(const aprs_radio_t *r, uint32_t now_ms)
+ 		while ((k = own ? h->rx_read(aprs_s.rxbuf, n) : (uint16_t)audio_mux_aprs_read(aprs_s.rxbuf, n)) != 0) {
+ 			aprs_rx_audio(aprs_s.rxbuf, k, now_ms);
+ 		}
++#if CONFIG_DUAL_WATCH
++		if (now_ms - aprs_s.rx_packet_last_ms >= RX_PACKET_GAP_MS)
++			aprs_s.rx_packet_seen = false;
++#endif
+ 	}
+ }
+ #endif
+diff --git a/core/aprs/aprs_int.h b/core/aprs/aprs_int.h
+index 1fdb5ed..d6d6e5e 100644
+--- a/core/aprs/aprs_int.h
++++ b/core/aprs/aprs_int.h
+@@ -81,6 +81,10 @@ typedef struct {
+ 	uint16_t rx_peak;
+ 	uint32_t rx_start_fails, rx_retry_ms;	// starts the board refused; the next try (RX_RETRY_MS later)
+ 	bool rx_retry_wait;			// the last start was refused: wait for rx_retry_ms
++#if CONFIG_DUAL_WATCH
++	bool rx_packet_seen;
++	uint32_t rx_packet_ms, rx_packet_last_ms;
++#endif
+ 	int16_t rxbuf[160];
+ 	char gate[AX25_TNC2_MAX + 20];
+ #endif
+diff --git a/core/aprs/hdlc.c b/core/aprs/hdlc.c
+index d579cdf..53743e2 100644
+--- a/core/aprs/hdlc.c
++++ b/core/aprs/hdlc.c
+@@ -93,8 +93,14 @@ void hdlc_dec_init(hdlc_dec_t *d)
+ static void append(hdlc_dec_t *d, bool bit)
+ {
+ 	if (d->nbits >= HDLC_BUF_MAX * 8u) {
++		// Count the possible closing flag's first seven bits without writing past the frame buffer.
++		if (d->nbits < HDLC_BUF_MAX * 8u + 7u) {
++			d->nbits++;
++			return;
++		}
+ 		d->in_frame = false;	// too long: wait for the next flag
+ 		d->nbits = 0;
++		d->flags = 0;
+ 		return;
+ 	}
+ 	if ((d->nbits & 7u) == 0) {
+@@ -119,6 +125,7 @@ size_t hdlc_dec_bit(hdlc_dec_t *d, bool mark)
+ 			}
+ 			d->in_frame = false;
+ 			d->nbits = 0;
++			d->flags = 0;
+ 			return 0;
+ 		}
+ 		if (d->in_frame) {
+@@ -127,6 +134,8 @@ size_t hdlc_dec_bit(hdlc_dec_t *d, bool mark)
+ 		return 0;
+ 	}
+ 	if (d->ones == 6) {			// 0111111 0: a flag
++		// Seven accumulated bits are the opening of this flag with no preceding data.
++		d->flags = d->in_frame && d->nbits == 7u && d->flags != 0 ? 2u : 1u;
+ 		if (d->in_frame && d->nbits >= 7u) {
+ 			uint32_t n = d->nbits - 7u;	// the flag's first seven bits went in
+ 			if ((n & 7u) == 0 && n / 8u >= HDLC_FRAME_MIN) {
+diff --git a/core/aprs/hdlc.h b/core/aprs/hdlc.h
+index 769bb88..864700b 100644
+--- a/core/aprs/hdlc.h
++++ b/core/aprs/hdlc.h
+@@ -42,6 +42,7 @@ typedef struct {
+ 	uint8_t last;		// the previous tone (NRZI)
+ 	uint8_t ones;
+ 	bool in_frame;		// a flag was seen: bits are collected
++	uint8_t flags;		// consecutive opening flags (up to two) before the current frame
+ 	uint32_t nbits;
+ 	uint8_t buf[HDLC_BUF_MAX];
+ 	uint32_t frames, fcs_errors, aborts;	// counters
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 7853c67..db8b71a 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -780,6 +780,15 @@ static bool channel_read(uint16_t number, channel_t *ch)
+ 	return true;
+ }
+ 
++#if CONFIG_APRS_RX && CONFIG_DUAL_WATCH
++static aprs_rx_packet_t aprs_dual_packet(const radio_sm_t *sm, uint32_t now_ms)
++{
++	if (sm->scan.kind == SCAN_DUAL && !sm->rx2_on && !sm->view.monitor && !sm->ptt)
++		return aprs_rx_packet(now_ms);
++	return APRS_RX_PACKET_NONE;
++}
++#endif
++
+ // Speaker and LEDs follow the state; only changes go to the board
+ // FM: the board's speaker path follows the squelch (or the monitor). DMR voice goes out as PCM from the vocoder
+ // (core/dmr/ambe routes the speaker itself); the green LED shows a call being played
+@@ -788,6 +797,10 @@ static void outputs(radio_sm_t *sm)
+ 	bool tx = sm->view.state == RS_TX;
+ 	bool fm = sm->view.ch.mode == RADIO_MODE_FM && !sm->hotspot && !parked(&sm->view.ch);
+ 	bool open = !tx && fm && (sm->view.monitor || sm->view.state == RS_RX || (sm->view.state == RS_TX_DENIED && sm->deny_rx));
++#if CONFIG_APRS_RX && CONFIG_DUAL_WATCH
++	if (open && aprs_dual_packet(sm, sm->led_now) != APRS_RX_PACKET_NONE)
++		open = false;
++#endif
+ 	bool green = open;
+ #if CONFIG_P25
+ 	if (sm->view.ch.mode == RADIO_MODE_P25 && !tx && sm->view.state == RS_RX &&
+@@ -5421,6 +5434,19 @@ static void scan_service(radio_sm_t *sm, const radio_status_t *st, uint32_t now_
+ 		scan_publish(sm);
+ 		return;
+ 	}
++#if CONFIG_APRS_RX
++	// This applies to normal visits and to a peek during the other channel's reply window.
++	aprs_rx_packet_t packet = aprs_dual_packet(sm, now_ms);
++	if (packet == APRS_RX_PACKET_ACTIVE) {
++		scan_publish(sm);
++		return;
++	}
++	if (packet == APRS_RX_PACKET_EXPIRED && !sm->dual_peek) {
++		// Continuous flags must give the other slot a turn even if the analog squelch is open.
++		scan_step(sm, now_ms);
++		return;
++	}
++#endif
+ 	if (sc->kind == SCAN_DUAL && dual_wait_service(sm, st, now_ms)) {
+ 		scan_publish(sm);
+ 		return;
+@@ -6133,6 +6159,9 @@ static void aprs_rf_start(radio_sm_t *sm, uint32_t now_ms)
+ 	if (!aprs_rf_take(&sm->aprs_job, now_ms)) {
+ 		return;
+ 	}
++#if CONFIG_APRS_RX
++	aprs_rx_stop();
++#endif
+ #if CONFIG_SCAN && CONFIG_DUAL_WATCH
+ 	if (dual_running(sm)) {
+ 		rx2_release(sm);	// the other receiver must be quiet while APRS has the transmitter
+@@ -6245,7 +6274,11 @@ static void aprs_poll(radio_sm_t *sm, uint32_t now_ms)
+ #endif
+ 	aprs_tick(&r, now_ms);
+ #if CONFIG_APRS_AFSK
+-	if (r.can_rf && aprs_rf_pending()) {
++	if (r.can_rf && aprs_rf_pending()
++#if CONFIG_APRS_RX && CONFIG_DUAL_WATCH
++	    && aprs_dual_packet(sm, now_ms) == APRS_RX_PACKET_NONE
++#endif
++	   ) {
+ 		aprs_rf_start(sm, now_ms);
+ 	}
+ #endif
+@@ -7461,6 +7494,9 @@ static void fm_key(radio_sm_t *sm, uint32_t now_ms)
+ 	sm->tx_start_ms = now_ms;
+ 	outputs(sm);
+ 	const channel_t *ch = &sm->view.ch;
++#if CONFIG_APRS_RX
++	aprs_rx_stop();
++#endif
+ 	if (!key_rf(sm, ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &ch->tx_tone)) {
+ 		deny(sm, board_refusal());
+ 		return;
+diff --git a/docs/spec/aprs.md b/docs/spec/aprs.md
+index d543233..4b18926 100644
+--- a/docs/spec/aprs.md
++++ b/docs/spec/aprs.md
+@@ -211,6 +211,19 @@ says whether the path runs.
+ When a retune takes the receiver off the APRS frequency or out of FM, the radio task releases the APRS audio path
+ before retuning. This lets a digital modem take the receive audio copy and restarts APRS decoding when FM returns.
+ 
++In dual watch with a single receiver, two consecutive HDLC flags on either Bell 202 demodulator path hold the current
++slot, including during a peek in the other slot's reply window. The FM speaker is muted during detected packet
++activity. The watch resumes after 75 ms without activity, or another slot gets a turn after 3 s of continuous activity
++even if the squelch is still open. Monitor and manual PTT retain priority. An APRS transmission waits during the hold.
++Reception still requires the receiver to catch enough of the preamble to acquire the packet.
++
++`aprsRadioTest` and `aprsRadioMdcTest` exercise the radio state machine with Bell 202 PCM in 256-sample blocks and
++compare accepted AX.25 frames and station entries. On a DM-32UV, repeat with a packet source on the configured APRS
++frequency and Dual Watch off, FM + APRS, and DMR + APRS, selecting each slot in turn. Compare
++`aprs.rx_listening`, `aprs.rx_bits`, `aprs.rx_start_fails`, `aprs.rx_fcs_errors`, and `aprs.rx_frames`. Check the
++speaker during bursts, voice reception on the other slot, and PTT on the selected slot. The host tests simulate the
++capture cadence. The RF tuning, hardware audio copy, and audible speaker behavior need that bench test.
++
+ The receive setting and messaging default to on when the radio can receive (`aprs_can_receive()`: the build has
+ `CONFIG_APRS_RX` and one of the two paths exists).
+ 
+diff --git a/tests/host/aprsRadioTest.c b/tests/host/aprsRadioTest.c
+index 9f873c4..0908139 100644
+--- a/tests/host/aprsRadioTest.c
++++ b/tests/host/aprsRadioTest.c
+@@ -42,6 +42,7 @@ static struct {
+ 	uint8_t tx_power;
+ 	int tx_off_calls;
+ 	bool keyed;
++	bool speaker;
+ 	uint16_t tone_hz;	// the TX tone in force (0 = the microphone)
+ 	uint8_t noise_on_aprs;	// noise reading on 144.390 (low = a carrier)
+ 	uint8_t noise_on_ch;	// ... and on the channel (0: none there, the squelch stays closed)
+@@ -107,7 +108,7 @@ static void r_status(radio_status_t *st)
+ 	st->carrier = false;
+ 	st->tone_ok = true;
+ }
+-static void r_audio(bool on) { (void)on; }
++static void r_audio(bool on) { hw.speaker = on; }
+ static bool r_tone(uint16_t hz)
+ {
+ 	hw.tone_hz = hz;
+@@ -1853,6 +1854,11 @@ static struct {
+ 	const int16_t *s;
+ 	size_t n, pos;
+ 	int starts, stops, refuse;
++#if CONFIG_DUAL_WATCH
++	bool timed;
++	uint32_t air_ms, capture_ms;
++	size_t captured;
++#endif
+ } brx;
+ static bool b_rx_start(void)
+ {
+@@ -1861,12 +1867,27 @@ static bool b_rx_start(void)
+ 		brx.refuse--;
+ 		return false;
+ 	}
++#if CONFIG_DUAL_WATCH
++	brx.capture_ms = now;
++	brx.captured = 0;
++#endif
+ 	return true;
+ }
+ static void b_rx_stop(void) { brx.stops++; }
+ static uint16_t b_rx_read(int16_t *buf, uint16_t max)
+ {
+ 	uint16_t k = 0;
++#if CONFIG_DUAL_WATCH
++	if (brx.timed) {
++		// The DM-32UV delivers 256 samples every 32 ms. The signal on air keeps moving across retunes.
++		size_t ready = ((now - brx.capture_ms) / 32u) * 256u;
++		while (k < max && brx.captured < ready) {
++			int32_t i = (int32_t)(brx.capture_ms - brx.air_ms) * 8 + (int32_t)brx.captured++;
++			buf[k++] = hw.rx_hz == APRS_HZ && i >= 0 && (size_t)i < brx.n ? brx.s[i] : 0;
++		}
++		return k;
++	}
++#endif
+ 	while (k < max && k < 200u && brx.pos < brx.n) {	// 25 ms at 8 kHz per poll
+ 		buf[k++] = brx.s[brx.pos++];
+ 	}
+@@ -1956,6 +1977,191 @@ static void test_rx_board_only(void)
+ 	CHECK(aprs_rx_listening() && brx.starts == 5);
+ 	fake_afsk = saved;
+ }
++
++#if CONFIG_DUAL_WATCH
++static void start_timed_rx(bool aprs_selected, bool watch)
++{
++	fake_afsk.rx_rate_hz = 8000;
++	fake_afsk.rx_start = b_rx_start;
++	fake_afsk.rx_read = b_rx_read;
++	fake_afsk.rx_stop = b_rx_stop;
++	memset(&brx, 0, sizeof(brx));
++	brx.timed = true;
++	reset();
++	settings_t *s = settings_begin();
++	s->vfo = 1;
++	s->vfo_rx_hz = s->vfo_tx_hz = aprs_selected ? APRS_HZ : CH_HZ;
++	settings_set_vfo_mode_bw(s, RADIO_MODE_FM, RADIO_BW_25K);
++	s->vfo2_rx_hz = s->vfo2_tx_hz = aprs_selected ? CH2_HZ : APRS_HZ;
++	s->vfo2_mode = RADIO_MODE_FM;
++	s->vfo2_bw = RADIO_BW_25K;
++	settings_end(now);
++	radio_sm_init(&sm, now);
++	if (watch) {
++		radio_dual_ref_t a = { .vfo = true, .pos = 0 }, b = { .vfo = true, .pos = 1 };
++		radio_req_t request = { RREQ_DUAL, (int32_t)radio_dual_arg(&a, true), radio_dual_arg(&b, false) };
++		radio_sm_request(&sm, &request, now);
++		CHECK(sm.scan.kind == SCAN_DUAL && sm.view.vfo && sm.view.vfo_index == 0);
++	}
++}
++
++static void timed_burst(const char *line, uint16_t flags)
++{
++	static uint8_t tones[768];
++	static int16_t audio[41000];
++	hdlc_enc_t e;
++	hdlc_enc_init(&e, tones, sizeof(tones));
++	CHECK(hdlc_enc_flags(&e, flags));
++	if (line != NULL) {
++		ax25_frame_t f;
++		uint8_t frame[AX25_FRAME_MAX];
++		CHECK(ax25_from_tnc2(line, strlen(line), &f));
++		size_t n = ax25_encode(&f, frame, sizeof(frame));
++		CHECK(n != 0 && hdlc_enc_frame(&e, frame, n) && hdlc_enc_flags(&e, 3));
++	}
++	afsk_mod_t m;
++	afsk_mod_init(&m, 8000);
++	brx.air_ms = now;
++	brx.s = audio;
++	brx.n = afsk_mod(&m, tones, e.nbits, 8000, audio, sizeof(audio) / sizeof(audio[0]));
++	CHECK(m.bit + 1u == e.nbits && brx.n > 8u * RADIO_SCAN_DUAL_MIN_DWELL_MS);
++}
++
++static bool wait_rx_hz(uint32_t hz, uint32_t limit_ms)
++{
++	for (uint32_t t = 0; hw.rx_hz != hz && t < limit_ms; t += RADIO_POLL_MS) {
++		run(RADIO_POLL_MS);
++	}
++	return hw.rx_hz == hz;
++}
++
++static void check_timed_packet(const char *call, const char *text)
++{
++	aprs_view_t v;
++	aprs_get_view(&v);
++	aprs_station_t st;
++	CHECK(v.rx_frames == 1);
++	CHECK(aprs_station_count() == 1 && aprs_station(0, &st) && strcmp(st.call, call) == 0 &&
++	      strncmp(st.text, text, sizeof(st.text) - 1u) == 0);
++}
++
++static void test_dual_watch_rx_packets(void)
++{
++	hal_afsk_t saved = fake_afsk;
++	const char *line = "Q1ABC-9>APRS,WIDE2-1:>Dual watch regression: complete AX.25 frame over the FM capture path";
++	const char *status = "Dual watch regression: complete AX.25 frame over the FM capture path";
++
++	start_timed_rx(true, false);
++	run(100);
++	timed_burst(line, 30);
++	run(1000);
++	check_timed_packet("Q1ABC-9", status);
++
++	// APRS selected, with the packet starting near the end of the normal APRS dwell.
++	start_timed_rx(true, true);
++	run(RADIO_SCAN_DUAL_MIN_DWELL_MS - 2u * RADIO_POLL_MS);
++	timed_burst(line, 30);
++	run(1000);
++	check_timed_packet("Q1ABC-9", status);
++	CHECK(wait_rx_hz(CH2_HZ, 2u * RADIO_SCAN_DUAL_MIN_DWELL_MS));
++
++	// APRS unselected, with the first preamble flags already gone when capture starts.
++	start_timed_rx(false, true);
++	run(RADIO_SCAN_DUAL_MIN_DWELL_MS - 2u * RADIO_POLL_MS);
++	timed_burst(line, 30);
++	CHECK(wait_rx_hz(APRS_HZ, RADIO_SCAN_DUAL_MIN_DWELL_MS));
++	run(1000);
++	check_timed_packet("Q1ABC-9", status);
++	CHECK(wait_rx_hz(CH_HZ, 2u * RADIO_SCAN_DUAL_MIN_DWELL_MS));
++
++	// A full information field and eight digipeaters exercise the receive buffer and hold budget.
++	char longest[AX25_TNC2_MAX] = "Q1MAX>APRS,WIDE1-1,WIDE2-1,WIDE3-1,WIDE4-1,WIDE5-1,WIDE6-1,WIDE7-1,WIDE8-1:>";
++	size_t prefix = strlen(longest);
++	memset(longest + prefix, '~', AX25_INFO_MAX - 1u);
++	longest[prefix + AX25_INFO_MAX - 1u] = '\0';
++	start_timed_rx(true, true);
++	run(50);
++	timed_burst(longest, 30);
++	run(3100);
++	check_timed_packet("Q1MAX", longest + prefix);
++	CHECK(wait_rx_hz(CH2_HZ, 2u * RADIO_SCAN_DUAL_MIN_DWELL_MS));
++
++	// Truncate after the preamble. The station list stays empty and the watch resumes promptly.
++	start_timed_rx(true, true);
++	run(50);
++	timed_burst(line, 30);
++	brx.n = 240u * 8u;
++	run(250);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening());
++	CHECK(wait_rx_hz(CH2_HZ, 150) && aprs_station_count() == 0);
++
++	// The scan also looks at APRS during the voice channel's wait for a reply.
++	start_timed_rx(false, true);
++	hw.noise_on_ch = 30;
++	run(2u * RADIO_SCAN_DUAL_MIN_DWELL_MS);
++	CHECK(hw.rx_hz == CH_HZ && hw.speaker && sm.scan.phase == SCAN_PH_HOLD);
++	hw.noise_on_ch = 0;
++	CHECK(wait_rx_hz(APRS_HZ, 1000) && sm.dual_peek);
++	timed_burst(line, 30);
++	run(1000);
++	check_timed_packet("Q1ABC-9", status);
++	CHECK(wait_rx_hz(CH_HZ, 1000));
++	fake_afsk = saved;
++}
++
++static void test_dual_watch_rx_guards(void)
++{
++	hal_afsk_t saved = fake_afsk;
++	const char *line = "Q1ABC-9>APRS:>Voice and PTT retain priority during APRS receive";
++
++	start_timed_rx(false, true);
++	CHECK(wait_rx_hz(APRS_HZ, RADIO_SCAN_DUAL_MIN_DWELL_MS));
++	hw.noise_on_aprs = 30;
++	timed_burst(line, 30);
++	run(125);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening() && !hw.speaker);
++	req(RREQ_PTT, 1);
++	CHECK(hw.keyed && hw.tx_hz == CH_HZ && !aprs_rx_listening());
++	req(RREQ_PTT, 0);
++	hw.noise_on_ch = 30;
++	run(100);
++	CHECK(hw.rx_hz == CH_HZ && hw.speaker && !hw.keyed);
++	CHECK(aprs_station_count() == 0);
++
++	// A same-frequency PTT also releases the demodulator before keying.
++	start_timed_rx(true, true);
++	run(RADIO_POLL_MS);
++	timed_burst(line, 30);
++	run(100);
++	aprs_set_test_call("N0TST");
++	configure(0, false);
++	CHECK(aprs_send_now());
++	run(50);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening());
++	CHECK(sm.aprs_phase == 0 && !hw.keyed);
++	req(RREQ_PTT, 1);
++	CHECK(hw.keyed && hw.tx_hz == APRS_HZ && !aprs_rx_listening());
++	req(RREQ_PTT, 0);
++
++	// An ordinary FM carrier on the APRS frequency is still audible.
++	start_timed_rx(true, true);
++	hw.noise_on_aprs = 30;
++	run(300);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening() && hw.speaker);
++
++	start_timed_rx(false, true);
++	CHECK(wait_rx_hz(APRS_HZ, RADIO_SCAN_DUAL_MIN_DWELL_MS));
++	timed_burst(NULL, 700);	// flags forever, with the analog squelch driven open
++	hw.noise_on_aprs = 30;
++	run(2u * RADIO_SCAN_DUAL_MIN_DWELL_MS);
++	CHECK(hw.rx_hz == APRS_HZ && aprs_rx_listening() && !hw.speaker);
++	hw.noise_on_ch = 30;
++	CHECK(wait_rx_hz(CH_HZ, 3000));
++	run(100);
++	CHECK(hw.speaker && !aprs_rx_listening() && aprs_station_count() == 0);
++	fake_afsk = saved;
++}
++#endif
+ #endif
+ 
+ #if CONFIG_MDC1200
+@@ -2347,6 +2553,10 @@ int main(void)
+ 	test_rx_release_on_retune();
+ 	test_rx_stream();
+ 	test_rx_board_only();
++#if CONFIG_DUAL_WATCH
++	test_dual_watch_rx_packets();
++	test_dual_watch_rx_guards();
++#endif
+ 	test_station_lookup();
+ 	test_station_range();
+ #endif
