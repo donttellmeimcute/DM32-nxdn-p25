@@ -64,14 +64,38 @@ static bool replay(Receiver& rx, std::istream& dibits, uint8_t samples_per_symbo
     return dibits.eof();
 }
 
+// Signed little-endian, 24 kHz samples from the offline RF replay.
+template<class Receiver>
+static bool replay_pcm16(Receiver& rx, std::istream& input)
+{
+    uint16_t rssi[64] = {};
+    q15_t samples[64] = {};
+    uint8_t count = 0;
+    unsigned char bytes[2];
+    while (input.read(reinterpret_cast<char*>(bytes), sizeof bytes)) {
+        const int sample = bytes[0] + 256 * (bytes[1] < 128 ? bytes[1] : int(bytes[1]) - 256);
+        samples[count++] = static_cast<q15_t>(sample);
+        if (count == 64) {
+            rx.samples(samples, rssi, count);
+            count = 0;
+        }
+    }
+    if (count)
+        rx.samples(samples, rssi, count);
+    return input.eof() && !input.gcount();
+}
+
 int main(int argc, char** argv)
 {
-    if (argc != 3)
+    const bool pcm = argc == 4 && std::string(argv[3]) == "--pcm16";
+    if (argc != 3 && !pcm)
         return 2;
     std::ifstream capture(argv[2], std::ios::binary);
     if (!capture)
         return 2;
     const std::string mode(argv[1]);
+    if (pcm && mode != "dn" && mode != "vd1" && mode != "vw" && mode != "dstar")
+        return 2;
 #if defined(TEST_M17)
     if (mode == "m17") {
         CM17RX rx;
@@ -89,7 +113,7 @@ int main(int argc, char** argv)
     }
     if (mode == "dn" || mode == "vd1" || mode == "vw") {
         CYSFRX rx;
-        return replay(rx, capture, 5, mode == "vw" ? 500 : 250) ? 0 : 1;
+        return (pcm ? replay_pcm16(rx, capture) : replay(rx, capture, 5, mode == "vw" ? 500 : 250)) ? 0 : 1;
     }
     if (mode == "nxdn48" || mode == "nxdn96") {
         CNXDNRX rx;
@@ -97,7 +121,7 @@ int main(int argc, char** argv)
     }
     if (mode == "dstar") {
         CDStarRX rx;
-        return replay(rx, capture, 5, 500) ? 0 : 1;
+        return (pcm ? replay_pcm16(rx, capture) : replay(rx, capture, 5, 500)) ? 0 : 1;
     }
 #endif
     return 2;

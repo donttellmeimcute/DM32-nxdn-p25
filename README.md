@@ -37,6 +37,19 @@ incluso con el squelch cerrado. **Arriba/Abajo** cambia la ventana entre 2, 5, 1
 **OK** alterna entre escala fija (−150 a −30 dBm) y automática. La escala fija conserva la referencia
 al girar una antena direccional. Los huecos indican que faltó una lectura del receptor.
 
+## Monitor Scan y Morse experimental
+
+Monitor Scan recorre una cuadrícula VHF/UHF, usa el RSSI para decidir
+cuándo probar los decodificadores y mantiene la radio en solo recepción.
+Puedes detenerte en un resultado, escucharlo y guardar la frecuencia
+como canal RX Only.
+
+La herramienta Morse decodifica pulsos de la envolvente RF y permite
+practicar en el altavoz con texto, CQ, el indicativo y 73. Monitor Scan
+y Morse se habilitan por separado en compilaciones personalizadas y
+quedan apagados en los perfiles de distribución. Las pruebas en placa
+siguen pendientes. Consulta [configuración, validación y límites de RF](docs/monitor-scan-cw.md).
+
 ## Estado (24 de noviembre de 2026)
 
 La release instalable más reciente está en [Releases](../../releases); el flasher sincroniza la imagen publicada por CI. Las pruebas host no sustituyen una medición acústica o de RF.

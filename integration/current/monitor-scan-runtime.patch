@@ -1,0 +1,1273 @@
+diff --git a/boards/dm32/radio_dm32.c b/boards/dm32/radio_dm32.c
+index b1fea9c..a984bdc 100644
+--- a/boards/dm32/radio_dm32.c
++++ b/boards/dm32/radio_dm32.c
+@@ -93,6 +93,14 @@ static rfbus_3w_t fd_bus;
+ static hrc7000_t modem;
+ static bool rf_b;		// the newer RF section: FD6818 set-up B (rf_detect)
+ static bool rf_unlocked;	// neither set-up locked the synthesizer: no transmitting
++#if CONFIG_MONITOR_SCAN
++static bool monitor_rx_locked;
++
++static bool monitor_tx_blocked(void)
++{
++	return __atomic_load_n(&monitor_rx_locked, __ATOMIC_ACQUIRE);
++}
++#endif
+ 
+ static radio_mode_t mode = RADIO_MODE_FM;
+ static uint32_t rx_hz;
+@@ -238,6 +246,10 @@ static void burst_switch(void)
+ static void burst_on(hrc_rfburst_wait_fn at, hrc_rfburst_wait_fn wait)
+ {
+ 	(void)wait;
++#if CONFIG_MONITOR_SCAN
++	if (monitor_tx_blocked())
++		return;
++#endif
+ 	bool boost = dmr_keyed && ku.boost != 0u;
+ 	bool split = tx_hz != rx_hz;
+ 	enum { P_SWITCH, P_BOOST, P_PA, P_DRIVE, P_COUNT };	// on a tie in this order
+@@ -318,6 +330,20 @@ static void dmr_disarm(void)
+ #endif
+ }
+ 
++#if CONFIG_MONITOR_SCAN
++static bool monitor_rx_only(bool on)
++{
++	if (on && (transmitting || dmr_keyed))
++		return false;
++	__atomic_store_n(&monitor_rx_locked, on, __ATOMIC_RELEASE);
++	if (on) {
++		dmr_disarm();
++		pa_off();
++	}
++	return true;
++}
++#endif
++
+ #if CONFIG_APRS_AFSK
+ static bool afsk_tx_route(bool on);
+ static void aprs_listen_route(bool on);
+@@ -529,6 +555,10 @@ static void tx_off(void);
+ 
+ static bool tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (monitor_tx_blocked())
++		return false;
++#endif
+ 	bool bench = board_manual_fm_tx_only(hz);
+ 	if (!board_in_band(hz, true) || rf_unlocked) {
+ 		return false;
+@@ -874,6 +904,10 @@ static void rx_sleep(bool sleep)
+ // frames and this one don't mix
+ bool dm32_chip_reg(uint8_t chip, uint8_t page, uint8_t reg, uint32_t *val, bool write)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (write && monitor_tx_blocked())
++		return false;
++#endif
+ 	if (chip != 0 || page != 0 || reg > 0x7Fu || (write && *val > 0xFFFFu) || fd.bus == NULL) {
+ 		return false;	// fd.bus: not attached yet (radio init)
+ 	}
+@@ -904,6 +938,10 @@ const hal_radio_t dm32_radio = {
+ 	.init = init,
+ 	.set_mode = set_mode,
+ 	.rx = rx,
++#if CONFIG_MONITOR_SCAN
++	.monitor_rx_only = monitor_rx_only,
++	.monitor_tx_blocked = monitor_tx_blocked,
++#endif
+ 	.tx = tx,
+ 	.tx_off = tx_off,
+ 	.dmr_tx_end = hrc_dmr_tx_end,
+diff --git a/core/codeplug/codeplug.h b/core/codeplug/codeplug.h
+index 511c1f9..18ac53b 100644
+--- a/core/codeplug/codeplug.h
++++ b/core/codeplug/codeplug.h
+@@ -83,6 +83,9 @@ enum { CP_DMR_PRIV_DEFAULT, CP_DMR_PRIV_AES, CP_DMR_PRIV_BASIC, CP_DMR_PRIV_ENHA
+ #define VFO_DIG_P25_AES		0x10u	// P25 KID 0 is valid
+ #define VFO_DIG_DMR_OFF		0x20u	// DMR privacy explicitly disabled on this VFO
+ #define VFO_DIG_DMR_AES128	0x40u	// DMR VFO key ID is from the AES-128 keyring
++#if CONFIG_MONITOR_SCAN
++#define CODEPLUG_MONITOR_PROBE	0x80u	// synthetic RX-only probe channel, never persisted
++#endif
+ #define VFO_DMR_AES128_ID_BASE	256	// RREQ_VFO_AES / Quick settings use 256 + KID for AES-128
+ enum { VFO_VARIANT_DEFAULT, VFO_VARIANT_FIRST, VFO_VARIANT_SECOND, VFO_VARIANT_AM };
+ 
+diff --git a/core/debuglink/debuglink_chipreg.c b/core/debuglink/debuglink_chipreg.c
+index 3d12eff..4fe7930 100644
+--- a/core/debuglink/debuglink_chipreg.c
++++ b/core/debuglink/debuglink_chipreg.c
+@@ -39,6 +39,10 @@ static size_t soc_reg(const uint8_t *req, uint16_t len, uint8_t *out)
+ 	bool write = len == 9;
+ 	uint32_t addr = get32(req + 1);
+ 	uint32_t v = write ? get32(req + 5) : 0u;
++#if CONFIG_MONITOR_SCAN
++	if (write && board.radio != NULL && board.radio->monitor_tx_blocked != NULL && board.radio->monitor_tx_blocked())
++		return answer(out, DL_ST_REFUSED, 0);
++#endif
+ 	// Not while transmitting: a timer or an interrupt mask written then could leave the transmitter keyed
+ 	if (write && debuglink_transmitting()) {
+ 		return answer(out, DL_ST_REFUSED, 0);
+diff --git a/core/dmr/call/dmr_call.c b/core/dmr/call/dmr_call.c
+index 827817e..ab18f8f 100644
+--- a/core/dmr/call/dmr_call.c
++++ b/core/dmr/call/dmr_call.c
+@@ -2524,6 +2524,13 @@ const dmr_call_view_t *dmr_call_view(void)
+ 	return &s.view;
+ }
+ 
++#if CONFIG_MONITOR_SCAN
++bool dmr_call_rx_cc_known(void)
++{
++	return s.rx_cc_known;
++}
++#endif
++
+ bool dmr_call_channel_clear(uint32_t now_ms)
+ {
+ 	if (transmitting() || s.rx != RXC_NONE)
+diff --git a/core/dmr/call/dmr_call.h b/core/dmr/call/dmr_call.h
+index 9d9202e..9c5c3d0 100644
+--- a/core/dmr/call/dmr_call.h
++++ b/core/dmr/call/dmr_call.h
+@@ -278,6 +278,9 @@ void dmr_call_poll(uint32_t now_ms);
+ void dmr_call_set_wake(void (*fn)(void));
+ 
+ const dmr_call_view_t *dmr_call_view(void);
++#if CONFIG_MONITOR_SCAN
++bool dmr_call_rx_cc_known(void);	// current call; only the radio task
++#endif
+ 
+ // Diagnostics counters (the debug link's GET_DIAG / RESET_COUNTERS; wrap freely)
+ typedef struct {
+diff --git a/core/radio/radio.h b/core/radio/radio.h
+index 14babf1..a686a71 100644
+--- a/core/radio/radio.h
++++ b/core/radio/radio.h
+@@ -410,6 +410,22 @@ typedef struct {
+ #define RADIO_LED_GREEN		0x01u	// radio_view_t.leds
+ #define RADIO_LED_RED		0x02u
+ 
++#if CONFIG_MONITOR_SCAN
++#include "radio/monitor_cw.h"
++
++enum { RADIO_MONITOR_STOP, RADIO_MONITOR_PAUSE, RADIO_MONITOR_RESUME, RADIO_MONITOR_SKIP };
++typedef struct {
++	uint32_t hz, tg;		// tg = UINT32_MAX when unavailable; private IDs are omitted
++	int16_t rssi_dbm;
++	uint16_t id;		// NAC, RAN, DG-ID or CAN; UINT16_MAX when unavailable
++	uint8_t state, mode;	// MC_* scan state and evidence
++	uint8_t cc, ts;		// CC = UINT8_MAX, TS = 0 when unavailable
++	bool restore_fault;
++	bool narrow;		// verified narrow profile on a YSF hit
++	char source[11];
++} radio_monitor_view_t;
++#endif
++
+ typedef struct {
+ 	radio_state_t state;
+ 	uint8_t tx_deny;	// tx_deny_t, while RS_TX_DENIED
+@@ -427,6 +443,9 @@ typedef struct {
+ 	uint16_t temp;		// which settings are temporary changes: RADIO_TEMP_* bits (temporary == (temp != 0))
+ 	uint8_t squelch;	// 0 = open .. 9 = tight
+ 	bool monitor;		// squelch held open by the user
++#if CONFIG_MONITOR_SCAN
++	radio_monitor_view_t monitor_scan;
++#endif
+ 	bool tone_ok;		// the RX tone or code is heard (debounced; true when the channel has no RX tone)
+ 	int16_t rssi_dbm;
+ #if CONFIG_RSSI_GRAPH
+@@ -595,6 +614,10 @@ void radio_req_ptt(bool down);
+ // radio_req_ptt(false)
+ void radio_req_ptt_host(bool down);
+ void radio_req_monitor(bool down);
++#if CONFIG_MONITOR_SCAN
++bool radio_req_monitor_scan_start(uint32_t lo_hz, uint32_t hi_hz, uint32_t step_hz, int16_t threshold_dbm, uint8_t filter);
++void radio_req_monitor_scan(uint8_t cmd);
++#endif
+ // The monitor key released after its hold function ran (keyassign.h): FM closes the squelch, DMR doesn't toggle
+ void radio_req_monitor_held_up(void);
+ void radio_req_power(int8_t dir);		// temporary change of power level, wraps
+diff --git a/core/radio/radio_nxdn.c b/core/radio/radio_nxdn.c
+index 982941a..12f2106 100644
+--- a/core/radio/radio_nxdn.c
++++ b/core/radio/radio_nxdn.c
+@@ -212,6 +212,10 @@ static bool trunk_cfg(const channel_t *ch, uint16_t number, nxdn_trunk_cfg_t *t)
+ {
+ 	nxdn_conv_cfg_t cc;
+ 
++#if CONFIG_MONITOR_SCAN
++	if (ch->vfo_digital & CODEPLUG_MONITOR_PROBE)
++		return false;
++#endif
+ 	if (number == 0)
+ 		return trunk_cfg_vfo(ch, t);
+ 	if (!nxdn_conv_load(number, ch, &cc) || !cc.conv.trunk)
+diff --git a/core/radio/radio_sm.c b/core/radio/radio_sm.c
+index 82ed316..45179c4 100644
+--- a/core/radio/radio_sm.c
++++ b/core/radio/radio_sm.c
+@@ -35,6 +35,9 @@
+ #include "radio/sigtone.h"
+ #include "radio/vibe.h"	// vibe_t (vibe_play only with CONFIG_VIBRATE)
+ #include "radio/tx_limit.h"	// the test TX limit (radio-features.md 3.1)
++#if CONFIG_MONITOR_SCAN
++#include "hal_time.h"
++#endif
+ #if CONFIG_P25 || CONFIG_NXDN || CONFIG_YSF
+ #include "air/air_session.h"	// air_tx_state_t
+ #endif
+@@ -977,7 +980,7 @@ static void tone_scan_end(radio_sm_t *sm, uint8_t phase)
+ }
+ #endif
+ 
+-static void tune(radio_sm_t *sm, uint32_t now_ms)
++static bool tune(radio_sm_t *sm, uint32_t now_ms)
+ {
+ #if CONFIG_RSSI_GRAPH
+ 	sm->view.rssi_sample_hz = 0;
+@@ -1078,8 +1081,9 @@ static void tune(radio_sm_t *sm, uint32_t now_ms)
+ #if CONFIG_BCAST_FM
+ 	bcast_tune(sm);		// the channel receiver keeps its last frequency, muted, while the broadcast one plays
+ #endif
++	bool tuned = true;
+ 	if (!sm->view.am && !sm->view.bcast)
+-		board.radio->rx(sm->view.ch.rx_hz, air ? RADIO_BW_12K5 : (radio_bw_t)sm->view.ch.bw,
++		tuned = board.radio->rx(sm->view.ch.rx_hz, air ? RADIO_BW_12K5 : (radio_bw_t)sm->view.ch.bw,
+ 				mode != RADIO_MODE_FM ? &no_tone : &sm->view.ch.rx_tone);
+ 	if (mode == RADIO_MODE_DMR) {
+ 		dmr_begin(sm);		// after set_mode(DMR): the modem only starts in DMR mode
+@@ -1103,6 +1107,7 @@ static void tune(radio_sm_t *sm, uint32_t now_ms)
+ 	}
+ 	outputs(sm);
+ 	changed(sm);
++	return tuned;
+ }
+ 
+ // From position start in z, the first readable channel going in dir (wraps once round the zone)
+@@ -1535,8 +1540,14 @@ static bool bcl_busy(const radio_sm_t *sm)
+ }
+ 
+ // The test TX limit applies to all RF keying, including manual FM PTT.
+-static bool key_rf(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
++static bool key_rf(const radio_sm_t *sm, uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (mc_session_tx_blocked(&sm->monitor_session))
++		return false;
++#else
++	(void)sm;
++#endif
+ 	if (!tx_limit_allows(hz)) {
+ 		tx_limit_refused(hz);
+ 		return false;
+@@ -1547,9 +1558,9 @@ static bool key_rf(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *t
+ 	return board.radio->tx(hz, bw, power, tone);
+ }
+ 
+-static bool key_tx(uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
++static bool key_tx(const radio_sm_t *sm, uint32_t hz, radio_bw_t bw, uint8_t power, const subtone_t *tone)
+ {
+-	return !board_manual_fm_tx_only(hz) && key_rf(hz, bw, power, tone);
++	return !board_manual_fm_tx_only(hz) && key_rf(sm, hz, bw, power, tone);
+ }
+ 
+ #define AIR_TRUNK	(CONFIG_P25_TRUNK || CONFIG_NXDN)
+@@ -1598,6 +1609,10 @@ static const trunk_ops_t *trunk_ops(void)
+ 
+ static uint8_t tx_check(const radio_sm_t *sm)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (mc_session_tx_blocked(&sm->monitor_session))
++		return TXDENY_INHIBIT;
++#endif
+ 	const channel_t *ch = &sm->view.ch;
+ 	if (sm->view.vfo_am)
+ 		return TXDENY_AM;
+@@ -2231,7 +2246,7 @@ static bool sfr_rpt_begin(radio_sm_t *sm)
+ 			     SFR_RPT_RESUMING(sm), 0)) {	// the beacon schedule starts at the first poll
+ 		return false;
+ 	}
+-	sm->dmr_keyed = key_tx(ch->tx_hz, RADIO_BW_12K5, sm->view.power, &none);
++	sm->dmr_keyed = key_tx(sm, ch->tx_hz, RADIO_BW_12K5, sm->view.power, &none);
+ 	if (!sm->dmr_keyed) {
+ 		radio_sfr_stop();	// the board refused the keying: no repeater that can't send
+ 		return false;
+@@ -2773,7 +2788,7 @@ static void dmr_ptt_down(radio_sm_t *sm, uint32_t now_ms)
+ 	}
+ 	if (!sm->dmr_keyed) {
+ 		static const subtone_t none = { TONE_NONE, 0 };
+-		if (!key_tx(ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &none)) {
++		if (!key_tx(sm, ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &none)) {
+ 			deny(sm, board_refusal());
+ 			return;
+ 		}
+@@ -2909,7 +2924,7 @@ static bool data_send(radio_sm_t *sm, const dmrBurst_t *bursts, int count)
+ 	if (!sm->dmr_keyed) {
+ 		static const subtone_t none = { TONE_NONE, 0 };
+ 		const channel_t *ch = &sm->view.ch;
+-		if (!key_tx(ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &none)) {
++		if (!key_tx(sm, ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &none)) {
+ 			return false;
+ 		}
+ 		sm->dmr_keyed = true;
+@@ -3552,7 +3567,7 @@ static void t3_send(radio_sm_t *sm, const t3_act_t *a, uint32_t now_ms)
+ 	}
+ 	if (!sm->dmr_keyed) {
+ 		static const subtone_t none = { TONE_NONE, 0 };
+-		if (!key_tx(sm->view.ch.tx_hz, (radio_bw_t)sm->view.ch.bw, sm->view.power, &none)) {
++		if (!key_tx(sm, sm->view.ch.tx_hz, (radio_bw_t)sm->view.ch.bw, sm->view.power, &none)) {
+ 			radio_t3v.send_fail++;
+ 			t3_ms_sent(&t3m, now_ms, false);
+ 			return;
+@@ -5815,7 +5830,7 @@ static bool roam_probe(radio_sm_t *sm)
+ 	}
+ 	if (!sm->dmr_keyed) {
+ 		static const subtone_t none = { TONE_NONE, 0 };
+-		if (!key_tx(ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &none)) {
++		if (!key_tx(sm, ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &none)) {
+ 			return false;
+ 		}
+ 		sm->dmr_keyed = true;
+@@ -6152,7 +6167,7 @@ static void aprs_rf_service(radio_sm_t *sm, const radio_status_t *st, uint32_t n
+ 		changed(sm);
+ 		// APRS's own power level when it has one, else the radio's current one (a temporary change included), as for
+ 		// PTT. The settings' default (the board's default power) ignored a lowered level
+-		if (!key_tx(sm->aprs_job.hz, sm->aprs_job.narrow ? RADIO_BW_12K5 : RADIO_BW_25K,
++		if (!key_tx(sm, sm->aprs_job.hz, sm->aprs_job.narrow ? RADIO_BW_12K5 : RADIO_BW_25K,
+ 				     aprs_tx_power(sm->view.power), &none)) {
+ 			aprs_rf_end(sm, APRS_RF_NO_KEY, now_ms);
+ 		}
+@@ -7174,7 +7189,7 @@ static void air_key(radio_sm_t *sm, uint32_t now_ms, uint32_t hz)
+ 	sm->view.tx_elapsed_ms = 0;
+ 	sm->tx_start_ms = now_ms;
+ 	outputs(sm);
+-	if (!key_tx(hz, RADIO_BW_12K5, sm->view.power, &none)) {
++	if (!key_tx(sm, hz, RADIO_BW_12K5, sm->view.power, &none)) {
+ 		o->tx_abort();
+ 		deny(sm, board_refusal());
+ 		return;
+@@ -7270,7 +7285,7 @@ static void p25t_burst(radio_sm_t *sm, const trunk_ops_t *tk, uint32_t hz)
+ 		return;
+ 	}
+ 	sm->air_tx = true;
+-	if (!key_tx(hz, RADIO_BW_12K5, sm->view.power, &none)) {
++	if (!key_tx(sm, hz, RADIO_BW_12K5, sm->view.power, &none)) {
+ 		o->tx_abort();			// AIR_TX_DONE follows: air_tick clears it
+ 		return;
+ 	}
+@@ -7427,7 +7442,7 @@ static void fm_key(radio_sm_t *sm, uint32_t now_ms)
+ 	sm->tx_start_ms = now_ms;
+ 	outputs(sm);
+ 	const channel_t *ch = &sm->view.ch;
+-	if (!key_rf(ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &ch->tx_tone)) {
++	if (!key_rf(sm, ch->tx_hz, (radio_bw_t)ch->bw, sm->view.power, &ch->tx_tone)) {
+ 		deny(sm, board_refusal());
+ 		return;
+ 	}
+@@ -7754,7 +7769,7 @@ static void hotspot_arm(radio_sm_t *sm)
+ 		return;		// armed again when the CW ID ends
+ 	}
+ #endif
+-	sm->dmr_keyed = key_tx(sm->hs_tx_hz, RADIO_BW_12K5, sm->hs_power, &none);
++	sm->dmr_keyed = key_tx(sm, sm->hs_tx_hz, RADIO_BW_12K5, sm->hs_power, &none);
+ }
+ 
+ #if RADIO_SM_CW
+@@ -7846,7 +7861,7 @@ static uint8_t cw_begin(radio_sm_t *sm, uint32_t hz, uint8_t power, const char *
+ 	sm->board_mode = RADIO_MODE_FM;
+ 	board.radio->set_mode(RADIO_MODE_FM);
+ 	sm->cw_phase = CW_KEYING;	// before tx(): cw_restore and outputs see it
+-	if (!key_tx(hz, RADIO_BW_12K5, power, &none) || !board.radio->tx_tone(sm->cw_tone_hz)) {
++	if (!key_tx(sm, hz, RADIO_BW_12K5, power, &none) || !board.radio->tx_tone(sm->cw_tone_hz)) {
+ 		cw_restore(sm);
+ 		cw_ended(sm, false, 0);
+ 		return 0;
+@@ -8097,7 +8112,7 @@ static void bench_key(radio_sm_t *sm, uint16_t max_ms, uint32_t now_ms)
+ 	if (!sm->air_bench || sm->bench_keyed || board.air == NULL || max_ms == 0 || tx_check(sm) != TXDENY_NONE) {
+ 		return;
+ 	}
+-	if (!key_tx(sm->view.ch.tx_hz, RADIO_BW_12K5, 0, &none)) {	// level 0: the board's lowest (bench signals)
++	if (!key_tx(sm, sm->view.ch.tx_hz, RADIO_BW_12K5, 0, &none)) {	// level 0: the board's lowest (bench signals)
+ 		return;
+ 	}
+ 	if (!board.air->tx_begin()) {
+@@ -9176,8 +9191,531 @@ static void replay_request(radio_sm_t *sm, int32_t cmd, uint32_t now_ms)
+ }
+ #endif
+ 
++#if CONFIG_MONITOR_SCAN
++// The FD6818 reports the tuned channel's RSSI. A fast raster pass only dwells
++// for protocol decoding after that RSSI crosses the user's threshold.
++#define MONITOR_SETTLE_MS	25u
++#define MONITOR_DWELL_MS	75u
++#define MONITOR_ANALOG_MS	150u
++
++typedef struct {
++	uint8_t mode, channel_mode, variant;
++	uint16_t ms;
++} monitor_probe_t;
++
++static const monitor_probe_t monitor_probes[] = {
++#if CONFIG_DMR
++	{ MC_DMR, RADIO_MODE_DMR, 0, 660 },
++#endif
++#if CONFIG_P25
++	{ MC_P25, RADIO_MODE_P25, 0, 420 },
++#endif
++#if CONFIG_NXDN
++	{ MC_NXDN48, RADIO_MODE_NXDN, VFO_VARIANT_FIRST, 280 },
++	{ MC_NXDN96, RADIO_MODE_NXDN, VFO_VARIANT_SECOND, 240 },
++#endif
++#if CONFIG_YSF
++	{ MC_YSF, RADIO_MODE_YSF, VFO_VARIANT_FIRST << 2, 240 },
++	{ MC_YSF, RADIO_MODE_YSF, VFO_VARIANT_SECOND << 2, 240 },
++#endif
++#if CONFIG_M17
++	{ MC_M17, RADIO_MODE_M17, 0, 260 },
++#endif
++#if CONFIG_DSTAR
++	{ MC_DSTAR, RADIO_MODE_DSTAR, 0, 660 },
++#endif
++#if CONFIG_CW
++	{ MC_CW, RADIO_MODE_FM, 0, 0 },
++#endif
++	{ MC_FM, RADIO_MODE_FM, 0, MONITOR_ANALOG_MS },
++};
++#define MONITOR_PROBES (sizeof monitor_probes / sizeof *monitor_probes)
++
++static uint16_t monitor_probe_wait(const radio_sm_t *sm, const monitor_probe_t *p)
++{
++#if CONFIG_CW
++	if (p->mode == MC_CW)
++		return (uint16_t)(65u * mc_unit_ms(sm->monitor_wpm));
++#else
++	(void)sm;
++#endif
++	return p->ms;
++}
++
++static bool monitor_allowed(uint32_t hz, void *ctx)
++{
++	(void)ctx;
++	return board_in_band(hz, false) && board_tx_band(hz) >= 0 &&
++	       !board_manual_fm_tx_only(hz) && !radio_listen_band(hz);
++}
++
++static uint32_t monitor_first(const struct mc_cfg *cfg, uint32_t from)
++{
++	uint32_t result = 0;
++	for (uint8_t i = 0; i < board_band_count(); i++) {
++		const band_t *band = &board.bands[i];
++		if (!band->tx || band == board.manual_fm_tx_band)
++			continue;
++		uint32_t lo = band->lo_hz > from ? band->lo_hz : from;
++		uint32_t hi = band->hi_hz < cfg->hi ? band->hi_hz : cfg->hi;
++		if (lo > hi)
++			continue;
++		uint32_t rem = (lo - cfg->lo) % cfg->step;
++		uint32_t bump = rem ? cfg->step - rem : 0;
++		if (bump <= hi - lo && monitor_allowed(lo + bump, NULL) &&
++		    (!result || lo + bump < result))
++			result = lo + bump;
++	}
++	return result;
++}
++
++static uint32_t monitor_next(uint32_t old, const struct mc_cfg *cfg, void *ctx)
++{
++	(void)ctx;
++	uint32_t following = 0;
++	if (old >= cfg->lo && old <= cfg->hi && cfg->step <= cfg->hi - old)
++		following = monitor_first(cfg, old + cfg->step);
++	return following ? following : monitor_first(cfg, cfg->lo);
++}
++
++static bool monitor_mode_ready(const monitor_probe_t *p)
++{
++	switch (p->mode) {
++#if CONFIG_DMR
++	case MC_DMR: return board.dmr != NULL;
++#endif
++#if CONFIG_P25
++	case MC_P25: return p25_ok();
++#endif
++#if CONFIG_NXDN
++	case MC_NXDN48:
++	case MC_NXDN96: return (radio_nxdn_fit(p->mode == MC_NXDN96) & AIR_FIT_RX) != 0;
++#endif
++#if CONFIG_YSF
++	case MC_YSF: return (radio_ysf_fit(p->variant == (VFO_VARIANT_SECOND << 2)) & AIR_FIT_RX) != 0;
++#endif
++#if CONFIG_M17
++	case MC_M17: return m17_ok();
++#endif
++#if CONFIG_DSTAR
++	case MC_DSTAR: return dstar_ok();
++#endif
++#if CONFIG_CW
++	case MC_CW: return true;
++#endif
++	case MC_FM: return true;
++	default: return false;
++	}
++}
++
++static void monitor_metadata_clear(radio_monitor_view_t *v)
++{
++	v->id = UINT16_MAX;
++	v->cc = UINT8_MAX;
++	v->ts = 0;
++	v->tg = UINT32_MAX;
++	v->narrow = false;
++	v->source[0] = '\0';
++}
++
++static void monitor_view_update(radio_sm_t *sm)
++{
++	const struct mc_session *s = &sm->monitor_session;
++	const struct mc_scan *scan = &s->scan;
++	radio_monitor_view_t *v = &sm->view.monitor_scan;
++	v->state = scan->state;
++	v->mode = scan->mode;
++	v->hz = s->owns_rx ? scan->hz : 0;
++	v->restore_fault = s->restore_fault;
++	if (scan->peak > -160)
++		v->rssi_dbm = scan->peak;
++	changed(sm);
++}
++
++static bool monitor_acquire(void *ctx)
++{
++	radio_sm_t *sm = ctx;
++	if (sm->view.state != RS_IDLE || sm->ptt || sm->hotspot || sm->standby || sm->power_off_req ||
++	    BENCH_HELD(sm) || radio_listen_band(sm->view.ch.rx_hz) || board.radio->monitor_rx_only == NULL)
++		return false;
++#if CONFIG_CW
++	if (sm->view.cw.active || sm->view.cw.preview || sm->view.cw.key_armed)
++		return false;
++#endif
++#if CONFIG_SCAN
++	if (scan_on(&sm->scan))
++		return false;
++#endif
++#if CONFIG_DMR
++	if (sm->dmr_keyed || sm->sfr_rpt || sm->view.dmr.state != RDMR_IDLE || sm->view.dmr.reply_active)
++		return false;
++#endif
++#if CONFIG_DMR_TRUNK
++	if (sm->t3_on)
++		return false;
++#endif
++#if AIR_TRUNK
++	if (trunk_ops() != NULL)
++		return false;
++#endif
++#if CONFIG_AIR
++	if (sm->air_tx || sm->air_permit_ms)
++		return false;
++#endif
++#if CONFIG_FM && CONFIG_BEEP
++	if (sm->fm_permit_ms)
++		return false;
++#endif
++#if CONFIG_APRS_AFSK
++	if (sm->aprs_phase != APRS_RF_OFF)
++		return false;
++#endif
++#if CONFIG_DMR_ROAMING
++	// The roaming receiver may already be visiting a channel owned by its search.
++	if (roam_searching(&sm->roam))
++		return false;
++#endif
++	if (!board.radio->monitor_rx_only(true))
++		return false;
++
++	sm->monitor_saved_ch = sm->view.ch;
++	sm->monitor_saved_number = sm->view.channel_number;
++	sm->monitor_saved_vfo = sm->view.vfo;
++	sm->monitor_saved_open = sm->view.monitor;
++#if CONFIG_DMR
++	sm->monitor_saved_hear_all = sm->hear_all_latch;
++	sm->monitor_saved_manual = sm->manual;
++	sm->monitor_saved_one_shot = sm->one_shot;
++#endif
++	sm->view.vfo = false;
++	sm->view.channel_number = 0;
++#if CONFIG_APRS_RX
++	aprs_rx_stop();
++#endif
++#if RADIO_MDC_RX
++	mdc_rx_stop(sm);
++#endif
++	return true;
++}
++
++static bool monitor_restore(void *ctx)
++{
++	radio_sm_t *sm = ctx;
++	dmr_end(sm);
++	sm->view.ch = sm->monitor_saved_ch;
++	sm->view.channel_number = sm->monitor_saved_number;
++	sm->view.vfo = sm->monitor_saved_vfo;
++	sm->view.monitor = sm->monitor_saved_open;
++#if CONFIG_DMR
++	sm->hear_all_latch = sm->monitor_saved_hear_all;
++	sm->manual = sm->monitor_saved_manual;
++	sm->one_shot = sm->monitor_saved_one_shot;
++#endif
++	return tune(sm, sm->monitor_clock);
++}
++
++static void monitor_release(void *ctx)
++{
++	radio_sm_t *sm = ctx;
++	(void)board.radio->monitor_rx_only(false);
++	activity(sm, sm->monitor_clock);
++}
++
++static bool monitor_tune_profile(radio_sm_t *sm, uint32_t hz, const monitor_probe_t *profile)
++{
++	dmr_end(sm); // each probe starts with a new receiver, never the preceding decoder's view
++	sm->view.ch = (channel_t){ .rx_hz = hz, .tx_hz = hz, .bw = RADIO_BW_12K5,
++		.mode = profile ? profile->channel_mode : RADIO_MODE_FM, .rx_only = true,
++		.vfo_digital = CODEPLUG_MONITOR_PROBE | (profile ? profile->variant : 0),
++		.no_beep = true };
++	sm->view.monitor = profile && profile->mode == MC_DMR;
++#if CONFIG_DMR
++	sm->hear_all_latch = profile && profile->channel_mode != RADIO_MODE_FM;
++#endif
++	sm->monitor_fm_polls = 0;
++	if (!tune(sm, sm->monitor_clock))
++		return false;
++	sm->monitor_probe_ms = hal_millis();
++#if CONFIG_CW
++	if (profile && profile->mode == MC_CW)
++		cw_rx_init(&sm->monitor_cw, sm->monitor_wpm, sm->monitor_session.scan.cfg.threshold);
++#endif
++	return true;
++}
++
++static bool monitor_tune_rx(void *ctx, uint32_t hz, uint32_t generation)
++{
++	radio_sm_t *sm = ctx;
++	(void)generation;
++	monitor_metadata_clear(&sm->view.monitor_scan);
++	sm->view.monitor_scan.rssi_dbm = -160;
++	if (!monitor_tune_profile(sm, hz, NULL))
++		return false;
++	sm->monitor_session.scan.since = sm->monitor_probe_ms;
++	return true;
++}
++
++// Analog-only filtering still checks the available digital decoders, so a
++// verified digital burst cannot become an FM candidate.
++static bool monitor_pick_probe(radio_sm_t *sm)
++{
++	const struct mc_cfg *cfg = &sm->monitor_session.scan.cfg;
++	for (; sm->monitor_probe < MONITOR_PROBES; sm->monitor_probe++) {
++		const monitor_probe_t *p = &monitor_probes[sm->monitor_probe];
++		if (!monitor_mode_ready(p))
++			continue;
++		if (p->mode == MC_CW && !(cfg->filter & MC_MORSE))
++			continue;
++		if (p->mode != MC_CW && p->mode != MC_FM && !(cfg->filter & MC_BOTH))
++			continue;
++		return monitor_tune_profile(sm, sm->monitor_session.scan.hz, p);
++	}
++	return true;
++}
++
++static bool monitor_probe_rx(void *ctx, uint32_t generation, uint16_t enabled)
++{
++	radio_sm_t *sm = ctx;
++	(void)generation;
++	(void)enabled;
++	sm->monitor_probe = 0;
++	return monitor_pick_probe(sm);
++}
++
++static const struct mc_radio_ops monitor_ops = {
++	.acquire_rx = monitor_acquire, .restore_rx = monitor_restore, .release_rx = monitor_release,
++	.tune_rx = monitor_tune_rx, .probe_rx = monitor_probe_rx, .allowed = monitor_allowed,
++	.next_allowed = monitor_next,
++};
++
++bool radio_sm_monitor_start(radio_sm_t *sm, const struct mc_cfg *requested, uint32_t now_ms)
++{
++	if (!requested || sm->monitor_session.owns_rx)
++		return false;
++	struct mc_cfg cfg = *requested;
++#if CONFIG_CW
++	sm->monitor_wpm = mc_unit_ms(sm->view.cw.wpm) ? sm->view.cw.wpm : 20u;
++#endif
++	cfg.settle = MONITOR_SETTLE_MS;
++	cfg.dwell = MONITOR_DWELL_MS;
++	cfg.verify = 0;
++	cfg.enabled = 0;
++	for (uint8_t i = 0; i < MONITOR_PROBES; i++) {
++		const monitor_probe_t *p = &monitor_probes[i];
++		if (!monitor_mode_ready(p) || (p->mode == MC_CW && !(cfg.filter & MC_MORSE)))
++			continue;
++		cfg.enabled |= (uint16_t)(1u << p->mode);
++		cfg.verify += monitor_probe_wait(sm, p) + MONITOR_SETTLE_MS + 2u * RADIO_TICK_MS;
++	}
++	if (!(cfg.filter & MC_BOTH) && !(cfg.enabled & (1u << MC_CW)))
++		return false;
++	sm->monitor_clock = now_ms;
++	enum mc_action action = mc_session_start(&sm->monitor_session, &cfg, now_ms, &monitor_ops, sm);
++	monitor_view_update(sm);
++	return action == MC_TUNE;
++}
++
++static bool monitor_stop(radio_sm_t *sm, uint32_t now_ms)
++{
++	sm->monitor_clock = now_ms;
++	bool ok = mc_session_stop(&sm->monitor_session, &monitor_ops, sm);
++	monitor_view_update(sm);
++	return ok;
++}
++
++static void monitor_command(radio_sm_t *sm, int32_t cmd, uint32_t now_ms)
++{
++	if (cmd == RADIO_MONITOR_STOP) {
++		(void)monitor_stop(sm, now_ms);
++		return;
++	}
++	struct mc_session *s = &sm->monitor_session;
++	if (!s->owns_rx || s->restore_fault)
++		return;
++	sm->monitor_clock = now_ms;
++	if (cmd == RADIO_MONITOR_PAUSE && s->scan.state != MC_HELD) {
++		mc_session_pause(s);
++		board.radio->audio(false);
++		dmr_end(sm);
++	} else if (cmd == RADIO_MONITOR_SKIP || cmd == RADIO_MONITOR_RESUME) {
++		if (cmd == RADIO_MONITOR_SKIP)
++			mc_session_pause(s);
++		(void)mc_session_resume(s, now_ms, &monitor_ops, sm);
++	}
++	monitor_view_update(sm);
++}
++
++static uint8_t monitor_evidence(radio_sm_t *sm, const radio_status_t *st, uint32_t now_ms)
++{
++	radio_monitor_view_t *out = &sm->view.monitor_scan;
++	(void)out;
++	(void)now_ms;
++	switch (monitor_probes[sm->monitor_probe].mode) {
++#if CONFIG_DMR
++	case MC_DMR: {
++		const dmr_call_view_t *v = dmr_call_view();
++		if ((v->phase != DMR_CALL_PHASE_RX_VOICE && v->phase != DMR_CALL_PHASE_RX_BUSY) || !v->caller.src)
++			break;
++		if (dmr_call_rx_cc_known())
++			out->cc = v->rx_cc;
++		out->ts = v->rx_ts;
++		if (v->caller.group)
++			out->tg = v->caller.dst;
++		if (v->caller.alias[0]) {
++			memcpy(out->source, v->caller.alias, sizeof out->source - 1u);
++			out->source[sizeof out->source - 1u] = '\0';
++		}
++		return MC_DMR;
++	}
++#endif
++#if CONFIG_P25
++	case MC_P25:
++		if (sm->view.p25.flags & RADIO_P25_RX) {
++			out->id = sm->view.p25.nac;
++			if (sm->view.p25.dst && !(sm->view.p25.flags & RADIO_P25_UNIT))
++				out->tg = sm->view.p25.dst;
++			return MC_P25;
++		}
++		break;
++#endif
++#if CONFIG_NXDN
++	case MC_NXDN48:
++	case MC_NXDN96:
++		if ((sm->view.nxdn.flags & RADIO_NXDN_RX) && sm->view.nxdn.src) {
++			out->id = sm->view.nxdn.ran;
++			if (!(sm->view.nxdn.flags & RADIO_NXDN_UNIT))
++				out->tg = sm->view.nxdn.dst;
++			return (sm->view.nxdn.flags & RADIO_NXDN_9600) ? MC_NXDN96 : MC_NXDN48;
++		}
++		break;
++#endif
++#if CONFIG_YSF
++	case MC_YSF:
++		if (sm->view.ysf.flags & RADIO_YSF_RX) {
++			out->id = sm->view.ysf.dgid;
++			out->narrow = (sm->view.ysf.flags & RADIO_YSF_NARROW) != 0;
++			memcpy(out->source, sm->view.ysf.src, sizeof sm->view.ysf.src);
++			return MC_YSF;
++		}
++		break;
++#endif
++#if CONFIG_M17
++	case MC_M17:
++		if ((sm->view.m17.flags & RADIO_M17_RX) && sm->view.m17.src[0]) {
++			out->id = sm->view.m17.can;
++			memcpy(out->source, sm->view.m17.src, sizeof sm->view.m17.src);
++			return MC_M17;
++		}
++		break;
++#endif
++#if CONFIG_DSTAR
++	case MC_DSTAR:
++		if (sm->view.dstar.rx && sm->view.dstar.source[0]) {
++			memcpy(out->source, sm->view.dstar.source, sizeof sm->view.dstar.source);
++			return MC_DSTAR;
++		}
++		break;
++#endif
++#if CONFIG_CW
++	case MC_CW:
++		cw_rx_sample(&sm->monitor_cw, now_ms, st->rssi_dbm, st->rssi_dbm < 0);
++		if (cw_rx_evidence(&sm->monitor_cw))
++			return MC_CW;
++		break;
++#endif
++	case MC_FM:
++		// Sustained RF and a quiet discriminator indicate an analog candidate.
++		if (st->rssi_dbm < 0 && st->rssi_dbm >= sm->monitor_session.scan.cfg.threshold &&
++		    (st->carrier || st->noise < RADIO_SQL_OPEN_L1 - 12)) {
++			if (sm->monitor_fm_polls < 8u)
++				sm->monitor_fm_polls++;
++			if (sm->monitor_fm_polls >= 8u)
++				return MC_FM;
++		} else {
++			sm->monitor_fm_polls = 0;
++		}
++		break;
++	default:
++		break;
++	}
++	return MC_UNKNOWN;
++}
++
++static void monitor_tick(radio_sm_t *sm, uint32_t now_ms)
++{
++	struct mc_session *session = &sm->monitor_session;
++	struct mc_scan *scan = &session->scan;
++	if (session->restore_fault || scan->state == MC_PAUSED)
++		return;
++#if CONFIG_DMR
++	if (sm->dmr_running)
++		dmr_call_poll(now_ms);
++#endif
++#if CONFIG_AIR
++	if (air_running())
++		air_poll(sm);
++#endif
++	radio_status_t st;
++	board.radio->status(&st);
++	if (scan->state == MC_HELD) {
++		if (sm->view.ch.mode == RADIO_MODE_FM)
++			board.radio->audio(scan->mode != MC_CW && st.rssi_dbm < 0 && st.rssi_dbm >= scan->cfg.threshold);
++		if (now_ms - sm->monitor_clock >= 100u && scan->mode != MC_UNKNOWN && scan->mode != MC_FM &&
++		    scan->mode != MC_CW) {
++			sm->monitor_clock = now_ms;
++			if (monitor_evidence(sm, &st, now_ms) != MC_UNKNOWN)
++				changed(sm);
++		}
++		return;
++	}
++
++	sm->monitor_clock = now_ms;
++	struct mc_sample sample = { .tune_id = scan->tune_id, .rssi = st.rssi_dbm, .valid = st.rssi_dbm < 0 };
++	if (scan->state == MC_VERIFY && sm->monitor_probe < MONITOR_PROBES &&
++	    now_ms - sm->monitor_probe_ms >= MONITOR_SETTLE_MS) {
++		sample.evidence = monitor_evidence(sm, &st, now_ms);
++		if (sample.evidence != MC_UNKNOWN) {
++			if (!mc_match(&scan->cfg, sample.evidence)) {
++				monitor_command(sm, RADIO_MONITOR_SKIP, now_ms);
++				return;
++			}
++			// Valid synchronization or an already decoded header can arrive during a TDMA idle slot.
++			if (sample.rssi < scan->peak || !sample.valid)
++				sample.rssi = scan->peak;
++			sample.valid = true;
++		} else if (now_ms - sm->monitor_probe_ms >= monitor_probe_wait(sm, &monitor_probes[sm->monitor_probe]) +
++			   MONITOR_SETTLE_MS) {
++			sm->monitor_probe++;
++			if (!monitor_pick_probe(sm)) {
++				monitor_stop(sm, now_ms);
++				return;
++			}
++			// No more probes. The last profile was FM, so an unidentified hit can listen here.
++			if (sm->monitor_probe == MONITOR_PROBES)
++				scan->since = now_ms - scan->cfg.verify;
++		}
++	}
++	uint8_t before = scan->state;
++	enum mc_action action = mc_session_poll(session, now_ms, sample, &monitor_ops, sm);
++	if (action != MC_IDLE || before != scan->state)
++		monitor_view_update(sm);
++}
++#endif
++
+ void radio_sm_request(radio_sm_t *sm, const radio_req_t *req, uint32_t now_ms)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (req->type == RREQ_MONITOR_SCAN) {
++		monitor_command(sm, req->arg, now_ms);
++		return;
++	}
++	if (sm->monitor_session.owns_rx) {
++		if (req->type != RREQ_POWER_OFF && req->type != RREQ_STANDBY)
++			return; // discard retunes and every pending TX producer under RX ownership
++		if (!monitor_stop(sm, now_ms))
++			return;
++	}
++#endif
+ 	sm->led_now = now_ms;
+ #if CONFIG_DMR_REPLAY
+ 	if (req->type == RREQ_DMR_REPLAY) {
+@@ -10263,6 +10801,14 @@ static int16_t rssi_held(radio_sm_t *sm, int16_t rssi_dbm)
+ 
+ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (sm->monitor_session.owns_rx) {
++		sm->led_now = now_ms;
++		follow_volume(sm);
++		battery_poll(sm, now_ms);
++		return;
++	}
++#endif
+ 	radio_status_t st;
+ #if CONFIG_RSSI_GRAPH
+ 	sm->view.rssi_sample_hz = 0;
+@@ -10612,6 +11158,12 @@ static void sfr_rpt_tick(radio_sm_t *sm, uint32_t now_ms)
+ 
+ void radio_sm_tick(radio_sm_t *sm, uint32_t now_ms)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (sm->monitor_session.owns_rx) {
++		monitor_tick(sm, now_ms);
++		return;
++	}
++#endif
+ 	sm->led_now = now_ms;
+ 	if (codeplug_kv_serial() != kv_seen) {
+ 		kv_load(sm, now_ms);	// a key written (menu, debug link): its value only, without a codeplug reload
+diff --git a/core/radio/radio_sm.h b/core/radio/radio_sm.h
+index 8348693..95f4a43 100644
+--- a/core/radio/radio_sm.h
++++ b/core/radio/radio_sm.h
+@@ -8,6 +8,12 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include "radio/radio.h"
++#if CONFIG_MONITOR_SCAN
++#include "radio/monitor_session.h"
++#if CONFIG_CW
++#include "radio/cw_rx.h"
++#endif
++#endif
+ #include "radio/scan.h"
+ #include "radio/battery.h"
+ #include "radio/morse.h"
+@@ -196,6 +202,10 @@ typedef enum {
+ 	RREQ_TONE_SCAN,		// arg: radio_tscan_cmd_t
+ 	RREQ_STANDBY,		// soft off: arg 1 receiver asleep, speaker quiet, no transmission; 0 awake again
+ 	RREQ_DMR_REPLAY,	// arg: radio_dmr_replay_cmd_t
++#if CONFIG_MONITOR_SCAN
++	RREQ_MONITOR_SCAN_START,	// radio task copies the queued configuration
++	RREQ_MONITOR_SCAN,	// arg: RADIO_MONITOR_*
++#endif
+ } radio_req_type_t;
+ 
+ // RREQ_TONE's argument: which (RADIO_TONE_*) in bits 25:24, the tone type in 23:16, the value in 15:0
+@@ -272,6 +282,21 @@ typedef struct {
+ 
+ typedef struct {
+ 	radio_view_t view;
++#if CONFIG_MONITOR_SCAN
++	struct mc_session monitor_session;
++	channel_t monitor_saved_ch;
++	uint32_t monitor_probe_ms, monitor_clock;
++	uint16_t monitor_saved_number;
++	uint8_t monitor_probe, monitor_fm_polls;
++	bool monitor_saved_vfo, monitor_saved_open;
++#if CONFIG_DMR
++	bool monitor_saved_hear_all, monitor_saved_manual, monitor_saved_one_shot;
++#endif
++#if CONFIG_CW
++	struct cw_rx monitor_cw;
++	uint8_t monitor_wpm;
++#endif
++#endif
+ #if CONFIG_TONE_SCAN
+ 	uint32_t tone_scan_ms, tone_trial_ms;
+ 	uint16_t tone_trial;
+@@ -613,6 +638,9 @@ void radio_sm_poll(radio_sm_t *sm, uint32_t now_ms);
+ 
+ // Every RADIO_TICK_MS: the DMR call stack (poll, PTT keying, TX done, the DMR view). Nothing without CONFIG_DMR
+ void radio_sm_tick(radio_sm_t *sm, uint32_t now_ms);
++#if CONFIG_MONITOR_SCAN
++bool radio_sm_monitor_start(radio_sm_t *sm, const struct mc_cfg *cfg, uint32_t now_ms);
++#endif
+ 
+ // Hotspot frequencies the board can use: RX in a band, TX in a band that allows transmit (the amateur band plan does
+ // not apply, docs/spec/gotchas.md 8.7)
+diff --git a/core/radio/radio_task.c b/core/radio/radio_task.c
+index 352bb26..f4afdc0 100644
+--- a/core/radio/radio_task.c
++++ b/core/radio/radio_task.c
+@@ -11,6 +11,9 @@
+ #include "radio/radio_trunk.h"
+ #include "hal_time.h"
+ #include "config.h"
++#if CONFIG_MONITOR_SCAN
++#include "board.h"
++#endif
+ #if CONFIG_HOTSPOT
+ #include "hotspot/hotspot.h"
+ #include "radio/radio_hotspot.h"
+@@ -54,6 +57,10 @@
+ 
+ static radio_sm_t sm RFOUNDRY_CPU_RAM;	// owned by the radio task; CPU only
+ static radio_settings_t pending_settings;	// radio_set_settings -> the radio task, under view_lock
++#if CONFIG_MONITOR_SCAN
++static struct mc_cfg pending_monitor;
++static bool monitor_start_pending;	// both under view_lock
++#endif
+ static radio_settings_t shared_settings;	// the published copy, under view_lock
+ // Settings generations, under view_lock: radio_set_settings counts sent, the radio task notes the one it copied
+ // (taken) and publish() the one shared_settings now holds (published). While published lags sent, the last sent
+@@ -98,6 +105,14 @@ static volatile uint32_t req_handled, req_dropped;
+ 
+ static bool send(const radio_req_t *req, TickType_t wait)
+ {
++#if CONFIG_MONITOR_SCAN
++	// A producer that arrives before Stop finishes must not wait behind Stop
++	// in the queue and key the restored channel.
++	if (board.radio->monitor_tx_blocked != NULL && board.radio->monitor_tx_blocked() &&
++	    req->type != RREQ_MONITOR_SCAN && req->type != RREQ_SETTINGS &&
++	    req->type != RREQ_POWER_OFF && req->type != RREQ_STANDBY)
++		return false;
++#endif
+ 	if (xQueueSend(requests, req, wait) != pdTRUE) {
+ 		req_dropped++;	// the queue was full: the request is lost
+ 		return false;
+@@ -232,6 +247,14 @@ static void radio_task(void *arg)
+ 					else
+ 						radio_ysf_set_settings(&y);
+ 					radio_sm_request(&sm, &req, hal_millis());
++#endif
++#if CONFIG_MONITOR_SCAN
++				} else if (req.type == RREQ_MONITOR_SCAN_START) {
++					xSemaphoreTake(view_lock, portMAX_DELAY);
++					struct mc_cfg cfg = pending_monitor;
++					monitor_start_pending = false;
++					xSemaphoreGive(view_lock);
++					radio_sm_monitor_start(&sm, &cfg, hal_millis());
+ #endif
+ 				} else if (req.type == RREQ_SETTINGS) {
+ 					radio_settings_t set;
+@@ -422,6 +445,26 @@ void radio_req_vfo_step_size(uint32_t hz) { post(RREQ_VFO_STEP_SIZE, (int32_t)hz
+ void radio_req_ptt(bool down) { post(RREQ_PTT, down, pdMS_TO_TICKS(50)); }
+ void radio_req_ptt_host(bool down) { post(RREQ_PTT, down ? 2 : 0, pdMS_TO_TICKS(50)); }
+ void radio_req_monitor(bool down) { post(RREQ_MONITOR, down, pdMS_TO_TICKS(50)); }
++#if CONFIG_MONITOR_SCAN
++bool radio_req_monitor_scan_start(uint32_t lo_hz, uint32_t hi_hz, uint32_t step_hz, int16_t threshold_dbm, uint8_t filter)
++{
++	if (requests == NULL || step_hz < 6250 || lo_hz > hi_hz || threshold_dbm < -150 ||
++	    threshold_dbm > -30 || !filter || (filter & ~(MC_BOTH | MC_MORSE)))
++		return false;
++	xSemaphoreTake(view_lock, portMAX_DELAY);
++	bool sent = false;
++	if (!monitor_start_pending) {
++		static const radio_req_t req = { .type = RREQ_MONITOR_SCAN_START };
++		pending_monitor = (struct mc_cfg){ .lo = lo_hz, .hi = hi_hz, .step = step_hz,
++			.threshold = threshold_dbm, .filter = filter };
++		sent = monitor_start_pending = send(&req, 0);
++	}
++	xSemaphoreGive(view_lock);
++	return sent;
++}
++
++void radio_req_monitor_scan(uint8_t cmd) { post(RREQ_MONITOR_SCAN, cmd, pdMS_TO_TICKS(50)); }
++#endif
+ void radio_req_monitor_held_up(void) { post(RREQ_MONITOR, 2, pdMS_TO_TICKS(50)); }
+ void radio_req_power(int8_t dir) { post(RREQ_POWER, dir, 0); }
+ void radio_req_squelch(int8_t dir) { post(RREQ_SQUELCH, dir, 0); }
+diff --git a/hal/hal_radio.h b/hal/hal_radio.h
+index 13109fb..d027ad6 100644
+--- a/hal/hal_radio.h
++++ b/hal/hal_radio.h
+@@ -115,6 +115,11 @@ typedef struct {
+ 	// Optional: configure the detector for one candidate on the current FM receive frequency.
+ 	// The board rearms the detector, and returns false if it cannot run now. Used by receive-only tone search.
+ 	bool (*rx_tone_test)(const subtone_t *tone);
++#if CONFIG_MONITOR_SCAN
++	// Take/release physical RX-only ownership. A refused take leaves keying untouched.
++	bool (*monitor_rx_only)(bool on);
++	bool (*monitor_tx_blocked)(void);
++#endif
+ } hal_radio_t;
+ 
+ #endif
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 5b32768..4f83803 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -359,6 +359,13 @@ radioCoreTest: $(RCORE) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/cal
+                $(CORE)/ui/ui_svc.h
+ 	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 -o $@ $(RCORE) -lm
+ 
++ifneq ($(wildcard $(CORE)/radio/monitor_session.h),)
++TESTS   += radioCoreTestMonitor
++radioCoreTestMonitor: $(RCORE) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h)
++	$(CC) $(CFLAGS) $(CORE_HAL) -I. -DDMR_RX_TRACE=0 -DCONFIG_DMR_IP_GATEWAY=0 -DCONFIG_SFR=1 -DCONFIG_APRS=0 \
++		-DCONFIG_MONITOR_SCAN=1 -o $@ $(RCORE) -lm
++endif
++
+ # The same with the DMR VFO off (CONFIG_VFO_DMR=0): the VFO stays analog and nothing about it changes
+ TESTS   += radioCoreTestNoVfoDmr
+ radioCoreTestNoVfoDmr: $(RCORE) $(wildcard $(CORE)/radio/*.h) $(wildcard $(CORE)/dmr/call/*.h) $(CORE)/dmr/dmrDataService.h \
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+index 9c64527..ecb6f56 100644
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -77,10 +77,25 @@ static struct {
+ 
+ static void r_init(void) {}
+ static radio_mode_t hw_mode;
++#if CONFIG_MONITOR_SCAN
++static bool scan_hw_rx_only;
++static uint32_t scan_failed_hz;
++static bool r_monitor_rx_only(bool on)
++{
++	if (on && hw.keyed)
++		return false;
++	scan_hw_rx_only = on;
++	return true;
++}
++#endif
+ // As on the DM-1701: the modem starts only with the board in DMR mode (dm1701_dmr_enter)
+ static void r_set_mode(radio_mode_t m) { hw_mode = m; hw.set_mode_calls++; sim.refuse_start = m != RADIO_MODE_DMR; }
+ static bool r_rx(uint32_t hz, radio_bw_t bw, const subtone_t *t)
+ {
++#if CONFIG_MONITOR_SCAN
++	if (scan_failed_hz && hz == scan_failed_hz)
++		return false;
++#endif
+ 	hw.rx_hz = hz;
+ 	hw.rx_bw = bw;
+ 	hw.rx_tone = *t;
+@@ -151,7 +166,11 @@ static int16_t ref_trim_ppb = 1;	// ref_trim: the last trim (1: never called)
+ static bool r_ref_trim(int16_t ppb) { ref_trim_ppb = ppb; return true; }
+ static hal_radio_t fake_radio = { .init = r_init, .set_mode = r_set_mode, .rx = r_rx, .tx = r_tx, .tx_off = r_tx_off,
+ 					.status = r_status, .audio = r_audio, .tx_tone = r_tx_tone,
+-					.tx_tone_key = r_tx_tone_key, .tx_dtmf = r_tx_dtmf, .ref_trim = r_ref_trim };
++					.tx_tone_key = r_tx_tone_key, .tx_dtmf = r_tx_dtmf, .ref_trim = r_ref_trim
++#if CONFIG_MONITOR_SCAN
++					, .monitor_rx_only = r_monitor_rx_only
++#endif
++};
+ 
+ // (fake_radio.volume is set by test_soft_volume only)
+ static void p_led(uint8_t which, bool on) { hw.led[which] = on; }
+@@ -12431,6 +12450,86 @@ static void test_dstar_memory(void)
+ }
+ #endif
+ 
++#if CONFIG_MONITOR_SCAN
++static void test_monitor_scan(void)
++{
++	setup_codeplug();
++	start();
++	// Start from a tuned VFO, with split frequency and custom bandwidth.
++	req(RREQ_VFO, 1);
++	req(RREQ_VFO_SET, 145500000);
++	req(RREQ_VFO_TX, 145550000);
++	req(RREQ_BANDWIDTH, RADIO_BW_25K);
++	const channel_t previous = sm.view.ch;
++	const struct mc_cfg cfg = { .lo = 146625000, .hi = 146637500, .step = 6250, .threshold = -90, .filter = MC_BOTH };
++	const uint32_t saved_hz = hw.rx_hz;
++	const radio_bw_t saved_bw = hw.rx_bw;
++	hw.st.rssi_dbm = -125;
++	CHECK(radio_sm_monitor_start(&sm, &cfg, now));
++	CHECK(scan_hw_rx_only && sm.view.monitor_scan.state == MC_SETTLE && hw.rx_hz == cfg.lo && sm.view.ch.rx_only);
++	run(110);
++	CHECK(hw.rx_hz == cfg.lo + cfg.step);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_PAUSE);
++	CHECK(sm.view.monitor_scan.state == MC_PAUSED);
++	run(300);
++	CHECK(hw.rx_hz == cfg.lo + cfg.step);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_RESUME);
++	CHECK(hw.rx_hz == cfg.hi);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_SKIP);
++	CHECK(hw.rx_hz == cfg.lo);
++
++	// Emit valid DMR LC on the raster. The fake RF reading is strong but is not enough to tag DMR.
++	hw.st.rssi_dbm = -71;
++	run(90);
++	CHECK(sm.view.monitor_scan.state == MC_VERIFY && sm.view.monitor_scan.mode == MC_UNKNOWN);
++	uint8_t lc[9];
++	mk_lc(lc, true, 334, 334001);
++	burst_lc(lc, 7, false);
++	run(65);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && sm.view.monitor_scan.mode == MC_DMR);
++	CHECK(sm.view.monitor_scan.cc == 7 && sm.view.monitor_scan.tg == 334 && sm.view.monitor_scan.rssi_dbm == -71);
++
++	const radio_req_type_t producers[] = { RREQ_PTT, RREQ_TONE_BURST, RREQ_TONE_BURST_KEY,
++		RREQ_DTMF, RREQ_HS_ENTER, RREQ_HS_FREQ, RREQ_HS_CWID, RREQ_AIR_BENCH, RREQ_AIR_TX,
++		RREQ_T3, RREQ_T3_DIAL, RREQ_T3_POLL, RREQ_VFO_SET, RREQ_ROAM };
++	for (unsigned i = 0; i < sizeof producers / sizeof *producers; i++)
++		req(producers[i], 1);
++	run(100);
++	CHECK(hw.tx_calls == 0 && sim.tx_begins == 0 && !hw.keyed && !sm.ptt && scan_hw_rx_only);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && hw.rx_hz == cfg.lo);
++
++	// A restore refusal leaves both physical and state-machine ownership asserted.
++	scan_failed_hz = saved_hz;
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++	CHECK(scan_hw_rx_only && sm.view.monitor_scan.restore_fault);
++	req(RREQ_PTT, 2);	// host PTT is blocked too
++	run(100);
++	CHECK(hw.tx_calls == 0 && !hw.keyed);
++	scan_failed_hz = 0;
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++	CHECK(!scan_hw_rx_only && !sm.view.monitor_scan.restore_fault && sm.view.monitor_scan.state == MC_OFF);
++	CHECK(sm.view.vfo && hw.rx_hz == saved_hz && hw.rx_bw == saved_bw &&
++	      memcmp(&previous, &sm.view.ch, sizeof previous) == 0);
++	hw.st.rssi_dbm = -125;
++	req(RREQ_PTT, 1);
++	run(250);
++	CHECK(hw.tx_calls == 1 && hw.keyed);
++	CHECK(!radio_sm_monitor_start(&sm, &cfg, now) && !scan_hw_rx_only && hw.keyed);
++	req(RREQ_PTT, 0);
++	run(250);
++	CHECK(!hw.keyed);
++
++	// The next seek jumps between board intervals, preserving the requested raster.
++	const struct mc_cfg wide = { .lo = 174000000, .hi = 440000000, .step = 12500, .threshold = -90, .filter = MC_BOTH };
++	radio_sm_monitor_start(&sm, &wide, now);
++	CHECK(scan_hw_rx_only && hw.rx_hz == wide.lo);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_SKIP);
++	CHECK(hw.rx_hz >= 400000000 && (hw.rx_hz - wide.lo) % wide.step == 0);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++	CHECK(!scan_hw_rx_only);
++}
++#endif
++
+ int main(int argc, char **argv)
+ {
+ #if (CONFIG_P25 && CONFIG_NXDN && CONFIG_YSF) || CONFIG_M17 || CONFIG_DSTAR
+@@ -12442,6 +12541,9 @@ int main(int argc, char **argv)
+ #endif
+ 	test_tx_limit_op();
+ 	test_startup();
++#if CONFIG_MONITOR_SCAN
++	test_monitor_scan();
++#endif
+ 	test_persist();
+ 	test_channel_step();
+ 	test_vfo_step_auto();

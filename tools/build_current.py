@@ -27,6 +27,7 @@ OPTIONAL_MODULES = {
 	'aprs': 'APRS', 'dstar': 'DSTAR', 'm17': 'M17', 'mdc1200': 'MDC1200',
 	'nxdn': 'NXDN', 'p25': 'P25', 'rssi-graph': 'RSSI_GRAPH', 'ysf': 'YSF',
 }
+EXPERIMENTAL_MODULES = {'monitor-scan': 'MONITOR_SCAN', 'cw': 'CW'}
 PATCHES = (
 	'base.patch', 'channel-aes-ysf.patch', 'vfo-rx-bands.patch', 'ysf-tx-pcm.patch',
 	'ysf-vfo-identity.patch',
@@ -222,8 +223,17 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'issue105-channel-tx-contact.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'fm-mdc-roger.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'signaling-tones.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'issue117-tx-mic-gain.patch', cwd=tree)
+	if dstar:
+		run('git', 'apply', '--binary', PATCH_DIR / 'issue117-dstar-mic-gain-tests-docs.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
+	run('git', 'apply', '--binary', PATCH_DIR / 'issue120-module-config.patch', cwd=tree)
+	for header in ('monitor_cw.h', 'monitor_session.h'):
+		shutil.copyfile(ROOT / 'experimental/monitor-cw' / header, tree / 'core/radio' / header)
+	for patch in ('monitor-scan-runtime.patch', 'issue120-cw-envelope.patch', 'issue120-monitor-cw-ui.patch',
+	              'monitor-scan-air-validation.patch'):
+		run('git', 'apply', '--binary', PATCH_DIR / patch, cwd=tree)
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
 
 
@@ -247,6 +257,9 @@ def main():
 	ap.add_argument('--variant', choices=RELEASE_VARIANTS, default='full', help='firmware preset')
 	ap.add_argument('--without', action='append', choices=OPTIONAL_MODULES, default=[], metavar='MODULE',
 	                help='omit a module (repeatable): ' + ', '.join(OPTIONAL_MODULES))
+	ap.add_argument('--with', dest='with_modules', action='append', choices=EXPERIMENTAL_MODULES, default=[],
+	                metavar='EXPERIMENTAL_MODULE',
+	                help='enable an experimental module (repeatable): ' + ', '.join(EXPERIMENTAL_MODULES))
 	ap.add_argument('--dstar', action=argparse.BooleanOptionalAction, default=True,
 	                help='build experimental D-STAR DV for the VFO and stored channels (RF unverified)')
 	ap.add_argument('--no-m17', action='store_true', help='build with CONFIG_M17=n (M17 voice; Codec 2 real time on the MCU unverified)')
@@ -280,11 +293,13 @@ def main():
 		variant_suffix = '' if args.variant == 'full' else '-' + args.variant
 		bench_options = (f'BUILD=build/dm32{variant_suffix}-bench-1p25m',)
 		version += '-bench-1p25m'
-	preset = 'custom' if args.without or not args.dstar or args.no_m17 or args.no_mdc1200 or bench_options else args.variant
+	custom = args.without or args.with_modules or not args.dstar or args.no_m17 or args.no_mdc1200 or bench_options
+	preset = 'custom' if custom else args.variant
 	options = {name: 'n' for key, name in OPTIONAL_MODULES.items() if key in disabled}
 	options['M17'] = 'n' if 'm17' in disabled else 'y'
 	options['MDC1200'] = 'n' if 'mdc1200' in disabled else 'y'
 	options['DSTAR'] = 'y' if dstar else 'n'
+	options.update({name: 'y' if key in args.with_modules else 'n' for key, name in EXPERIMENTAL_MODULES.items()})
 	run('make', '-j%d' % args.jobs, 'BOARD=dm32', 'CROSS=' + args.cross, 'GITVERSION=' + version,
 	    'GITDIRTY=', 'RFOUNDRY_GIT_TIME=' + git_time, 'RFOUNDRY_PRESET=' + preset, *variant, *bench_options,
 	    *(f'CONFIG_{name}={value}' for name, value in options.items()), *dstar_options, 'all', 'stack-check', cwd=tree)

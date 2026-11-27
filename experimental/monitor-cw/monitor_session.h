@@ -3,7 +3,7 @@
 #define DM32_MONITOR_SESSION_H
 #include "monitor_cw.h"
 /*
- * Radio-task adapter contract; no RF implementation here.
+ * Radio-task adapter contract.
  * acquire_rx must atomically take ownership, inhibit ALL TX producers and
  * snapshot the previous channel; false must leave the radio unchanged.
  * restore_rx must restore while the TX interlock is still asserted.
@@ -17,6 +17,7 @@ struct mc_radio_ops {
     bool (*tune_rx)(void *, uint32_t, uint32_t);
     bool (*probe_rx)(void *, uint32_t, uint16_t);
     mc_allowed allowed;
+    mc_next_allowed next_allowed;
 };
 struct mc_session {
     struct mc_scan scan;
@@ -51,6 +52,7 @@ static inline enum mc_action mc_session_start(struct mc_session *s,
         return MC_STOP;
     if (!ops->acquire_rx(ctx)) return MC_STOP;
     s->owns_rx=true; s->restore_fault=false;
+    s->scan.next=ops->next_allowed;
     return mc_session_apply(s,mc_start(&s->scan,cfg,now,ops->allowed,ctx),ops,ctx);
 }
 static inline enum mc_action mc_session_poll(struct mc_session *s,

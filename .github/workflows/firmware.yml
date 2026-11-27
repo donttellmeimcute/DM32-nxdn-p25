@@ -79,6 +79,21 @@ jobs:
             (cd "$T" && ./"$t")
           done
 
+      - name: Check Monitor Scan and Morse with the optional modules enabled
+        run: |
+          set -eu
+          T=build/current/tests/host
+          tests="radioCoreTestMonitor radioCoreTestCw radioCoreTestMonitorCw uiSignalToolsTest"
+          make -C "$T" -j4 $tests
+          for t in $tests; do
+            (cd "$T" && ./"$t")
+          done
+          digital="radioCoreTestDstar radioCoreTestYsf radioCoreTestP25Nxdn radioCoreTestM17"
+          make -B -C "$T" -j4 CC="cc -DCONFIG_MONITOR_SCAN=1" $digital
+          for t in $digital; do
+            (cd "$T" && ./"$t")
+          done
+
       - name: Decode digital TX with MMDVM
         run: python3 tools/test_mmdvm_interop.py
 
@@ -136,6 +151,9 @@ jobs:
               raise SystemExit(f"full release manifest missing features: {', '.join(sorted(missing))}")
           if "AIR_RAW" in enabled or "AIR_RAW" not in disabled:
               raise SystemExit("release manifest unexpectedly enables AIR_RAW")
+          experimental = {"MONITOR_SCAN", "CW"}
+          if experimental & enabled or not experimental <= disabled:
+              raise SystemExit("full release must leave Monitor Scan and CW off by default")
           if "BCAST_FM" not in enabled or "BCAST_FM" in disabled:
               raise SystemExit("release manifest is missing broadcast FM")
           print("Full release manifest includes all tested digital voice modes")

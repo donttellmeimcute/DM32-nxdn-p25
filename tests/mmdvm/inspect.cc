@@ -92,6 +92,24 @@ static void check_ysf(std::istream& stream, unsigned char dt, bool narrow)
     assert(stream.gcount() == 0 && terminator);
 }
 
+static void check_ysf_rf(std::istream& stream)
+{
+    CYSFFICH fich;
+    std::array<unsigned char, 120> frame{};
+    unsigned total = 0, valid = 0, narrow = 0, types[4] = {};
+    while (stream.read(reinterpret_cast<char*>(frame.data()), frame.size())) {
+        ++total;
+        if (fich.decode(frame.data())) {
+            ++valid;
+            narrow += fich.getDev();
+            ++types[fich.getDT()];
+        }
+    }
+    assert(stream.gcount() == 0 && valid > 0);
+    std::printf("RF YSF: %u/%u valid FICH, narrow %u, DT 0/1/2/3 = %u/%u/%u/%u\n",
+                valid, total, narrow, types[0], types[1], types[2], types[3]);
+}
+
 int main(int argc, char** argv)
 {
     assert(argc == 3);
@@ -108,6 +126,10 @@ int main(int argc, char** argv)
         check_ysf(frames, 2, true);
     else if (mode == "vw")
         check_ysf(frames, 3, false);
+    else if (mode == "ysf-rf") {
+        check_ysf_rf(frames);
+        return 0;
+    }
     else
         return 2;
     std::printf("%s: MMDVMHost accepted the call metadata\n", argv[1]);

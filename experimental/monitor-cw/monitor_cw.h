@@ -10,7 +10,8 @@ enum mc_filter { MC_ANALOG=1, MC_DIGITAL=2, MC_BOTH=3, MC_MORSE=4 };
 enum mc_action { MC_IDLE, MC_TUNE, MC_PROBE, MC_FOUND, MC_STOP };
 enum mc_state { MC_OFF, MC_SETTLE, MC_LISTEN, MC_VERIFY, MC_HELD, MC_PAUSED };
 struct mc_cfg { uint32_t lo, hi, step; uint16_t settle, dwell, verify; int16_t threshold; uint16_t enabled; uint8_t filter; };
-struct mc_scan { struct mc_cfg cfg; uint32_t hz, since, tune_id; int16_t peak; uint8_t state, mode; };
+typedef uint32_t (*mc_next_allowed)(uint32_t hz, const struct mc_cfg *cfg, void *ctx);
+struct mc_scan { struct mc_cfg cfg; mc_next_allowed next; uint32_t hz, since, tune_id; int16_t peak; uint8_t state, mode; };
 struct mc_sample { uint32_t tune_id; int16_t rssi; uint8_t evidence; bool valid; };
 typedef bool (*mc_allowed)(uint32_t hz, void *ctx);
 static inline bool mc_match(const struct mc_cfg *c, unsigned m) {
@@ -23,6 +24,11 @@ static inline enum mc_action mc_tune(struct mc_scan *s, uint32_t hz, uint32_t no
 }
 /* Skip unavailable raster positions in bounded batches; stop rather than hang on a hole. */
 static inline enum mc_action mc_advance(struct mc_scan *s, uint32_t now, mc_allowed allowed, void *ctx) {
+    if (s->next) {
+        uint32_t f=s->next(s->hz,&s->cfg,ctx);
+        return f>=s->cfg.lo && f<=s->cfg.hi && (f-s->cfg.lo)%s->cfg.step==0 && allowed(f,ctx) ?
+            mc_tune(s,f,now) : mc_stop(s);
+    }
     uint32_t f=s->hz;
     for (unsigned n=0; n<256; ++n) {
         f=(f<s->cfg.lo || f>s->cfg.hi || s->cfg.hi-f<s->cfg.step) ? s->cfg.lo : f+s->cfg.step;

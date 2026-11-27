@@ -11,7 +11,7 @@ static bool tune(void *v,uint32_t f,uint32_t gen) { struct mock_radio *m=v; asse
 static bool probe(void *v,uint32_t gen,uint16_t enabled) { struct mock_radio *m=v; assert(m->lock && gen && enabled); ++m->probes; return !m->fail_probe; }
 static void session_tests(void) {
     struct mc_session s={0}; struct mock_radio m={0};
-    const struct mc_radio_ops ops={acquire,restore,release,tune,probe,band};
+    const struct mc_radio_ops ops={acquire,restore,release,tune,probe,band,0};
     struct mc_cfg c={146000000,146025000,12500,25,75,300,-75,1u<<MC_DMR,MC_BOTH};
     m.reject=true;
     assert(mc_session_start(&s,&c,0,&ops,&m)==MC_STOP && !m.lock && !m.tunes);

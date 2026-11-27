@@ -1,0 +1,64 @@
+diff --git a/Makefile b/Makefile
+index a3d6e9b..afb7f35 100644
+--- a/Makefile
++++ b/Makefile
+@@ -146,6 +146,12 @@ APP_DIRS := $(CORE_DIRS) $(PLATFORM_DIRS) $(BOARD_DIRS)
+ # Sorted: the link order steers LTO's code, and $(wildcard)'s order depends on the make (gotchas 13.10)
+ APP_SRC := $(foreach d,$(APP_DIRS),$(sort $(wildcard $(d)/*.c)))
+ APP_ASM := $(foreach d,$(APP_DIRS),$(sort $(wildcard $(d)/*.S)))
++ifneq ($(CONFIG_CW),y)
++APP_SRC := $(filter-out core/radio/cw_rx.c,$(APP_SRC))
++endif
++ifeq ($(filter y,$(CONFIG_HOTSPOT) $(CONFIG_SFR_CWID) $(CONFIG_CW)),)
++APP_SRC := $(filter-out core/radio/morse.c,$(APP_SRC))
++endif
+ # The stub entry without the debug link: its listener uses the debug link's framing (dl_frame.c, no RTOS or board)
+ ifeq ($(CONFIG_STUB_ENTRY)$(CONFIG_DEBUGLINK),yn)
+ APP_SRC += core/debuglink/dl_frame.c
+diff --git a/config/features.mk b/config/features.mk
+--- a/config/features.mk
++++ b/config/features.mk
+@@ -393,8 +393,26 @@ endif
+ CONFIG_RSSI_GRAPH ?= n
+ FEATURES += RSSI_GRAPH
++FEATURES += MONITOR_SCAN CW
+ 
++# Experimental RX-only frequency sweep using DM32's FD6818.
++CONFIG_MONITOR_SCAN ?= n
++# Experimental carrier-envelope Morse reception and local practice.
++CONFIG_CW ?= n
++ifneq ($(BOARD),dm32)
++BOARD_UNSUPPORTED += MONITOR_SCAN CW
++# The registry runs Make for every board and inherits the target's flag assignments.
++override CONFIG_MONITOR_SCAN := n
++override CONFIG_CW := n
++endif
++
+ # Dependencies
+ feature_on = $(filter y,$(CONFIG_$(1)))
++$(foreach f,MONITOR_SCAN CW,$(if $(and $(call feature_on,$(f)),$(if $(and $(call feature_on,FM),$(call feature_on,VFO)),,x)),$(error CONFIG_$(f)=y needs CONFIG_FM=y and CONFIG_VFO=y)))
++ifneq ($(call feature_on,CW),)
++  ifeq ($(call feature_on,BEEP),)
++    $(error CONFIG_CW=y needs CONFIG_BEEP=y)
++  endif
++endif
+ ifneq ($(call feature_on,SUBTONE),)
+   ifeq ($(call feature_on,FM),)
+     $(error CONFIG_SUBTONE=y needs CONFIG_FM=y)
+diff --git a/core/hostlink/build_info.c b/core/hostlink/build_info.c
+index d2ead0a..224f56d 100644
+--- a/core/hostlink/build_info.c
++++ b/core/hostlink/build_info.c
+@@ -197,6 +197,12 @@ static const char features[] =
+ #if CONFIG_SCAN
+ 	"SCAN,"
+ #endif
++#if CONFIG_MONITOR_SCAN
++	"MONITOR_SCAN,"
++#endif
++#if CONFIG_CW
++	"CW,"
++#endif
+ #if CONFIG_BEEP
+ 	"BEEP,"
+ #endif

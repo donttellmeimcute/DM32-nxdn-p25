@@ -6,14 +6,13 @@
 #include "board.h"
 #include "codeplug/codeplug.h"
 #include "radio/radio.h"
-#include "radio/mic_gain.h"
+#include "radio/mic_gain_pcm.h"
 #include "dsp/fxp.h"
 #include "radio/digital_rx_trim.h"
 #include "radio_dstar.h"
 #include "dstar_codeplug.h"
 #include "ambe_wire.h"
 #include "dv_engine.h"
-#include "tx_gain.h"
 
 #define QUEUE 8u
 #define PCM_PERIOD_US (AUDIO_BLOCK_MS * 1000u)
@@ -124,10 +123,8 @@ typedef struct {
 
 static void encode_mic(dstar_ambe_t *codec, const int16_t *mic, int16_t *spk, uint8_t *raw)
 {
-	static const uint16_t q8[MIC_GAIN_STEPS + 1] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 643, 810 };
-	// Keep the original PCM at the default setting and avoid applying a board gain twice.
-	uint16_t gain = mic_gain_on_board() ? 256u : q8[radio_mic_gain()];
-	gain = dstar_tx_gain_limit_q8(mic, AUDIO_BLOCK_SAMPLES, gain);
+	uint16_t requested = mic_gain_step_q8(radio_dstar_mic_gain());
+	uint16_t gain = mic_gain_limit_q8(mic, AUDIO_BLOCK_SAMPLES, requested);
 	if (gain == 256u) {
 		dstar_ambe_encode(codec, mic, raw);
 		return;

@@ -1,0 +1,124 @@
+diff --git a/tests/host/radioCoreTest.c b/tests/host/radioCoreTest.c
+--- a/tests/host/radioCoreTest.c
++++ b/tests/host/radioCoreTest.c
+@@ -12539,6 +12539,18 @@
+ 	CHECK(hw.rx_hz >= 400000000 && (hw.rx_hz - wide.lo) % wide.step == 0);
+ 	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
+ 	CHECK(!scan_hw_rx_only);
++
++	// No decodable frames and a sustained quiet discriminator is the FM candidate, not a digital hit.
++	struct mc_cfg analog = cfg;
++	analog.hi = analog.lo;
++	analog.filter = MC_ANALOG;
++	hw.st.rssi_dbm = -72;
++	hw.st.noise = 20;
++	CHECK(radio_sm_monitor_start(&sm, &analog, now));
++	run(4300);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && sm.view.monitor_scan.mode == MC_FM && hw.audio);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++	CHECK(!scan_hw_rx_only && hw.rx_hz == saved_hz);
+ #if CONFIG_CW
+ 	req(RREQ_BANDWIDTH, RADIO_BW_12K5);
+ 	req(RREQ_CW_TOOL, CW_RX_START);
+@@ -12659,6 +12671,91 @@
+ }
+ #endif
+ 
++#if CONFIG_MONITOR_SCAN && (CONFIG_P25 || CONFIG_NXDN || CONFIG_M17 || CONFIG_DSTAR)
++static bool monitor_profile(uint8_t mode, uint8_t variant)
++{
++	const struct mc_cfg cfg = { .lo = 446100000, .hi = 446100000, .step = 6250, .threshold = -90, .filter = MC_DIGITAL };
++	setup_codeplug();
++	start();
++	memset(fair, 0, sizeof fair);
++	hw.st.rssi_dbm = -74;
++	if (!radio_sm_monitor_start(&sm, &cfg, now))
++		return false;
++	for (unsigned i = 0; i < 200; i++) {
++		run(20);
++		if (sm.view.monitor_scan.state == MC_VERIFY && sm.view.ch.mode == mode &&
++		    (sm.view.ch.vfo_digital & (VFO_DIG_NXDN_MASK | VFO_DIG_YSF_MASK)) == variant)
++			return true;
++	}
++	return false;
++}
++
++static void test_monitor_air(void)
++{
++#if CONFIG_P25
++	CHECK(monitor_profile(RADIO_MODE_P25, 0));
++	CHECK(sm.view.monitor_scan.mode == MC_UNKNOWN);
++	far_begin(0x398, 334001, false, 334);
++	far_call(500);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && sm.view.monitor_scan.mode == MC_P25);
++	CHECK(sm.view.monitor_scan.id == 0x398 && sm.view.monitor_scan.tg == 334);
++	far_stop();
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++#endif
++#if CONFIG_NXDN
++	for (unsigned rate9600 = 0; rate9600 < 2; rate9600++) {
++		uint8_t variant = rate9600 ? VFO_VARIANT_SECOND : VFO_VARIANT_FIRST;
++		CHECK(monitor_profile(RADIO_MODE_NXDN, variant));
++		CHECK(sm.view.monitor_scan.mode == MC_UNKNOWN);
++		nfar_begin(rate9600, 19, 88, false, 293);
++		nfar_call(500);
++		CHECK(sm.view.monitor_scan.state == MC_HELD &&
++		      sm.view.monitor_scan.mode == (rate9600 ? MC_NXDN96 : MC_NXDN48));
++		CHECK(sm.view.monitor_scan.id == 19 && sm.view.monitor_scan.tg == 293);
++		nfar_stop();
++		req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++	}
++#endif
++#if CONFIG_YSF && CONFIG_P25 && CONFIG_IMBE
++	CHECK(monitor_profile(RADIO_MODE_YSF, VFO_VARIANT_FIRST << 2));
++	yfar_begin(YSF_DT_VOICE_FR);
++	yfar_start();
++	run(500);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && sm.view.monitor_scan.mode == MC_YSF);
++	CHECK(sm.view.monitor_scan.id == 0 && !sm.view.monitor_scan.narrow &&
++	      strcmp(sm.view.monitor_scan.source, "XE1XYZ") == 0);
++	yfar_stop();
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++#endif
++#if CONFIG_M17
++	CHECK(monitor_profile(RADIO_MODE_M17, 0));
++	m17_engine_cfg_t call_m17 = { .rx_can = M17_CAN_ANY, .tx_can = 10, .src = m17_addr_encode("XE1POC"),
++				    .dst = M17_ADDR_BROADCAST };
++	CHECK(m17_engine_begin(&m17_far_eng, &fake_air1, &call_m17, &m17_far_hooks, NULL));
++	CHECK(m17_engine_tx_prepare(&m17_far_eng) && m17_engine_tx_go(&m17_far_eng));
++	run(500);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && sm.view.monitor_scan.mode == MC_M17);
++	CHECK(sm.view.monitor_scan.id == 10 && strcmp(sm.view.monitor_scan.source, "XE1POC") == 0);
++	m17_engine_end(&m17_far_eng);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++#endif
++#if CONFIG_DSTAR
++	CHECK(monitor_profile(RADIO_MODE_DSTAR, 0));
++	static dstar_engine_t sender;
++	const dstar_engine_hooks_t hooks = { 0 };
++	const dstar_header_t header = { .rpt2 = "DIRECT  ", .rpt1 = "DIRECT  ", .ur = "CQCQCQ  ",
++				       .my = "XE1POC  ", .suffix = "MON " };
++	CHECK(dstar_engine_open(&sender, &fake_air1, &hooks, NULL));
++	CHECK(dstar_engine_prime(&sender, &header) && air_session_tx_go(&sender.session));
++	run(650);
++	CHECK(sm.view.monitor_scan.state == MC_HELD && sm.view.monitor_scan.mode == MC_DSTAR);
++	CHECK(strcmp(sm.view.monitor_scan.source, "XE1POC") == 0);
++	dstar_engine_close(&sender);
++	req(RREQ_MONITOR_SCAN, RADIO_MONITOR_STOP);
++#endif
++}
++#endif
++
+ int main(int argc, char **argv)
+ {
+ #if CONFIG_CW
+@@ -12676,6 +12773,9 @@
+ 	test_startup();
+ #if CONFIG_MONITOR_SCAN
+ 	test_monitor_scan();
++#if CONFIG_P25 || CONFIG_NXDN || CONFIG_M17 || CONFIG_DSTAR
++	test_monitor_air();
++#endif
+ #endif
+ 	test_persist();
+ 	test_channel_step();
