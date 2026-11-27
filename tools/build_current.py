@@ -219,6 +219,7 @@ def prepare(tree, dstar=False):
 		run('git', 'apply', '--binary', PATCH_DIR / 'issue108-dstar-mic-gain.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'issue105-channel-tx-contact.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'fm-mdc-roger.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'signaling-tones.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
 		shutil.copyfile(VARIANT_DIR / (name + '.mk'), tree / 'config/variants' / (name + '.mk'))
 	run('git', 'submodule', 'update', '--init', '--depth=1', 'third_party/FreeRTOS-Kernel', cwd=tree)
