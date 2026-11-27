@@ -1,0 +1,232 @@
+diff --git a/core/dmr/ambe/ambeVoice.c b/core/dmr/ambe/ambeVoice.c
+index 2af41b7..f3ffdd9 100644
+--- a/core/dmr/ambe/ambeVoice.c
++++ b/core/dmr/ambe/ambeVoice.c
+@@ -5,6 +5,7 @@
+ #include "dmr/ambe/ambeFec.h"
+ #include "config.h"
+ #include "radio/digital_rx_trim.h"
++#include "radio/mic_gain_pcm.h"
+ #include "radio/sigtone.h"
+ 
+ #include <stddef.h>
+@@ -730,11 +731,10 @@ static void tx_block(const int16_t *mic)
+ 		test_block(scaled);
+ 		mic = scaled;
+ 	}
+-	uint16_t g = LOAD(mic_gain_q8);
++	uint16_t g = mic_gain_limit_q8(mic, AUDIO_BLOCK_SAMPLES, LOAD(mic_gain_q8));
+ 	if (g != 256) {
+ 		for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+-			int32_t v = ((int32_t)mic[i] * g) / 256;
+-			scaled[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
++			scaled[i] = (int16_t)(((int32_t)mic[i] * g) / 256);
+ 		}
+ 		mic = scaled;
+ 	}
+@@ -819,8 +819,7 @@ void ambeVoiceAudioBlock(const int16_t *mic, int16_t *spk, void *ctx)
+ // 2 dB per step around step 5 (unity): -10 dB .. +10 dB, Q8
+ void ambeVoiceSetMicGain(uint8_t step)
+ {
+-	static const uint16_t q8[11] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 643, 810 };
+-	STORE(mic_gain_q8, q8[step > 10 ? 10 : step]);
++	STORE(mic_gain_q8, mic_gain_step_q8(step));
+ }
+ 
+ void ambeVoiceSetEncodeOptions(uint32_t opts)
+diff --git a/core/radio/mic_gain.c b/core/radio/mic_gain.c
+index 50dd3a0..d7679f6 100644
+--- a/core/radio/mic_gain.c
++++ b/core/radio/mic_gain.c
+@@ -13,12 +13,26 @@
+ #endif
+ 
+ static volatile uint8_t mic_step = MIC_GAIN_UNITY;
++#if CONFIG_DSTAR
++static volatile uint8_t manual_step = MIC_GAIN_UNITY;
++#endif
+ 
+ void radio_set_mic_gain(uint8_t step)
++{
++	radio_set_mic_gain_with_agc(step, false);
++}
++
++void radio_set_mic_gain_with_agc(uint8_t step, bool agc)
+ {
+ 	if (step > MIC_GAIN_STEPS) {
+ 		step = MIC_GAIN_STEPS;
+ 	}
++#if CONFIG_DSTAR
++	manual_step = step;
++#endif
++	if (agc) {
++		step = MIC_GAIN_UNITY;
++	}
+ 	mic_step = step;
+ 	bool hw = mic_gain_on_board();
+ 	if (hw) {
+@@ -40,3 +54,10 @@ uint8_t radio_mic_gain(void)
+ {
+ 	return mic_step;
+ }
++
++#if CONFIG_DSTAR
++uint8_t radio_dstar_mic_gain(void)
++{
++	return mic_gain_on_board() ? MIC_GAIN_UNITY : manual_step;
++}
++#endif
+diff --git a/core/radio/mic_gain.h b/core/radio/mic_gain.h
+index a846b7e..e0c0a5d 100644
+--- a/core/radio/mic_gain.h
++++ b/core/radio/mic_gain.h
+@@ -38,7 +38,12 @@ static inline bool mic_gain_available(void)
+ }
+ 
+ void radio_set_mic_gain(uint8_t step);
+-// The step last set (MIC_GAIN_UNITY until the first call)
++// Keep the manual setting for D-STAR while the DMR vocoder handles AGC.
++void radio_set_mic_gain_with_agc(uint8_t step, bool agc);
++// The effective step for the board and DMR (MIC_GAIN_UNITY while AGC is enabled).
+ uint8_t radio_mic_gain(void);
++#if CONFIG_DSTAR
++uint8_t radio_dstar_mic_gain(void);
++#endif
+ 
+ #endif
+diff --git a/core/radio/mic_gain_pcm.h b/core/radio/mic_gain_pcm.h
+new file mode 100644
+index 0000000..38a3e6c
+--- /dev/null
++++ b/core/radio/mic_gain_pcm.h
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#ifndef RADIO_MIC_GAIN_PCM_H
++#define RADIO_MIC_GAIN_PCM_H
++
++#include "radio/mic_gain.h"
++
++// The manual microphone gain steps in Q8, 2 dB per step and unity at step 5.
++static inline uint16_t mic_gain_step_q8(uint8_t step)
++{
++	static const uint16_t q8[MIC_GAIN_STEPS + 1] = { 81, 102, 128, 161, 203, 256, 322, 406, 511, 643, 810 };
++	return q8[step > MIC_GAIN_STEPS ? MIC_GAIN_STEPS : step];
++}
++
++// Reduce positive gain for the entire block when its peak would clip.
++// A block that already reached full scale is passed through at unity.
++static inline uint16_t mic_gain_limit_q8(const int16_t *pcm, unsigned count, uint16_t requested)
++{
++	if (requested <= 256u)
++		return requested;
++	uint32_t peak = 0;
++	for (unsigned i = 0; i < count; i++) {
++		int32_t sample = pcm[i];
++		uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
++		if (magnitude > peak)
++			peak = magnitude;
++	}
++	if (peak * requested <= 32767u * 256u)
++		return requested;
++	uint32_t limit = (32767u * 256u) / peak;
++	return (uint16_t)(limit < 256u ? 256u : limit);
++}
++
++#endif
+diff --git a/core/ui/ui_menus.c b/core/ui/ui_menus.c
+index d4520f2..26abe72 100644
+--- a/core/ui/ui_menus.c
++++ b/core/ui/ui_menus.c
+@@ -8106,9 +8106,13 @@ static bool vocoder_has(uint32_t opt)
+ 	return board.vocoder != NULL && board.vocoder->options != NULL && (board.vocoder->options() & opt) != 0;
+ }
+ 
+-// Mic AGC is on and in force: Mic gain doesn't apply (shown as "AGC", dimmed)
++// Software microphone gain remains editable on D-STAR when the DMR vocoder uses AGC.
+ static bool mic_agc_on(void)
+ {
++#if CONFIG_DSTAR
++	if (ui_view()->ch.mode == RADIO_MODE_DSTAR && !mic_gain_on_board())
++		return false;
++#endif
+ 	return vocoder_has(VOCODER_OPT_AGC) && ui_svc_setting_get(UI_SET_MIC_AGC) != 0;
+ }
+ 
+diff --git a/core/ui/ui_svc_radio.c b/core/ui/ui_svc_radio.c
+index c763166..5235760 100644
+--- a/core/ui/ui_svc_radio.c
++++ b/core/ui/ui_svc_radio.c
+@@ -622,16 +622,14 @@ int32_t ui_svc_reply_shown(const radio_settings_t *s)
+ 	return 10;
+ }
+ 
+-// Mic gain: the step, or step 5 (the board's levels, FM included) while the vocoder's AGC sets the level (Mic gain
+-// dimmed)
++// DMR's AGC uses the board's base level. D-STAR still needs the requested manual step on software-gain radios.
+ static void apply_mic_gain(int32_t step, bool agc)
+ {
+-	if (CONFIG_DMR && agc) {
+-		step = (int32_t)MIC_GAIN_UNITY;
+-	} else if (step < 0) {
++	if (step < 0) {
+ 		step = 0;
+ 	}
+-	radio_set_mic_gain((uint8_t)(step > (int32_t)MIC_GAIN_STEPS ? (int32_t)MIC_GAIN_STEPS : step));
++	radio_set_mic_gain_with_agc((uint8_t)(step > (int32_t)MIC_GAIN_STEPS ? (int32_t)MIC_GAIN_STEPS : step),
++				    CONFIG_DMR && agc);
+ }
+ 
+ // The UI's settings that live in radio_settings_t. The radio core saves them (settings store) and restores them at
+diff --git a/tests/host/ambeVoiceTest.c b/tests/host/ambeVoiceTest.c
+index 0e55870..33d7e14 100644
+--- a/tests/host/ambeVoiceTest.c
++++ b/tests/host/ambeVoiceTest.c
+@@ -737,6 +737,40 @@ static const hal_vocoder_t cap_vocoder = {
+ 	.options = opt_options, .set_options = opt_set, .encode_flags = opt_encode_flags,
+ };
+ 
++static void testTxMicGain(void)
++{
++	ambeVoiceInit(&audio, &cap_vocoder);
++	const dmr_voice_source_t *src = ambeVoiceSource();
++	ncap = 0;
++	src->begin(src->ctx);
++	memset(mic, 0, sizeof mic);
++	mic[0] = -1000;
++	mic[1] = 1000;
++	ambeVoiceSetMicGain(10);
++	block();
++	CHECK(cap_pcm[0][0] == -3164 && cap_pcm[0][1] == 3164, "quiet PCM gets the requested gain");
++
++	mic[0] = -20000;
++	mic[1] = 20000;
++	mic[2] = 10000;
++	block();
++	CHECK(cap_pcm[1][0] == -32734 && cap_pcm[1][1] == 32734 && cap_pcm[1][2] == 16367,
++	      "loud PCM keeps one linear gain for the whole block");
++	mic[0] = INT16_MIN;
++	mic[1] = INT16_MAX;
++	block();
++	CHECK(memcmp(mic, cap_pcm[2], sizeof mic) == 0, "full-scale PCM receives no extra gain");
++
++	ambeVoiceSetMicGain(0);
++	block();
++	CHECK(cap_pcm[3][0] == -10368 && cap_pcm[3][1] == 10367, "manual attenuation is preserved");
++	CHECK(ncap == 4, "each PCM block reached the vocoder (%d)", ncap);
++	src->end(src->ctx);
++	block();
++	ambeVoiceSetMicGain(5);
++	ambeVoiceInit(&audio, &vocoder);
++}
++
+ static int zeroCrossings(const int16_t *p, int n)
+ {
+ 	int c = 0;
+@@ -880,6 +914,7 @@ int main(void)
+ 	ambeVoiceSink()->begin(NULL, NULL);
+ 	CHECK(starts == 2, "restarted after stop");
+ 	testRouteHandoff();
++	testTxMicGain();
+ #if CONFIG_DMR_REPLAY
+ 	testReplay();
+ #endif
