@@ -1,0 +1,848 @@
+diff --git a/core/hostlink/build_info.c b/core/hostlink/build_info.c
+index d2ead0a..746f774 100644
+--- a/core/hostlink/build_info.c
++++ b/core/hostlink/build_info.c
+@@ -215,6 +215,9 @@ static const char features[] =
+ #if CONFIG_CPS_FAST
+ 	"CPS_FAST,"
+ #endif
++#if CONFIG_SPLASH_IMAGE
++	"SPLASH_COLOR,"
++#endif
+ #if CONFIG_USB
+ 	"USB,"
+ #endif
+diff --git a/core/ui/ui_screens.c b/core/ui/ui_screens.c
+index ceadbe3..2dcff17 100644
+--- a/core/ui/ui_screens.c
++++ b/core/ui/ui_screens.c
+@@ -15,6 +15,7 @@
+ #include "codeplug/codeplug_modes.h"	// channel kinds: the mode word
+ #if CONFIG_SPLASH_IMAGE
+ #include "codeplug/codeplug_kv.h"
++#include "storage/storage.h"
+ #endif
+ #if CONFIG_P25 || CONFIG_NXDN
+ #include "air/air_session.h"
+@@ -1145,10 +1146,68 @@ static color_t shade(unsigned level)
+ 	return (color_t)((r << 11) | (g << 5) | b);
+ }
+ 
++// DM-32UV color asset at EEPROM image + 0xB000. The CRC ties it to the
++// legacy KV record, so an older CPS replacing that record takes effect.
++#define COLOR_SPLASH_ADDR 0xB000u
++#define COLOR_SPLASH_MAGIC 0x31424652u
++#define COLOR_EDGE 128u
++#define COLOR_SPLASH_BYTES (12u + 32u + COLOR_EDGE * COLOR_EDGE / 2u)
++
++static uint32_t splash_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static bool draw_color_splash(uint32_t addr, uint32_t legacy_crc)
++{
++	uint8_t header[12 + 32];
++	if (!board.flash->read(addr, header, sizeof(header)) || splash_u32(header) != COLOR_SPLASH_MAGIC ||
++	    splash_u32(header + 4) != legacy_crc)
++		return false;
++
++	color_t palette[16];
++	for (unsigned i = 0; i < 16; i++)
++		palette[i] = (color_t)(header[12 + 2 * i] | (header[13 + 2 * i] << 8));
++
++	int w = gfx_width(), h = gfx_height();
++	unsigned edge = (unsigned)(w < h ? w : h);
++	int left = (w - (int)edge) / 2, top = (h - (int)edge) / 2;
++	uint32_t crc = storage_crc32(0, header + 12, 32);
++	uint8_t row[COLOR_EDGE / 2];
++	gfx_clear(palette[0]); // the letterbox uses one of the image's 16 colors
++	addr += sizeof(header);
++	for (unsigned y = 0; y < COLOR_EDGE; y++, addr += sizeof(row)) {
++		if (!board.flash->read(addr, row, sizeof(row)))
++			return false;
++		crc = storage_crc32(crc, row, sizeof(row));
++		unsigned y0 = (y * edge + COLOR_EDGE - 1) / COLOR_EDGE;
++		unsigned y1 = ((y + 1) * edge + COLOR_EDGE - 1) / COLOR_EDGE;
++		if (y1 == y0)
++			continue;
++		unsigned x0 = 0;
++		for (unsigned x = 0; x < COLOR_EDGE; x++) {
++			unsigned x1 = ((x + 1) * edge + COLOR_EDGE - 1) / COLOR_EDGE;
++			unsigned index = (row[x / 2] >> ((x & 1) ? 0 : 4)) & 15u;
++			if (index != 0 && x1 != x0)
++				gfx_fill(left + (int)x0, top + (int)y0, (int)(x1 - x0), (int)(y1 - y0), palette[index]);
++			x0 = x1;
++		}
++	}
++	return crc == splash_u32(header + 8);
++}
++
+ static bool draw_user_image(void)
+ {
+ 	if (codeplug_kv_get(SPLASH_RECORD, splash_pixels, sizeof(splash_pixels)) != (int)sizeof(splash_pixels))
+ 		return false;
++	const hal_flash_map_t *map = storage_map();
++	if (gfx_bpp() >= 4 && map && map->openfw_eeprom + COLOR_SPLASH_ADDR + COLOR_SPLASH_BYTES <= board.flash->size) {
++		storage_lock();
++		bool color = draw_color_splash(map->openfw_eeprom + COLOR_SPLASH_ADDR, storage_crc32(0, splash_pixels, sizeof(splash_pixels)));
++		storage_unlock();
++		if (color)
++			return true;
++	}
+ 	int w = gfx_width(), h = gfx_height();
+ 	int edge = w < h ? w : h;
+ 	int left = (w - edge) / 2, top = (h - edge) / 2;
+diff --git a/docs/spec/codeplug-settings.md b/docs/spec/codeplug-settings.md
+index 6b8437b..190b971 100644
+--- a/docs/spec/codeplug-settings.md
++++ b/docs/spec/codeplug-settings.md
+@@ -371,3 +371,13 @@ startup screen when the record is absent or a different length. This asset
+ also appears in the startup screen preview. Diagnostics and firmware update
+ screens retain their own banners. The editor stores or removes it with the
+ rest of the settings area, preserving unrelated entries.
++
++The DM-32UV also stores a 128 × 128 indexed color splash at EEPROM image
++offset `0xB000`, outside the settings sector and the qdmr transfer ranges.
++The record starts with `RFB1`, the CRC-32 of the legacy 1,024-byte image,
++and the CRC-32 of the color payload (both little-endian). The payload is
++16 little-endian RGB565 palette entries and 8,192 pixel bytes, in row order
++with the higher nibble first. The first palette entry fills the letterbox.
++The radio uses the legacy image if either CRC fails, including after a partial
++write or a legacy CPS change. The CPS transfers the color record only when the
++radio advertises `SPLASH_COLOR`. Full CPS file exports include both records.
+diff --git a/docs/user/02-installing.md b/docs/user/02-installing.md
+index 822f658..594a9e4 100644
+--- a/docs/user/02-installing.md
++++ b/docs/user/02-installing.md
+@@ -414,6 +414,8 @@ Your radio's section in the [Radio reference](23-radios.md) says which way appli
+ 
+ On a build with startup image support, choose **Change Startup Image** in the web installer to open the Codeplug
+ Editor at the **Radio** tab. Read from the radio, select a PNG, JPEG, or WebP in **Startup image**, and write the codeplug.
+-The radio shows the image in four shades using the current theme. **Settings
++Current DM-32UV firmware displays a 128 × 128 image with up to 16 colors. Older
++firmware with custom startup images displays the four-shade version using
++the current theme. **Settings
+ → My radio → Preview splash** shows what will appear at startup. Restore the
+ built-in screen in the same editor field.
+diff --git a/site/i18n/en.json b/site/i18n/en.json
+index b608031..3d13d86 100644
+--- a/site/i18n/en.json
++++ b/site/i18n/en.json
+@@ -1878,7 +1878,7 @@
+  "editor.general.boot2": "Boot Text Line 2",
+  "editor.general.boot_image": "Startup image",
+  "editor.general.boot_image_reset": "Restore built-in startup screen",
+- "editor.general.boot_image_help": "PNG, JPEG or WebP. Shown in four shades on firmware with custom startup images.",
++ "editor.general.boot_image_help": "PNG, JPEG or WebP. 128 × 128 with up to 16 colors on updated firmware. Older builds use the four-shade version.",
+  "editor.general.boot_image_error": "Could not open this image.",
+  "editor.general.group_hang": "Group Call Hang Time",
+  "editor.general.private_hang": "Private Call Hang Time",
+diff --git a/site/i18n/es.json b/site/i18n/es.json
+index 9aa1598..5440250 100644
+--- a/site/i18n/es.json
++++ b/site/i18n/es.json
+@@ -1878,7 +1878,7 @@
+  "editor.general.boot2": "Texto de arranque, línea 2",
+  "editor.general.boot_image": "Imagen de inicio",
+  "editor.general.boot_image_reset": "Restaurar imagen original",
+- "editor.general.boot_image_help": "PNG, JPEG o WebP. Se muestra en cuatro tonos en firmware compatible.",
++ "editor.general.boot_image_help": "PNG, JPEG o WebP. 128 × 128 y hasta 16 colores con firmware actualizado. Las versiones anteriores usan cuatro tonos.",
+  "editor.general.boot_image_error": "No se pudo abrir esta imagen.",
+  "editor.general.group_hang": "Tiempo de espera de llamada de grupo",
+  "editor.general.private_hang": "Tiempo de espera de llamada privada",
+diff --git a/site/i18n/it.json b/site/i18n/it.json
+index 97a4a4c..464bb81 100644
+--- a/site/i18n/it.json
++++ b/site/i18n/it.json
+@@ -1878,7 +1878,7 @@
+  "editor.general.boot2": "Testo di avvio riga 2",
+  "editor.general.boot_image": "Immagine di avvio",
+  "editor.general.boot_image_reset": "Ripristina immagine originale",
+- "editor.general.boot_image_help": "PNG, JPEG o WebP. Visualizzata in quattro tonalità sul firmware compatibile.",
++ "editor.general.boot_image_help": "PNG, JPEG o WebP. 128 × 128 e fino a 16 colori con firmware aggiornato. Le versioni precedenti usano quattro tonalità.",
+  "editor.general.boot_image_error": "Impossibile aprire questa immagine.",
+  "editor.general.group_hang": "Tempo di coda chiamata di gruppo",
+  "editor.general.private_hang": "Tempo di coda chiamata privata",
+diff --git a/site/i18n/zh.json b/site/i18n/zh.json
+index 9bb8c35..e008fe4 100644
+--- a/site/i18n/zh.json
++++ b/site/i18n/zh.json
+@@ -1878,7 +1878,7 @@
+  "editor.general.boot2": "启动文字第二行",
+  "editor.general.boot_image": "开机图像",
+  "editor.general.boot_image_reset": "还原默认开机图像",
+- "editor.general.boot_image_help": "支持 PNG、JPEG 或 WebP。兼容固件使用四个色阶显示。",
++ "editor.general.boot_image_help": "支持 PNG、JPEG 或 WebP。新固件支持 128 × 128 和最多 16 种颜色，旧固件使用四个色阶。",
+  "editor.general.boot_image_error": "无法打开此图像。",
+  "editor.general.group_hang": "组呼挂起时间",
+  "editor.general.private_hang": "个呼挂起时间",
+diff --git a/site/static/js/codeplug/bootimage.js b/site/static/js/codeplug/bootimage.js
+index 75535b2..50825f6 100644
+--- a/site/static/js/codeplug/bootimage.js
++++ b/site/static/js/codeplug/bootimage.js
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: MIT
+ // Copyright (c) 2026 lyra XE1POC
+-// RadioFoundry startup image asset in the codeplug settings area.
++// RadioFoundry startup image assets in the codeplug.
++import { crc32 } from "../flasher/bytes.js";
++import { decodeArea, deleteValue, getValue, putArea, setValue } from "./kv.js";
+ export const BOOT_IMAGE_KEY = 0x2000;
+ export const BOOT_IMAGE_EDGE = 64;
+ export const BOOT_IMAGE_BYTES = BOOT_IMAGE_EDGE ** 2 / 4;
+@@ -13,18 +15,164 @@ export function packBootImage(rgba) {
+ 	if (rgba.length !== BOOT_IMAGE_EDGE ** 2 * 4) throw new RangeError("Invalid image dimensions");
+ 	const image = new Uint8Array(BOOT_IMAGE_BYTES);
+ 	const luma = (i) => (0.2126 * rgba[i] + 0.7152 * rgba[i + 1] + 0.0722 * rgba[i + 2]) / 255;
+-	let transparent = false, lightArtwork = true;
++	let coverage = 0, brightness = 0, transparent = false;
+ 	for (let i = 0; i < rgba.length; i += 4) {
+-		transparent ||= rgba[i + 3] < 255;
+-		lightArtwork &&= rgba[i + 3] === 0 || luma(i) >= 2 / 3;
++		const alpha = rgba[i + 3];
++		transparent ||= alpha < 255;
++		coverage += alpha;
++		brightness += luma(i) * alpha;
+ 	}
+-	// Keep transparent white graphics legible as theme ink. Mixed tones retain their source polarity.
+-	const whiteLogo = transparent && lightArtwork;
++	// A dark logo on a transparent background should use the theme foreground.
++	const invert = transparent && brightness < coverage / 2;
+ 	for (let i = 0; i < rgba.length; i += 4) {
+-		// Shade 0 is the theme background and 3 is its ink. Alpha blends towards the background.
+-		const shade = (whiteLogo ? luma(i) : 1 - luma(i)) * rgba[i + 3] / 255;
++		const shade = (invert ? 1 - luma(i) : luma(i)) * rgba[i + 3] / 255;
+ 		const pixel = i / 4;
+ 		image[pixel >> 2] |= Math.round(shade * 3) << (6 - 2 * (pixel & 3));
+ 	}
+ 	return image;
+ }
++
++// DM-32UV color splash, in three unused sectors of the open-firmware EEPROM image.
++// RFB1, CRC32 of the legacy image, CRC32 of the color payload, 16 little-endian
++// RGB565 colors, then 128 rows of 4-bit palette indexes (high nibble first).
++export const BOOT_COLOR_EDGE = 128;
++const COLOR_TABLE_SIZE = 32;
++const COLOR_BYTES = COLOR_TABLE_SIZE + BOOT_COLOR_EDGE ** 2 / 2;
++const HEADER_SIZE = 12;
++const COLOR_MAGIC = 0x31424652;
++export const BOOT_COLOR_AREA = [0xB000, 0xB000 + HEADER_SIZE + COLOR_BYTES];
++
++export function bootColorValid(pixels) {
++	return pixels instanceof Uint8Array && pixels.length === COLOR_BYTES;
++}
++
++function rgb565(r, g, b) {
++	return (Math.round(r * 31 / 255) << 11) | (Math.round(g * 63 / 255) << 5) | Math.round(b * 31 / 255);
++}
++
++export function bootColorRgb(color) {
++	return [Math.round((color >> 11) * 255 / 31), Math.round(((color >> 5) & 63) * 255 / 63), Math.round((color & 31) * 255 / 31)];
++}
++
++function colorBox(colors) {
++	const bounds = [0, 1, 2].map((axis) => {
++		let min = 255, max = 0;
++		for (const color of colors) {
++			min = Math.min(min, color.rgb[axis]);
++			max = Math.max(max, color.rgb[axis]);
++		}
++		return max - min;
++	});
++	const axis = bounds.indexOf(Math.max(...bounds));
++	const weight = colors.reduce((sum, color) => sum + color.count, 0);
++	return { colors, axis, weight, score: bounds[axis] * weight };
++}
++
++// Weighted median cut in RGB space, after binning to the panel's RGB565 values.
++// Every distinct source color stays exact when it already fits the palette.
++export function packBootColor(rgba) {
++	const size = BOOT_COLOR_EDGE ** 2;
++	if (rgba.length !== size * 4) throw new RangeError("Invalid color image dimensions");
++	const histogram = new Map();
++	const source = new Uint16Array(size);
++	for (let p = 0; p < size; p++) {
++		const i = p * 4;
++		const alpha = rgba[i + 3] / 255;
++		const color = rgb565(rgba[i] * alpha, rgba[i + 1] * alpha, rgba[i + 2] * alpha);
++		source[p] = color;
++		histogram.set(color, (histogram.get(color) || 0) + 1);
++	}
++	const colors = Array.from(histogram, ([color, count]) => ({ rgb: bootColorRgb(color), count }));
++	const boxes = [colorBox(colors)];
++	while (boxes.length < 16) {
++		boxes.sort((a, b) => b.score - a.score);
++		if (!boxes[0].score) break;
++		const { colors, axis, weight } = boxes.shift();
++		colors.sort((a, b) => a.rgb[axis] - b.rgb[axis]);
++		let split = 1, subtotal = colors[0].count;
++		while (split < colors.length - 1 && subtotal < weight / 2) subtotal += colors[split++].count;
++		boxes.push(colorBox(colors.slice(0, split)), colorBox(colors.slice(split)));
++	}
++	const result = new Uint8Array(COLOR_BYTES);
++	const view = new DataView(result.buffer);
++	const indexes = new Map();
++	boxes.sort((a, b) => b.weight - a.weight);
++	boxes.forEach(({ colors, weight }, index) => {
++		const sums = [0, 0, 0];
++		for (const { rgb, count } of colors) {
++			indexes.set(rgb565(...rgb), index);
++			for (let axis = 0; axis < 3; axis++) sums[axis] += rgb[axis] * count;
++		}
++		view.setUint16(index * 2, rgb565(...sums.map((sum) => sum / weight)), true);
++	});
++	for (let p = 0; p < size; p++) {
++		result[COLOR_TABLE_SIZE + (p >> 1)] |= indexes.get(source[p]) << (p & 1 ? 0 : 4);
++	}
++	return result;
++}
++
++export function bootColorPalette(image) {
++	const view = new DataView(image.buffer, image.byteOffset, COLOR_TABLE_SIZE);
++	return Array.from({ length: COLOR_TABLE_SIZE / 2 }, (_, i) => bootColorRgb(view.getUint16(i * 2, true)));
++}
++
++export function bootColorIndex(image, pixel) {
++	return (image[COLOR_TABLE_SIZE + (pixel >> 1)] >> (pixel & 1 ? 0 : 4)) & 15;
++}
++
++function colorRecord(bytes) {
++	return bytes.subarray(...BOOT_COLOR_AREA);
++}
++
++export function decodeBootColor(bytes, legacy) {
++	const record = colorRecord(bytes);
++	if (record.length !== HEADER_SIZE + COLOR_BYTES || !bootImageValid(legacy)) return undefined;
++	const header = new DataView(record.buffer, record.byteOffset, HEADER_SIZE);
++	const payload = record.subarray(HEADER_SIZE);
++	if (header.getUint32(0, true) !== COLOR_MAGIC || header.getUint32(4, true) !== crc32(legacy)
++			|| header.getUint32(8, true) !== crc32(payload)) return undefined;
++	return payload.slice();
++}
++
++export function encodeBootColor(bytes, color, legacy) {
++	const record = colorRecord(bytes);
++	if (bootColorValid(color) && bootImageValid(legacy)) {
++		const header = new DataView(record.buffer, record.byteOffset, HEADER_SIZE);
++		header.setUint32(0, COLOR_MAGIC, true);
++		header.setUint32(4, crc32(legacy), true);
++		header.setUint32(8, crc32(color), true);
++		record.set(color, HEADER_SIZE);
++	} else if (color === null) {
++		const header = new DataView(record.buffer, record.byteOffset, HEADER_SIZE);
++		if (header.getUint32(0, true) === COLOR_MAGIC) record.fill(0xFF);
++	}
++}
++
++// Merge the splash after the rest of the settings. Only a file with a splash
++// or an explicit image edit can replace the connected radio's asset.
++export function bootColorForWrite(file, radio, base, { bootColor, bootImage }, fromFile) {
++	const record = colorRecord(file);
++	const current = colorRecord(radio);
++	const original = base && colorRecord(base);
++	const edited = bootColor === null || (bootColorValid(bootColor)
++		&& (fromFile || !original || record.some((v, i) => v !== original[i])));
++	if (!edited) {
++		record.set(current);
++		return;
++	}
++	const area = decodeArea(file);
++	if (area.state === "newer") throw new RangeError("Newer codeplug settings area");
++	const legacy = getValue(area.entries, BOOT_IMAGE_KEY);
++	if (bootImageValid(bootImage)) {
++		if (!legacy || legacy.length !== bootImage.length || legacy.some((v, i) => v !== bootImage[i])) {
++			if (!putArea(file, setValue(area.entries, BOOT_IMAGE_KEY, bootImage)))
++				throw new RangeError("Startup image fallback does not fit");
++		}
++		encodeBootColor(file, bootColor, bootImage);
++	} else {
++		if (bootImageValid(legacy) && !putArea(file, deleteValue(area.entries, BOOT_IMAGE_KEY)))
++			throw new RangeError("Cannot reset startup image");
++		record.set(current);
++		encodeBootColor(file, null);
++	}
++}
+diff --git a/site/static/js/codeplug/model.js b/site/static/js/codeplug/model.js
+index 4ea65c6..7bf7225 100644
+--- a/site/static/js/codeplug/model.js
++++ b/site/static/js/codeplug/model.js
+@@ -19,6 +19,8 @@ import { readHeader } from "./iddb.js";
+ import { decodeArea, keyValid, KEYS } from "./kv.js";
+ import { decodeModes, encodeModes, syncModes, removeModes, validateModes, MODE_LIMITS } from "./channelmodes.js";
+ 
++import { encodeBootColor } from "./bootimage.js";
++
+ const REFS = ["contact", "rxList", "aprs"];
+ 
+ export function decode(image) {
+@@ -236,6 +238,7 @@ export function encode(m) {
+ 	encodeGeneral(m.general, b);
+ 	// the modes' records after the records they name (channel-modes.md 2.4: the record first, then its tag)
+ 	encodeModes(m, b, () => channelNames(m.base.bytes));
++	encodeBootColor(b, m.general.bootColor, m.general.bootImage);
+ 	fixLucz(b, m);
+ 	return img;
+ }
+diff --git a/site/static/js/codeplug/records.js b/site/static/js/codeplug/records.js
+index e40060e..8040892 100644
+--- a/site/static/js/codeplug/records.js
++++ b/site/static/js/codeplug/records.js
+@@ -10,7 +10,7 @@ import {
+ 	getFreq, putFreq, getBcdId, putBcdId, getTone, putTone, getName, putName, getCoord, coordBytes, u16, put16,
+ } from "./fields.js";
+ import { decodeArea, getKey, getValue, KEYS } from "./kv.js";
+-import { BOOT_IMAGE_KEY, bootImageValid } from "./bootimage.js";
++import { BOOT_IMAGE_KEY, bootImageValid, decodeBootColor } from "./bootimage.js";
+ 
+ export const LIMITS = {
+ 	channels: 1024, zones: 68, zoneChannels: 80, contacts: 1024, rxLists: 76, rxListContacts: 32,
+@@ -372,6 +372,7 @@ export function decodeGeneral(b) {
+ 	const g = b.subarray(GENERAL, GENERAL + GENERAL_SIZE);
+ 	const kv = decodeArea(b).entries;
+ 	const bootImage = getValue(kv, BOOT_IMAGE_KEY);
++	const bootColor = decodeBootColor(b, bootImage);
+ 	return {
+ 		radioName: getName(g, 0, 8),
+ 		dmrId: getBcdId(g, 8),
+@@ -380,6 +381,7 @@ export function decodeGeneral(b) {
+ 		bootLine1: getName(b, BOOT_TEXT, 16),
+ 		bootLine2: getName(b, BOOT_TEXT + 16, 16),
+ 		...(bootImageValid(bootImage) ? { bootImage } : {}),
++		...(bootColor ? { bootColor } : {}),
+ 		...Object.fromEntries(KEYS.map((row) => [row.name, getKey(kv, row)])),
+ 	};
+ }
+diff --git a/site/static/js/codeplug/transport.js b/site/static/js/codeplug/transport.js
+index 791fdab..52a4049 100644
+--- a/site/static/js/codeplug/transport.js
++++ b/site/static/js/codeplug/transport.js
+@@ -19,6 +19,8 @@ import { encodeBlock } from "../flasher/lz4.js";
+ import { FastLink, FastError, BLOCK, REASON } from "./fastlink.js";
+ import { note } from "../diag.js";
+ 
++import { BOOT_COLOR_AREA } from "./bootimage.js";
++
+ export class TransportError extends Error {
+ 	constructor(code, params = {}) {
+ 		super(code);
+@@ -49,9 +51,9 @@ export function keepIdentity(want, have) {
+ }
+ 
+ // Regions of the codeplug a write may change
+-export function writeRanges() {
++export function writeRanges(regions = EDITOR_REGIONS) {
+ 	const out = [];
+-	for (const [a, b] of EDITOR_REGIONS) {
++	for (const [a, b] of regions) {
+ 		let s = a;
+ 		for (const [ka, kb] of KEEP_OUT) {
+ 			if (ka >= s && ka < b) {
+@@ -156,6 +158,7 @@ export class CpsSerial {
+ 		this.probe = p;
+ 		const features = String(p.features || "").split(",");
+ 		this.compact = features.includes("IDDB_COMPACT");
++		this.colorSplash = features.includes("SPLASH_COLOR");
+ 		this.fast = null;
+ 		if (features.includes("CPS_FAST") && !this.noFast) {
+ 			const fl = new FastLink(this.link);
+@@ -190,6 +193,10 @@ export class CpsSerial {
+ 		return Math.min(cp.end - cp.base, this.fast?.end || Infinity, this.flash ? this.flash - cp.base : Infinity);
+ 	}
+ 
++	get regions() {
++		return this.colorSplash ? [...EDITOR_REGIONS, BOOT_COLOR_AREA] : EDITOR_REGIONS;
++	}
++
+ 	// The codeplug's regions read into a fresh image (the rest erased); with iddb, the whole ID database too. cache: an
+ 	// image read before; with the fast protocol its blocks whose CRC still matches aren't read again
+ 	async read({ iddb = true, progress = () => {}, signal, cache = null } = {}) {
+@@ -215,7 +222,7 @@ export class CpsSerial {
+ 	// The database's header first, so the progress covers the whole read, database too
+ 	async cpsRead({ iddb, progress, signal }) {
+ 		const img = await this.cpsGet(CodeplugImage.from(new Uint8Array(0)), [IDDB_HEADER], { signal });
+-		return this.cpsGet(img, [...EDITOR_REGIONS, ...(iddb ? this.iddbRest(img) : [])], { signal, progress });
++		return this.cpsGet(img, [...this.regions, ...(iddb ? this.iddbRest(img) : [])], { signal, progress });
+ 	}
+ 
+ 	cpsReadIddb(img, { progress, signal }) {
+@@ -266,7 +273,7 @@ export class CpsSerial {
+ 	}
+ 
+ 	cpsPlan(want, have, { iddb = false } = {}) {
+-		const plan = changes(want.bytes, have?.bytes ?? null, writeRanges());
++		const plan = changes(want.bytes, have?.bytes ?? null, writeRanges(this.regions));
+ 		if (iddb) plan.push(...changes(want.bytes, null, iddbRanges(want)));
+ 		plan.sort((x, y) => x[0] - y[0]);
+ 		const bytes = plan.reduce((n, [, runs]) => n + runs.reduce((m, [, d]) => m + d.length, 0), 0);
+@@ -393,7 +400,7 @@ export class CpsSerial {
+ 	// Whole blocks of the database after its header's block (read whole with the header), and with regions the
+ 	// codeplug's too, in one pass
+ 	async fastReadIddb(img, { cache, progress, signal, regions = false, iddb = true }) {
+-		const ranges = blocksOf([...(regions ? EDITOR_REGIONS : []), ...(iddb ? this.iddbRest(img) : [])])
++		const ranges = blocksOf([...(regions ? this.regions : []), ...(iddb ? this.iddbRest(img) : [])])
+ 			.filter(([a]) => a < IDDB_HEADER[0] || a >= IDDB_HEADER[0] + BLOCK).map(([a]) => [a, a + BLOCK]);
+ 		await this.fastBlocks(img, ranges, { cache, progress, signal, total: ranges.length * BLOCK });
+ 		return img;
+@@ -418,7 +425,7 @@ export class CpsSerial {
+ 	}
+ 
+ 	async fastPlan(want, have, { iddb = false } = {}) {
+-		const cp = writeRanges(), db = iddb ? iddbRanges(want) : [];
++		const cp = writeRanges(this.regions), db = iddb ? iddbRanges(want) : [];
+ 		want.ensure(Math.max(...[...cp, ...db].map(([, b]) => b)));
+ 		const sums = await this.fastSums(blocksOf([...cp, ...db]).map(([a]) => a));
+ 		const codeplug = await this.fastChanged(want, have, cp, sums);
+@@ -453,7 +460,7 @@ export class CpsSerial {
+ 		}
+ 		// a block the fast protocol refuses (outside what it serves on this radio) goes through the CPS
+ 		for (const a of refused) {
+-			const runs = changes(want.bytes, null, writeRanges().filter(([x, y]) => x < a + BLOCK && y > a)
++			const runs = changes(want.bytes, null, writeRanges(this.regions).filter(([x, y]) => x < a + BLOCK && y > a)
+ 				.map(([x, y]) => [Math.max(x, a), Math.min(y, a + BLOCK)]));
+ 			for (const [sector, r] of runs) await this.writeSector(sector, r);
+ 		}
+diff --git a/site/static/js/editor/app.js b/site/static/js/editor/app.js
+index 5a6beca..bd57672 100644
+--- a/site/static/js/editor/app.js
++++ b/site/static/js/editor/app.js
+@@ -11,7 +11,7 @@ import { SerialStream, serialSupported, serialApi, RFOUNDRY_USB, browserErrorKey
+ import { CodeplugImage, IDDB_HEADER, EDITOR_REGIONS } from "../codeplug/image.js";
+ import { decode, encode, empty, remove, validate, newChannel, newContact, numberAll, assignNumbers } from "../codeplug/model.js";
+ import { LIMITS, decodeGeneral } from "../codeplug/records.js";
+-import { BOOT_IMAGE_EDGE, packBootImage } from "../codeplug/bootimage.js";
++import { BOOT_IMAGE_EDGE, packBootImage, BOOT_COLOR_EDGE, packBootColor, bootColorForWrite } from "../codeplug/bootimage.js";
+ import { CpsSerial, TransportError, estimate, keepIdentity, IDENTITY, iddbRanges } from "../codeplug/transport.js";
+ import { FastError } from "../codeplug/fastlink.js";
+ import { areaForWrite, KEYS } from "../codeplug/kv.js";
+@@ -62,6 +62,7 @@ const messages = h("div", { class: "ed-messages", "aria-live": "polite" });
+ function load(model, name, { fromRadio = false, stockAes = false } = {}) {
+ 	S.model = model;
+ 	S.stockAes = stockAes;
++	S.fromRadio = fromRadio;
+ 	S.fileName = name;
+ 	S.history.reset();
+ 	S.dirty = false;
+@@ -385,8 +386,8 @@ function openRecord(tab, r) {
+ function bootImageField(g) {
+ 	const current = S.model;
+ 	const err = h("span", { class: "small ed-err", "aria-live": "polite" });
+-	const setImage = (bootImage) => change(t("editor.undo.edit"), () => {
+-		S.model.general = { ...S.model.general, bootImage };
++	const setImage = (bootImage, bootColor) => change(t("editor.undo.edit"), () => {
++		S.model.general = { ...S.model.general, bootImage, bootColor };
+ 	});
+ 	const input = h("input", { id: "g-boot-image", type: "file", accept: "image/png,image/jpeg,image/webp" });
+ 	input.addEventListener("change", async () => {
+@@ -395,15 +396,17 @@ function bootImageField(g) {
+ 		try {
+ 			const image = await createImageBitmap(file);
+ 			try {
+-				const edge = BOOT_IMAGE_EDGE;
+-				const canvas = h("canvas", { width: edge, height: edge });
+-				const ctx = canvas.getContext("2d");
+-				const scale = edge / Math.max(image.width, image.height);
+-				const w = Math.max(1, Math.round(image.width * scale));
+-				const hgt = Math.max(1, Math.round(image.height * scale));
+-				ctx.drawImage(image, (edge - w) / 2, (edge - hgt) / 2, w, hgt);
+-				if (S.model === current)
+-					setImage(packBootImage(ctx.getImageData(0, 0, edge, edge).data));
++				const fit = (edge) => {
++					const canvas = h("canvas", { width: edge, height: edge });
++					const ctx = canvas.getContext("2d");
++					const scale = edge / Math.max(image.width, image.height);
++					const w = Math.max(1, Math.round(image.width * scale));
++					const hgt = Math.max(1, Math.round(image.height * scale));
++					ctx.drawImage(image, Math.floor((edge - w) / 2), Math.floor((edge - hgt) / 2), w, hgt);
++					return ctx.getImageData(0, 0, edge, edge).data;
++				};
++				if (S.model === current && input.files[0] === file)
++					setImage(packBootImage(fit(BOOT_IMAGE_EDGE)), packBootColor(fit(BOOT_COLOR_EDGE)));
+ 			} finally {
+ 				image.close();
+ 			}
+@@ -413,7 +416,7 @@ function bootImageField(g) {
+ 		}
+ 	});
+ 	return h("div", { class: "form-row" }, h("label", { for: "g-boot-image" }, t("editor.general.boot_image")),
+-		input, g.bootImage ? button(t("editor.general.boot_image_reset"), () => setImage(null), { quiet: true }) : null,
++		input, g.bootImage ? button(t("editor.general.boot_image_reset"), () => setImage(null, null), { quiet: true }) : null,
+ 		h("span", { class: "small muted" }, t("editor.general.boot_image_help")), err);
+ }
+ 
+@@ -603,7 +606,7 @@ async function connect() {
+ 		const hash = location.hash;
+ 		S.fake = S.fake || new FakeCpsRadio({ board: "DM-1701", image: CodeplugImage.blank().bytes, foreign: hash === "#sim-foreign",
+ 			// #sim-modes: firmware that runs every channel mode the editor knows (modes.js)
+-			features: hash.startsWith("#sim-compact") ? "FM,DMR,IDDB_COMPACT" : hash.startsWith("#sim-modes") ? "FM,DMR,DMR_TRUNK,P25,P25_TRUNK,NXDN" : "FM,DMR", release: hash.match(/[#&]release=([\w.]+)/)?.[1],
++			features: hash.startsWith("#sim-compact") ? "FM,DMR,SPLASH_COLOR,IDDB_COMPACT" : hash.startsWith("#sim-modes") ? "FM,DMR,SPLASH_COLOR,DMR_TRUNK,P25,P25_TRUNK,NXDN" : "FM,DMR,SPLASH_COLOR", release: hash.match(/[#&]release=([\w.]+)/)?.[1],
+ 			gitTime: Number(hash.match(/[#&]git_time=(\d+)/)?.[1]) || 0 });
+ 		stream = S.fake.stream();
+ 	} else {
+@@ -959,6 +962,7 @@ async function planWrite() {
+ 		} else {
+ 			areaForWrite(file.bytes, c.image.bytes, S.model.base?.bytes);
+ 		}
++		if (c.transport.colorSplash) bootColorForWrite(file.bytes, c.image.bytes, S.model.base?.bytes, S.model.general, !S.fromRadio);
+ 		const kept = keepIdentity(file, c.image);
+ 		const differs = IDENTITY.some(([a, b]) => kept.bytes.subarray(a, b).some((x, i) => x !== file.bytes[a + i]));
+ 		const plans = { file: await c.transport.plan(file, c.image, { iddb }) };
+@@ -1043,6 +1047,7 @@ function writeChosen(c, { want }, iddb, prepared) {
+ 			if (iddb) c.dbKnown = true;
+ 			S.iddbChanged = false;
+ 			S.model.base = want;
++			S.fromRadio = true;
+ 			S.model.iddb = dbHeader(want.bytes);	// format N when it went to a radio that reads only that
+ 			S.dirty = false;
+ 			refresh();
+diff --git a/site/tests/bootimage.test.mjs b/site/tests/bootimage.test.mjs
+index 97875da..74e39d6 100644
+--- a/site/tests/bootimage.test.mjs
++++ b/site/tests/bootimage.test.mjs
+@@ -2,16 +2,17 @@
+ // Copyright (c) 2026 lyra XE1POC
+ import assert from "node:assert/strict";
+ import { test } from "node:test";
+-import { BOOT_IMAGE_EDGE, BOOT_IMAGE_KEY, packBootImage } from "../static/js/codeplug/bootimage.js";
++import { BOOT_IMAGE_EDGE, BOOT_IMAGE_KEY, packBootImage, BOOT_COLOR_EDGE, BOOT_COLOR_AREA, packBootColor, bootColorPalette, bootColorIndex, bootColorForWrite } from "../static/js/codeplug/bootimage.js";
++import { FakeCpsRadio } from "../static/js/codeplug/fakecps.js";
++import { CpsSerial } from "../static/js/codeplug/transport.js";
+ import { decode, empty, encode } from "../static/js/codeplug/model.js";
+-import { decodeArea, getValue, putArea, setValue } from "../static/js/codeplug/kv.js";
++import { decodeArea, getValue, putArea, setValue, areaForWrite } from "../static/js/codeplug/kv.js";
+ 
+ test("a startup image round-trips alongside other settings and can be removed", () => {
+ 	const pixels = new Uint8ClampedArray(BOOT_IMAGE_EDGE ** 2 * 4);
+-	pixels.fill(255);
+-	pixels.set([255, 255, 255, 255, 170, 170, 170, 255, 85, 85, 85, 255, 0, 0, 0, 255]);
++	pixels.set([255, 255, 255, 255, 170, 170, 170, 255, 85, 85, 85, 255, 255, 255, 255, 0]);
+ 	const image = packBootImage(pixels);
+-	assert.equal(image[0], 0x1b);
++	assert.equal(image[0], 0xe4);
+ 	const model = empty();
+ 	model.general.bootImage = image;
+ 	model.general.batteryTone = true;
+@@ -36,11 +37,11 @@ test("an unknown startup image record is preserved by unrelated edits", () => {
+ 	assert.deepEqual(getValue(decodeArea(encode(model).bytes).entries, BOOT_IMAGE_KEY), Uint8Array.of(1, 2, 3));
+ });
+ 
+-test("a transparent image keeps shadows and can replace obsolete mode records", () => {
++test("a transparent black logo is visible and can replace obsolete mode records", () => {
+ 	const pixels = new Uint8ClampedArray(BOOT_IMAGE_EDGE ** 2 * 4);
+-	pixels.set([0, 0, 0, 255, 0, 0, 0, 128, 0, 0, 0, 0, 255, 255, 255, 255]);
++	pixels.set([0, 0, 0, 255]);
+ 	const image = packBootImage(pixels);
+-	assert.equal(image[0], 0xe0);
++	assert.equal(image[0], 0xc0);
+ 	const saved = encode(empty());
+ 	assert.ok(putArea(saved.bytes, setValue(decodeArea(saved.bytes).entries, 0x0400, new Uint8Array(3500))));
+ 	const model = decode(saved);
+@@ -48,8 +49,81 @@ test("a transparent image keeps shadows and can replace obsolete mode records",
+ 	assert.deepEqual(decode(encode(model)).general.bootImage, image);
+ });
+ 
+-test("a transparent white logo uses the theme foreground", () => {
+-	const pixels = new Uint8ClampedArray(BOOT_IMAGE_EDGE ** 2 * 4);
+-	pixels.set([255, 255, 255, 255, 255, 255, 255, 128]);
+-	assert.equal(packBootImage(pixels)[0], 0xe0);
++function testColor() {
++	const pixels = new Uint8ClampedArray(BOOT_COLOR_EDGE ** 2 * 4);
++	const colors = Array.from({ length: 16 }, (_, i) => [i & 1 ? 255 : 0, i & 2 ? 255 : 0, (i >> 2) * 85]);
++	for (let i = 0; i < BOOT_COLOR_EDGE ** 2; i++) pixels.set([...colors[i & 15], 255], i * 4);
++	return packBootColor(pixels);
++}
++
++test("the color record uses all 16 colors and survives a file round-trip", () => {
++	const model = empty();
++	model.general.bootImage = new Uint8Array(1024).fill(255);
++	model.general.bootColor = testColor();
++	const palette = bootColorPalette(model.general.bootColor);
++	const firstRow = Array.from({ length: 16 }, (_, i) => bootColorIndex(model.general.bootColor, i));
++	assert.equal(new Set(firstRow).size, 16);
++	assert.deepEqual(palette[firstRow[3]], [255, 255, 0]);
++	assert.deepEqual(palette[firstRow[15]], [255, 255, 255]);
++	const image = encode(model);
++	assert.deepEqual(decode(image).general.bootColor, model.general.bootColor);
++	assert.deepEqual(encode(decode(image)).bytes, image.bytes);
++	image.bytes[BOOT_COLOR_AREA[1] - 1] ^= 1;
++	assert.equal(decode(image).general.bootColor, undefined);
++	assert.deepEqual(decode(image).general.bootImage, model.general.bootImage);
++});
++
++test("a grayscale write by an older CPS overrides the color record", () => {
++	const model = empty();
++	model.general.bootImage = new Uint8Array(1024).fill(255);
++	model.general.bootColor = testColor();
++	const saved = encode(model);
++	const legacy = new Uint8Array(1024).fill(0x55);
++	assert.ok(putArea(saved.bytes, setValue(decodeArea(saved.bytes).entries, BOOT_IMAGE_KEY, legacy)));
++	const reloaded = decode(saved);
++	assert.equal(reloaded.general.bootColor, undefined);
++	assert.deepEqual(reloaded.general.bootImage, legacy);
++});
++
++test("a new color splash writes through the serial CPS and older radios only receive grayscale", async () => {
++	const model = empty();
++	model.general.bootImage = new Uint8Array(1024).fill(255);
++	model.general.bootColor = testColor();
++	const file = encode(model);
++	const codeplug = { names: ["DM-32UV"], base: 0x700000, end: 0xF00000 };
++	for (const support of [true, false]) {
++		const radio = new FakeCpsRadio({ ...codeplug, board: "DM-32UV",
++			features: support ? "FM,DMR,SPLASH_COLOR" : "FM,DMR", image: model.base.bytes });
++		const transport = new CpsSerial(radio.stream());
++		await transport.identify([{ codeplug }]);
++		const before = await transport.read({ iddb: false });
++		const written = await transport.write(file, before);
++		await transport.verify(file, written.plan);
++		const after = decode(await transport.read({ iddb: false }));
++		assert.deepEqual(after.general.bootColor, support ? model.general.bootColor : undefined);
++		assert.deepEqual(after.general.bootImage, model.general.bootImage);
++	}
++});
++
++test("a channel-only write preserves the radio splash and explicit reset clears both formats", () => {
++	const model = empty();
++	model.general.bootImage = new Uint8Array(1024).fill(255);
++	model.general.bootColor = testColor();
++	const radio = encode(model);
++	const other = empty();
++	other.general.radioName = "XE1POC";
++	const untouched = encode(other);
++	areaForWrite(untouched.bytes, radio.bytes, other.base.bytes);
++	bootColorForWrite(untouched.bytes, radio.bytes, other.base.bytes, other.general, true);
++	assert.deepEqual(decode(untouched).general.bootColor, model.general.bootColor);
++
++	const loaded = decode(radio);
++	loaded.general.bootImage = null;
++	loaded.general.bootColor = null;
++	const reset = encode(loaded);
++	areaForWrite(reset.bytes, radio.bytes, radio.bytes);
++	bootColorForWrite(reset.bytes, radio.bytes, radio.bytes, loaded.general, false);
++	assert.equal(decode(reset).general.bootImage, undefined);
++	assert.equal(decode(reset).general.bootColor, undefined);
++	assert.ok(reset.bytes.subarray(...BOOT_COLOR_AREA).every((v) => v === 0xFF));
+ });
+diff --git a/tests/host/Makefile b/tests/host/Makefile
+index 5b32768..3f168c2 100644
+--- a/tests/host/Makefile
++++ b/tests/host/Makefile
+@@ -768,6 +768,10 @@ TESTS   += gfxTest
+ gfxTest: gfxTest.c $(UI) $(LANG_H) $(wildcard $(CORE)/ui/*.h $(CORE)/ui/fonts/*.inc)
+ 	$(CC) $(CFLAGS) -I$(ROOT)/hal -Iout/gen -Wshadow -DGFX_INDEXED=1 -DCONFIG_NET_WEBCTL=1 -o $@ gfxTest.c $(UI)
+ 
++TESTS += gfxSplashTest
++gfxSplashTest: gfxTest.c $(UI) $(CORE)/radio/radio_am.c $(LANG_H) $(wildcard $(CORE)/ui/*.h $(CORE)/ui/fonts/*.inc)
++	$(CC) $(CFLAGS) -I$(ROOT)/hal -Iout/gen -Wshadow -DGFX_INDEXED=1 -DGFX_MAX_ROWS=320 -DCONFIG_NET_WEBCTL=1 -DCONFIG_SPLASH_IMAGE=1 -o $@ gfxTest.c $(UI) $(CORE)/radio/radio_am.c -lz
++
+ # The same with a CJK catalog (CONFIG_LANG_ZH): text is UTF-8, a character of it is a 16 px glyph of the CJK face, widths
+ # add up in pixels, and a cut keeps whole characters (core/ui/cjk_font.h, docs/spec/ui.md 2.5)
+ CJK     := $(CORE)/ui/cjk_font.c $(CORE)/ui/cjk_font_data.c
+diff --git a/tests/host/gfxTest.c b/tests/host/gfxTest.c
+index 0ee8190..dc811c6 100644
+--- a/tests/host/gfxTest.c
++++ b/tests/host/gfxTest.c
+@@ -32,9 +32,42 @@ static hal_display_t disp = { .width = 160, .height = 120, .bpp = 16, .init = d_
+ 
+ static const band_t bands[] = { { 136000000, 174000000, true }, { 400000000, 480000000, true } };
+ static const char *const power_names[] = { "50mW", "250mW", "500mW", "750mW", "1W", "2W", "3W", "4W", "5W" };
++#if CONFIG_SPLASH_IMAGE
++#include <zlib.h>
++#include "codeplug/codeplug_kv.h"
++#include "storage/storage.h"
++
++#define COLOR_ADDR 0xB000u
++static uint8_t legacy_image[1024];
++static uint8_t color_image[12 + 32 + 128 * 128 / 2];
++static const hal_flash_map_t splash_map = { .openfw_flash = 0x20000u };
++static bool splash_read(uint32_t addr, void *buf, uint32_t len)
++{
++	if (addr < COLOR_ADDR || addr - COLOR_ADDR + len > sizeof(color_image))
++		return false;
++	memcpy(buf, color_image + addr - COLOR_ADDR, len);
++	return true;
++}
++static const hal_flash_t splash_flash = { .size = 0x100000u, .map = &splash_map, .read = splash_read };
++const hal_flash_map_t *storage_map(void) { return &splash_map; }
++void storage_lock(void) {}
++void storage_unlock(void) {}
++uint32_t storage_crc32(uint32_t crc, const void *buf, uint32_t len) { return (uint32_t)crc32(crc, buf, len); }
++int codeplug_kv_get(uint16_t key, void *out, uint16_t cap)
++{
++	if (key != 0x2000 || cap < sizeof(legacy_image))
++		return -1;
++	memcpy(out, legacy_image, sizeof(legacy_image));
++	return sizeof(legacy_image);
++}
++#endif
++
+ const board_t board = {
+ 	.name = "Test radio", .bands = bands, .band_count = 2, .power_count = 9, .power_names = power_names,
+ 	.power_default = 4, .display = &disp,
++#if CONFIG_SPLASH_IMAGE
++	.flash = &splash_flash,
++#endif
+ };
+ 
+ static void save(const char *name)
+@@ -371,6 +404,50 @@ static void test_big_text(void)
+ 	ui_layout_init();
+ }
+ 
++#if CONFIG_SPLASH_IMAGE
++static void put_splash_crc(uint8_t *p, uint32_t crc)
++{
++	for (unsigned i = 0; i < 4; i++)
++		p[i] = (uint8_t)(crc >> (8 * i));
++}
++
++static void test_color_splash(void)
++{
++	disp.width = 240; disp.height = 320; disp.bpp = 4; disp.flush_indexed = d_flush_indexed;
++	CHECK(gfx_init(&disp));
++	ui_layout_init();
++	memcpy(color_image, "RFB1", 4);
++	for (unsigned i = 0; i < 16; i++) {
++		color_image[12 + 2 * i] = (uint8_t)(i * 13);
++		color_image[13 + 2 * i] = (uint8_t)(i * 17);
++	}
++	memset(color_image + 44, 0x12, sizeof(color_image) - 44);
++	for (unsigned i = 0; i < 8; i++)
++		color_image[44 + i] = (uint8_t)((2 * i << 4) | (2 * i + 1));
++	put_splash_crc(color_image + 4, storage_crc32(0, legacy_image, sizeof(legacy_image)));
++	put_splash_crc(color_image + 8, storage_crc32(0, color_image + 12, sizeof(color_image) - 12));
++	ui_draw_user_splash("", "", "", "");
++	for (unsigned i = 0; i < 16; i++) {
++		unsigned x = (i * 240 + 127) / 128;
++		CHECK(gfx_get_pixel(x, 40) == ((i * 17) << 8 | i * 13));
++	}
++	CHECK(gfx_get_pixel(239, 279) == 0x221A);
++	CHECK(gfx_get_pixel(0, 39) == 0);
++	CHECK(gfx_get_pixel(0, 280) == 0);
++
++	color_image[sizeof(color_image) - 1] ^= 1;
++	ui_draw_user_splash("", "", "", "");
++	CHECK(gfx_get_pixel(239, 279) == ui_col.bg);
++	color_image[sizeof(color_image) - 1] ^= 1;
++
++	legacy_image[0] = 0xC0;
++	ui_draw_user_splash("", "", "", "");
++	CHECK(gfx_get_pixel(0, 40) == ui_col.fg);
++	CHECK(gfx_get_pixel(239, 279) == ui_col.bg);
++	legacy_image[0] = 0;
++}
++#endif
++
+ // The splash footer (board and version) stays on a 128 px display with an 11-character board name and the longest
+ // release name, a beta's: the board name goes before the version is cut
+ static void test_splash_footer(void)
+@@ -653,6 +730,9 @@ int main(void)
+ 	test_idle_pill_contrast();
+ 	test_big_text();
+ 	test_hc_strip_white();
++#if CONFIG_SPLASH_IMAGE
++	test_color_splash();
++#endif
+ 
+ 	printf(fails ? "# FAILED gfxTest: %d\n" : "# PASSED gfxTest\n", fails);
+ 	return fails != 0;

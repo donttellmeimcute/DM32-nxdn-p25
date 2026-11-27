@@ -111,7 +111,8 @@ jobs:
           set -eu
           export RFOUNDRY_SITE_FIXTURES="$RUNNER_TEMP/cps-fixtures"
           mkdir -p "$RFOUNDRY_SITE_FIXTURES"
-          make -C build/current/tests/host cpsSim
+          make -C build/current/tests/host cpsSim gfxSplashTest
+          (cd build/current/tests/host && ./gfxSplashTest)
           build/current/tests/host/cpsSim --populate --dump "$RFOUNDRY_SITE_FIXTURES/codeplug_sim.bin" </dev/null
           node --test build/current/site/tests/{modes,csv,channel-aes,bootimage}.test.mjs
 

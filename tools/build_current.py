@@ -224,6 +224,7 @@ def prepare(tree, dstar=False):
 	run('git', 'apply', '--binary', PATCH_DIR / 'fm-mdc-roger.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'signaling-tones.patch', cwd=tree)
 	run('git', 'apply', '--binary', PATCH_DIR / 'issue117-tx-mic-gain.patch', cwd=tree)
+	run('git', 'apply', '--binary', PATCH_DIR / 'dm32-color-startup-image.patch', cwd=tree)
 	if dstar:
 		run('git', 'apply', '--binary', PATCH_DIR / 'issue117-dstar-mic-gain-tests-docs.patch', cwd=tree)
 	for name in RELEASE_VARIANTS[1:]:
